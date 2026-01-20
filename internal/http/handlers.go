@@ -183,6 +183,26 @@ func (s *Server) HandleUpgrade() http.HandlerFunc {
 			}
 		} else {
 			s.jobStore.AppendLog(fmt.Sprintf("Policy fetched: latest=%s, %d releases", policyData.Latest, len(policyData.Releases)))
+
+			// Check for breakpoints (DASHBOARD mode only)
+			if mode == jobs.JobModeDashboard && policyData != nil {
+				for _, breakpoint := range policyData.Breakpoints {
+					if breakpoint.Version == req.RequestedTarget {
+						// Breakpoint hit - manual upgrade required
+						job.State = jobs.JobStateFailed
+						job.FailureCode = "MANUAL_UPGRADE_REQUIRED"
+						job.Message = fmt.Sprintf("%s %s", breakpoint.Reason, breakpoint.Docs)
+						job.UpdatedAt = time.Now().UTC()
+						s.jobStore.Save(job)
+						s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - Target %s requires manual upgrade: %s", job.FailureCode, req.RequestedTarget, job.Message))
+
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusOK)
+						json.NewEncoder(w).Encode(job)
+						return
+					}
+				}
+			}
 		}
 
 		// Fetch runtime manifest
