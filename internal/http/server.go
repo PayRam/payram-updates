@@ -10,29 +10,39 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/payram/payram-updater/internal/config"
+	"github.com/payram/payram-updater/internal/jobs"
 )
 
 // Server represents the HTTP server.
 type Server struct {
 	httpServer *http.Server
 	port       int
+	config     *config.Config
+	jobStore   *jobs.Store
 }
 
 // New creates a new HTTP server instance.
-func New(port int) *Server {
+func New(cfg *config.Config, jobStore *jobs.Store) *Server {
+	s := &Server{
+		port:     cfg.Port,
+		config:   cfg,
+		jobStore: jobStore,
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", HandleHealth())
+	mux.HandleFunc("/upgrade/status", s.HandleUpgradeStatus())
+	mux.HandleFunc("/upgrade/logs", s.HandleUpgradeLogs())
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	httpServer := &http.Server{
+	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
+	s.httpServer = &http.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
 
-	return &Server{
-		httpServer: httpServer,
-		port:       port,
-	}
+	return s
 }
 
 // Start starts the HTTP server and blocks until shutdown.
