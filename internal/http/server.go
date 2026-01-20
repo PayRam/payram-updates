@@ -35,6 +35,7 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 	mux.HandleFunc("/health", HandleHealth())
 	mux.HandleFunc("/upgrade/status", s.HandleUpgradeStatus())
 	mux.HandleFunc("/upgrade/logs", s.HandleUpgradeLogs())
+	mux.HandleFunc("/upgrade", s.HandleUpgrade())
 
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 	s.httpServer = &http.Server{
