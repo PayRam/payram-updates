@@ -1,0 +1,27 @@
+[Unit]
+Description=Payram Updater Service
+Documentation=https://github.com/payram/payram-updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/payram/updater.env
+ExecStart=/usr/local/bin/payram-updater
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=payram-updater
+
+# Security hardening
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/payram /var/log/payram
+
+[Install]
+WantedBy=multi-user.target
