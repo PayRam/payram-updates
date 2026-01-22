@@ -41,3 +41,7 @@ vendor/
 # Temporary files
 tmp/
 temp/
+
+*.env.*
+!.env.example
+data/
