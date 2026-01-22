@@ -16,17 +16,34 @@ type Config struct {
 	LogDir              string
 }
 
-// Load reads configuration from environment variables first, then falls back to
-// /etc/payram/updater.env. Required fields are validated.
+// Load reads configuration with the following precedence order:
+//  1. OS environment variables (highest priority)
+//  2. .env file in current working directory (if present)
+//  3. /etc/payram/updater.env (if present)
+//  4. Default values (lowest priority)
+//
+// Required fields are validated.
 func Load() (*Config, error) {
-	// Try to load from env file if it exists
-	envFilePath := "/etc/payram/updater.env"
-	if _, err := os.Stat(envFilePath); err == nil {
-		if err := loadEnvFile(envFilePath); err != nil {
+	// Load config files in reverse precedence order (lowest to highest priority)
+	// so that higher priority sources can override lower priority ones.
+
+	// Try to load from /etc/payram/updater.env if it exists (lowest priority file)
+	etcEnvFilePath := "/etc/payram/updater.env"
+	if _, err := os.Stat(etcEnvFilePath); err == nil {
+		if err := loadEnvFile(etcEnvFilePath); err != nil {
 			return nil, fmt.Errorf("failed to load env file: %w", err)
 		}
 	}
 
+	// Try to load from .env in current working directory if it exists (higher priority)
+	cwdEnvFilePath := ".env"
+	if _, err := os.Stat(cwdEnvFilePath); err == nil {
+		if err := loadEnvFile(cwdEnvFilePath); err != nil {
+			return nil, fmt.Errorf("failed to load .env file: %w", err)
+		}
+	}
+
+	// Build config from environment variables (OS env vars have highest priority)
 	cfg := &Config{
 		Port:                getEnvInt("UPDATER_PORT", 2359),
 		PolicyURL:           os.Getenv("POLICY_URL"),
