@@ -24,6 +24,12 @@ func main() {
 	}
 
 	command := os.Args[1]
+	// Handle help flags
+	if command == "-h" || command == "--help" || command == "help" {
+		printHelp()
+		return
+	}
+
 	switch command {
 	case "serve":
 		runServe()
@@ -34,10 +40,41 @@ func main() {
 	case "dry-run":
 		runDryRun()
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
-		fmt.Fprintf(os.Stderr, "Available commands: serve, status, logs, dry-run\n")
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
+		printHelp()
 		os.Exit(1)
 	}
+}
+
+func printHelp() {
+	fmt.Print(`payram-updater - Payram runtime upgrade manager
+
+USAGE:
+  payram-updater [COMMAND]
+
+COMMANDS:
+  serve            Start the upgrade daemon (default)
+  status           Get current upgrade status
+  logs             Get upgrade logs
+  dry-run          Initiate a dry-run upgrade
+  help             Show this help message
+
+DRY-RUN FLAGS:
+  --mode string    Upgrade mode: 'dashboard' or 'manual' (required)
+  --to string      Target version (required)
+
+EXAMPLES:
+  payram-updater serve
+  payram-updater status
+  payram-updater logs
+  payram-updater dry-run --mode dashboard --to latest
+  payram-updater dry-run --mode manual --to v1.2.3
+
+CONFIG:
+  Configuration is loaded from environment variables first,
+  then from /etc/payram/updater.env if it exists.
+
+`)
 }
 
 func runServe() {
@@ -72,7 +109,8 @@ func runStatus() {
 
 	resp, err := http.Get(url)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get status: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to daemon: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Is the payram-updater daemon running?\n")
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
@@ -99,7 +137,8 @@ func runLogs() {
 
 	resp, err := http.Get(url)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get logs: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to daemon: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Is the payram-updater daemon running?\n")
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
@@ -110,14 +149,8 @@ func runLogs() {
 		os.Exit(1)
 	}
 
-	// Pretty-print JSON
-	var prettyJSON bytes.Buffer
-	if err := json.Indent(&prettyJSON, body, "", "  "); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to format JSON: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println(prettyJSON.String())
+	// Print plain text logs directly
+	fmt.Print(string(body))
 }
 
 func runDryRun() {
@@ -163,7 +196,8 @@ func runDryRun() {
 	// Send POST request
 	resp, err := http.Post(url, "application/json", bytes.NewReader(payloadBytes))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to initiate upgrade: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to daemon: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Is the payram-updater daemon running?\n")
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
@@ -192,13 +226,18 @@ func runDryRun() {
 }
 
 func getPort() int {
-	// Try to get port from environment
-	if portStr := os.Getenv("UPDATER_PORT"); portStr != "" {
-		var port int
-		if _, err := fmt.Sscanf(portStr, "%d", &port); err == nil {
-			return port
+	// Load config the same way as daemon (env vars first, then /etc/payram/updater.env)
+	cfg, err := config.Load()
+	if err != nil {
+		// If config loading fails, fall back to reading UPDATER_PORT directly
+		if portStr := os.Getenv("UPDATER_PORT"); portStr != "" {
+			var port int
+			if _, err := fmt.Sscanf(portStr, "%d", &port); err == nil {
+				return port
+			}
 		}
+		// Default port
+		return 2359
 	}
-	// Default port
-	return 2359
+	return cfg.Port
 }
