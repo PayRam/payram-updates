@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -252,5 +253,115 @@ func TestFetch_WithMultipleOverrides(t *testing.T) {
 
 	if result.Overrides[1].Version != "v3.0.0" {
 		t.Errorf("expected second override version v3.0.0, got %q", result.Overrides[1].Version)
+	}
+}
+
+func TestFetch_LocalFile(t *testing.T) {
+	manifest := Manifest{
+		Image: Image{
+			Repo: "ghcr.io/payram/runtime",
+		},
+		Defaults: Defaults{
+			ContainerName: "payram-runtime",
+			RestartPolicy: "unless-stopped",
+			Ports: []Port{
+				{Container: 8080, Host: 8080, Protocol: "tcp"},
+			},
+			Volumes: []Volume{
+				{Source: "/var/lib/payram", Destination: "/data", ReadOnly: false},
+			},
+		},
+	}
+
+	// Create temp directory and write manifest file
+	tmpDir := t.TempDir()
+	manifestPath := tmpDir + "/manifest.json"
+
+	manifestJSON, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("failed to marshal manifest: %v", err)
+	}
+
+	if err := os.WriteFile(manifestPath, manifestJSON, 0644); err != nil {
+		t.Fatalf("failed to write manifest file: %v", err)
+	}
+
+	// Fetch from local file path
+	client := NewClient(5 * time.Second)
+	result, err := client.Fetch(context.Background(), manifestPath)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.Image.Repo != manifest.Image.Repo {
+		t.Errorf("expected image repo %q, got %q", manifest.Image.Repo, result.Image.Repo)
+	}
+
+	if result.Defaults.ContainerName != manifest.Defaults.ContainerName {
+		t.Errorf("expected container name %q, got %q", manifest.Defaults.ContainerName, result.Defaults.ContainerName)
+	}
+
+	if result.Defaults.RestartPolicy != manifest.Defaults.RestartPolicy {
+		t.Errorf("expected restart policy %q, got %q", manifest.Defaults.RestartPolicy, result.Defaults.RestartPolicy)
+	}
+
+	if len(result.Defaults.Ports) != len(manifest.Defaults.Ports) {
+		t.Errorf("expected %d ports, got %d", len(manifest.Defaults.Ports), len(result.Defaults.Ports))
+	}
+
+	if len(result.Defaults.Volumes) != len(manifest.Defaults.Volumes) {
+		t.Errorf("expected %d volumes, got %d", len(manifest.Defaults.Volumes), len(result.Defaults.Volumes))
+	}
+}
+
+func TestFetch_LocalFile_NotFound(t *testing.T) {
+	client := NewClient(5 * time.Second)
+	_, err := client.Fetch(context.Background(), "/nonexistent/path/manifest.json")
+
+	if err == nil {
+		t.Fatal("expected error for non-existent file")
+	}
+}
+
+func TestFetch_LocalFile_TooBig(t *testing.T) {
+	// Create a file larger than 1MB
+	tmpDir := t.TempDir()
+	largePath := tmpDir + "/large.json"
+
+	largeData := make([]byte, maxResponseSize+1)
+	if err := os.WriteFile(largePath, largeData, 0644); err != nil {
+		t.Fatalf("failed to write large file: %v", err)
+	}
+
+	client := NewClient(5 * time.Second)
+	_, err := client.Fetch(context.Background(), largePath)
+
+	if err == nil {
+		t.Fatal("expected error for file too big")
+	}
+
+	if !errors.Is(err, ErrResponseTooBig) {
+		t.Errorf("expected ErrResponseTooBig, got: %v", err)
+	}
+}
+
+func TestFetch_LocalFile_InvalidJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	invalidPath := tmpDir + "/invalid.json"
+
+	if err := os.WriteFile(invalidPath, []byte("not valid json"), 0644); err != nil {
+		t.Fatalf("failed to write invalid json file: %v", err)
+	}
+
+	client := NewClient(5 * time.Second)
+	_, err := client.Fetch(context.Background(), invalidPath)
+
+	if err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+
+	if !errors.Is(err, ErrInvalidJSON) {
+		t.Errorf("expected ErrInvalidJSON, got: %v", err)
 	}
 }

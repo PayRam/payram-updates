@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -77,8 +79,38 @@ func NewClient(timeout time.Duration) *Client {
 	}
 }
 
-// Fetch retrieves and parses the manifest from the given URL.
+// Fetch retrieves and parses the manifest from the given URL or local file path.
+// Phase 1: Supports both HTTP(S) URLs and local filesystem paths.
+// If the URL starts with "http://" or "https://", it is fetched via HTTP.
+// Otherwise, it is treated as a local file path.
 func (c *Client) Fetch(ctx context.Context, url string) (*Manifest, error) {
+	var body []byte
+	var err error
+
+	// Check if this is an HTTP(S) URL or a local file path
+	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+		// HTTP fetch (existing behavior)
+		body, err = c.fetchHTTP(ctx, url)
+	} else {
+		// Local file fetch (Phase 1 support)
+		body, err = c.fetchLocal(url)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse JSON with strict unmarshaling
+	var manifest Manifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidJSON, err)
+	}
+
+	return &manifest, nil
+}
+
+// fetchHTTP retrieves manifest data from an HTTP(S) URL.
+func (c *Client) fetchHTTP(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -105,10 +137,19 @@ func (c *Client) Fetch(ctx context.Context, url string) (*Manifest, error) {
 		return nil, ErrResponseTooBig
 	}
 
-	var manifest Manifest
-	if err := json.Unmarshal(body, &manifest); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidJSON, err)
+	return body, nil
+}
+
+// fetchLocal retrieves manifest data from a local file path.
+func (c *Client) fetchLocal(path string) ([]byte, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read local manifest file: %w", err)
 	}
 
-	return &manifest, nil
+	if len(body) > maxResponseSize {
+		return nil, ErrResponseTooBig
+	}
+
+	return body, nil
 }

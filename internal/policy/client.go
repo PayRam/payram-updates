@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -48,8 +50,38 @@ func NewClient(timeout time.Duration) *Client {
 	}
 }
 
-// Fetch retrieves and parses the policy from the given URL.
+// Fetch retrieves and parses the policy from the given URL or local file path.
+// Local file support is provided for development and testing.
+// If the URL starts with "http://" or "https://", it is fetched via HTTP.
+// Otherwise, it is treated as a local file path.
 func (c *Client) Fetch(ctx context.Context, url string) (*Policy, error) {
+	var body []byte
+	var err error
+
+	// Check if this is an HTTP(S) URL or a local file path
+	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+		// HTTP fetch (production)
+		body, err = c.fetchHTTP(ctx, url)
+	} else {
+		// Local file fetch (development/testing)
+		body, err = c.fetchLocal(url)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse JSON with strict unmarshaling
+	var policy Policy
+	if err := json.Unmarshal(body, &policy); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidJSON, err)
+	}
+
+	return &policy, nil
+}
+
+// fetchHTTP retrieves policy data from an HTTP(S) URL.
+func (c *Client) fetchHTTP(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -76,10 +108,19 @@ func (c *Client) Fetch(ctx context.Context, url string) (*Policy, error) {
 		return nil, ErrResponseTooBig
 	}
 
-	var policy Policy
-	if err := json.Unmarshal(body, &policy); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidJSON, err)
+	return body, nil
+}
+
+// fetchLocal retrieves policy data from a local file path.
+func (c *Client) fetchLocal(path string) ([]byte, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read local policy file: %w", err)
 	}
 
-	return &policy, nil
+	if len(body) > maxResponseSize {
+		return nil, ErrResponseTooBig
+	}
+
+	return body, nil
 }
