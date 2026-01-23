@@ -44,4 +44,4 @@ temp/
 
 *.env.*
 !.env.example
-data/
+data*/

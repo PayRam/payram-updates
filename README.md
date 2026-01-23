@@ -238,6 +238,69 @@ Breakpoints in the policy file prevent dashboard upgrades to specific versions:
 
 Dashboard mode will fail with `MANUAL_UPGRADE_REQUIRED` if the resolved target matches a breakpoint. Manual mode ignores breakpoints.
 
+## Manual Smoke Testing
+
+For local development and testing, the repository includes test data files in the `data/` directory.
+
+### Test Data Files
+
+- `data/upgrade-policy.json`: Policy with 10 releases and 2 breakpoints:
+  - `1.8.0`: Breaking change requiring manual step
+  - `1.10.0`: Breaking DB migration requirement
+- `data/runtime-manifest.json`: Manifest with version-specific overrides
+
+### Running Smoke Tests Locally
+
+1. **Configure for local file mode** (already set in `.env`):
+```bash
+POLICY_URL=data/upgrade-policy.json
+RUNTIME_MANIFEST_URL=data/runtime-manifest.json
+STATE_DIR=data/state
+LOG_DIR=data/logs
+```
+
+2. **Start the daemon**:
+```bash
+go run cmd/payram-updater/main.go serve
+```
+
+3. **Test health check**:
+```bash
+curl http://127.0.0.1:2359/health
+# Expected: {"status":"ok"}
+```
+
+4. **Test dashboard upgrade blocked by breakpoint**:
+```bash
+payram-updater dry-run --mode dashboard --to 1.8.0
+# Expected: State FAILED with MANUAL_UPGRADE_REQUIRED
+```
+
+5. **Test manual upgrade bypassing breakpoint**:
+```bash
+payram-updater dry-run --mode manual --to 1.8.0
+# Expected: State READY (breakpoint ignored)
+```
+
+6. **Test concurrency guard**:
+```bash
+# While job active from previous step:
+payram-updater dry-run --mode dashboard --to 1.9.0
+# Expected: HTTP 409 Conflict error
+```
+
+7. **View logs**:
+```bash
+payram-updater logs
+```
+
+### Expected Test Behaviors
+
+- **Dashboard mode**: Fails on breakpoint versions (1.8.0, 1.10.0)
+- **Manual mode**: Bypasses breakpoints, allows any version
+- **Concurrency**: Only one job allowed at a time (409 if attempted)
+- **Policy fetch failure**: Fatal in DASHBOARD mode, warning in MANUAL mode
+
 ## Systemd Service
 
 The service runs as `root` with the following characteristics:
