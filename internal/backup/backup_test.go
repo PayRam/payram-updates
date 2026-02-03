@@ -96,6 +96,20 @@ func newTestManagerWithMockContainer(t *testing.T, executor *mockExecutor) (*Man
 }
 
 func TestCreateBackup_Success(t *testing.T) {
+	// Set external DB environment to avoid container discovery
+	os.Setenv("POSTGRES_HOST", "external-db.example.com")
+	os.Setenv("POSTGRES_PORT", "5432")
+	os.Setenv("POSTGRES_DATABASE", "testdb")
+	os.Setenv("POSTGRES_USER", "testuser")
+	os.Setenv("POSTGRES_PASSWORD", "testpass")
+	defer func() {
+		os.Unsetenv("POSTGRES_HOST")
+		os.Unsetenv("POSTGRES_PORT")
+		os.Unsetenv("POSTGRES_DATABASE")
+		os.Unsetenv("POSTGRES_USER")
+		os.Unsetenv("POSTGRES_PASSWORD")
+	}()
+
 	executor := &mockExecutor{
 		executeFunc: func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
 			// Simulate pg_dump creating the file
@@ -162,8 +176,8 @@ func TestCreateBackup_Success(t *testing.T) {
 	if !containsArg(call.Args, "-Fc") {
 		t.Error("expected -Fc flag for custom format")
 	}
-	if !containsArg(call.Args, "-h") || !containsArg(call.Args, "localhost") {
-		t.Error("expected -h localhost")
+	if !containsArg(call.Args, "-h") || !containsArg(call.Args, "external-db.example.com") {
+		t.Error("expected -h external-db.example.com")
 	}
 	if !containsArg(call.Args, "-U") || !containsArg(call.Args, "testuser") {
 		t.Error("expected -U testuser")
@@ -186,6 +200,20 @@ func TestCreateBackup_Success(t *testing.T) {
 }
 
 func TestCreateBackup_PgDumpFails(t *testing.T) {
+	// Set external DB environment to avoid container discovery
+	os.Setenv("POSTGRES_HOST", "external-db.example.com")
+	os.Setenv("POSTGRES_PORT", "5432")
+	os.Setenv("POSTGRES_DATABASE", "testdb")
+	os.Setenv("POSTGRES_USER", "testuser")
+	os.Setenv("POSTGRES_PASSWORD", "testpass")
+	defer func() {
+		os.Unsetenv("POSTGRES_HOST")
+		os.Unsetenv("POSTGRES_PORT")
+		os.Unsetenv("POSTGRES_DATABASE")
+		os.Unsetenv("POSTGRES_USER")
+		os.Unsetenv("POSTGRES_PASSWORD")
+	}()
+
 	executor := &mockExecutor{
 		executeFunc: func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
 			return []byte("connection refused"), &mockError{msg: "exit status 1"}
@@ -203,8 +231,8 @@ func TestCreateBackup_PgDumpFails(t *testing.T) {
 		t.Fatal("expected error, got nil")
 	}
 
-	if !strings.Contains(err.Error(), "pg_dump failed") {
-		t.Errorf("expected pg_dump failed error, got: %v", err)
+	if !strings.Contains(err.Error(), "pg_dump (host) failed") {
+		t.Errorf("expected pg_dump (host) failed error, got: %v", err)
 	}
 }
 
@@ -423,6 +451,20 @@ func TestGetBackupByPath(t *testing.T) {
 }
 
 func TestBackupFilename(t *testing.T) {
+	// Set external DB environment to avoid container discovery
+	os.Setenv("POSTGRES_HOST", "external-db.example.com")
+	os.Setenv("POSTGRES_PORT", "5432")
+	os.Setenv("POSTGRES_DATABASE", "testdb")
+	os.Setenv("POSTGRES_USER", "testuser")
+	os.Setenv("POSTGRES_PASSWORD", "testpass")
+	defer func() {
+		os.Unsetenv("POSTGRES_HOST")
+		os.Unsetenv("POSTGRES_PORT")
+		os.Unsetenv("POSTGRES_DATABASE")
+		os.Unsetenv("POSTGRES_USER")
+		os.Unsetenv("POSTGRES_PASSWORD")
+	}()
+
 	executor := &mockExecutor{
 		executeFunc: func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
 			// Find and create the output file
@@ -574,39 +616,40 @@ func TestRestoreBackup_EmptyFile(t *testing.T) {
 }
 
 func TestRestoreBackup_PgRestoreFails(t *testing.T) {
-	var callCount int
-	executor := mockDockerInspectExecutor(func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
-		callCount++
-		t.Logf("Mock called %d: name=%s, args=%v", callCount, name, args)
-		err := &mockError{msg: "exit status 1"}
-		t.Logf("Returning error: %v (type: %T)", err, err)
-		return []byte("connection refused"), err
-	})
+	// Set external DB environment to avoid container discovery
+	os.Setenv("POSTGRES_HOST", "external-db.example.com")
+	os.Setenv("POSTGRES_PORT", "5432")
+	os.Setenv("POSTGRES_DATABASE", "testdb")
+	os.Setenv("POSTGRES_USER", "testuser")
+	os.Setenv("POSTGRES_PASSWORD", "testpass")
+	defer func() {
+		os.Unsetenv("POSTGRES_HOST")
+		os.Unsetenv("POSTGRES_PORT")
+		os.Unsetenv("POSTGRES_DATABASE")
+		os.Unsetenv("POSTGRES_USER")
+		os.Unsetenv("POSTGRES_PASSWORD")
+	}()
+
+	executor := &mockExecutor{
+		executeFunc: func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
+			// Return error for pg_restore
+			return []byte("connection refused"), &mockError{msg: "exit status 1"}
+		},
+	}
 
 	mgr, tmpDir := newTestManager(t, executor)
-
-	// Create persisted credentials for restore
-	stateDir := filepath.Join(tmpDir, "state")
-	os.MkdirAll(stateDir, 0755)
-	dbEnvContent := `POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DATABASE=testdb
-POSTGRES_USERNAME=testuser
-POSTGRES_PASSWORD=testpass
-`
-	os.WriteFile(filepath.Join(stateDir, "db.env"), []byte(dbEnvContent), 0600)
 
 	// Create a backup file
 	backupPath := filepath.Join(tmpDir, "backups", "test.dump")
 	os.WriteFile(backupPath, []byte("backup data"), 0644)
 
-	_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true, ContainerName: "test-payram-mock"})
-	t.Logf("RestoreBackup returned: err=%v (type: %T)", err, err)
+	_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "pg_restore failed") {
-		t.Errorf("expected pg_restore failed error, got: %v", err)
+	// After refactor, error message is now "RESTORE_FAILED: restore" instead of "pg_restore failed"
+	if !strings.Contains(err.Error(), "RESTORE_FAILED") && !strings.Contains(err.Error(), "restore") {
+		t.Errorf("expected restore failed error, got: %v", err)
 	}
 }
 

@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/payram/payram-updater/internal/container"
+	"github.com/payram/payram-updater/internal/dbexec"
 )
 
 // BackupInfo contains metadata about a backup.
@@ -104,11 +104,34 @@ func NewManager(cfg Config, executor CommandExecutor, logger Logger) *Manager {
 // CreateBackup creates a new database backup using pg_dump.
 // Returns BackupInfo with metadata, or an error.
 // Backups are always enabled.
+//
+// BACKUP LOCATION MODES (matches restore logic):
+// 1. If POSTGRES_HOST is localhost/127.0.0.1 → IN_CONTAINER_DB (run pg_dump via docker exec)
+// 2. Else → EXTERNAL_DB (run pg_dump from host)
 func (m *Manager) CreateBackup(ctx context.Context, meta BackupMeta) (*BackupInfo, error) {
 	// Ensure backup directory exists
 	if err := os.MkdirAll(m.Config.Dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create backup directory: %w", err)
 	}
+
+	// Create executor wrapper for dbexec
+	executor := &executorWrapper{executor: m.Executor}
+
+	// CREDENTIAL DISCOVERY using shared dbexec package
+	dbCtx, err := dbexec.DiscoverDBContext(ctx, executor, dbexec.DiscoverOpts{
+		ImagePattern: m.Config.ImagePattern,
+		BackupDir:    m.Config.Dir,
+		Logger:       m.Logger,
+	})
+	if err != nil {
+		// Check if container not found for in-container DB
+		if dbErr, ok := err.(*dbexec.DBError); ok && dbErr.Code == "CONTAINER_NOT_FOUND" {
+			return nil, fmt.Errorf("BACKUP_FAILED: container not running; cannot backup in-container DB. Start the container and retry.")
+		}
+		return nil, err
+	}
+
+	m.Logger.Printf("Backup mode: %s, credential source: %s", dbCtx.Mode, dbCtx.CredSource)
 
 	// Generate filename: payram-backup-<timestamp>-<fromVersion>-to-<toVersion>.dump
 	timestamp := time.Now().UTC().Format("20060102-150405")
@@ -120,40 +143,53 @@ func (m *Manager) CreateBackup(ctx context.Context, meta BackupMeta) (*BackupInf
 
 	m.Logger.Printf("Creating backup: %s", backupPath)
 
-	// Build pg_dump command
-	args := []string{
-		"-Fc", // Custom format
-		"-h", m.Config.PGHost,
-		"-p", fmt.Sprintf("%d", m.Config.PGPort),
-		"-U", m.Config.PGUser,
-		"-d", m.Config.PGDB,
-		"-f", backupPath,
+	// Select executor based on mode
+	var pgExec dbexec.PGExecutor
+	var executorType string
+	if dbCtx.Mode == dbexec.DBModeInContainer {
+		if dbCtx.ContainerName == "" {
+			return nil, fmt.Errorf("BACKUP_FAILED: DBModeInContainer requires container name")
+		}
+		pgExec = dbexec.NewDockerPGExecutor(executor, m.Logger)
+		executorType = "docker"
+		m.Logger.Printf("DB mode: in_container, Executor: docker, Container: %s", dbCtx.ContainerName)
+	} else {
+		hostExec := dbexec.NewHostPGExecutor(executor, m.Logger)
+		if m.Config.PGDumpBin != "" {
+			hostExec.PGDumpBin = m.Config.PGDumpBin
+			dir := filepath.Dir(m.Config.PGDumpBin)
+			hostExec.PSQLBin = filepath.Join(dir, "psql")
+			hostExec.PGRestoreBin = filepath.Join(dir, "pg_restore")
+		}
+		pgExec = hostExec
+		executorType = "host"
+		m.Logger.Printf("DB mode: external, Executor: host, Host: %s:%s", dbCtx.Creds.Host, dbCtx.Creds.Port)
 	}
 
-	// Set environment for password
-	env := os.Environ()
-	if m.Config.PGPassword != "" {
-		env = append(env, fmt.Sprintf("PGPASSWORD=%s", m.Config.PGPassword))
+	// HARD GUARD: Fail fast if logic regresses
+	if dbCtx.Mode == dbexec.DBModeInContainer && executorType != "docker" {
+		return nil, fmt.Errorf("BUG: host pg_dump attempted for container database (mode=%s, executor=%s)", dbCtx.Mode, executorType)
 	}
 
-	// Execute pg_dump
-	output, err := m.Executor.Execute(ctx, m.Config.PGDumpBin, args, env)
+	// Execute backup
+	err = pgExec.Dump(ctx, dbCtx, backupPath, "custom")
 	if err != nil {
-		return nil, fmt.Errorf("pg_dump failed: %w: %s", err, string(output))
+		return nil, err
 	}
 
 	m.Logger.Printf("Backup created successfully: %s", backupPath)
 
 	// Persist credentials if this is a local database
 	// Only persist after successful backup, and only for localhost/127.0.0.1
-	if IsLocalDB(m.Config.PGHost) {
+	if dbCtx.Mode == dbexec.DBModeInContainer {
+		// Convert dbexec.DBCreds to ContainerDBConfig for persistence
 		dbConfig := &ContainerDBConfig{
-			Host:     m.Config.PGHost,
-			Port:     fmt.Sprintf("%d", m.Config.PGPort),
-			Database: m.Config.PGDB,
-			Username: m.Config.PGUser,
-			Password: m.Config.PGPassword,
-			SSLMode:  "", // Not available in legacy config
+			Host:     dbCtx.Creds.Host,
+			Port:     dbCtx.Creds.Port,
+			Database: dbCtx.Creds.Database,
+			Username: dbCtx.Creds.Username,
+			Password: dbCtx.Creds.Password,
+			SSLMode:  dbCtx.Creds.SSLMode,
 		}
 		if err := PersistDBCredentials(m.Config.Dir, dbConfig); err != nil {
 			m.Logger.Printf("Warning: failed to persist DB credentials: %v", err)
@@ -187,14 +223,23 @@ func (m *Manager) CreateBackup(ctx context.Context, meta BackupMeta) (*BackupInf
 		FromVersion:   meta.FromVersion,
 		TargetVersion: meta.TargetVersion,
 		JobID:         meta.JobID,
-		Database:      m.Config.PGDB,
-		Host:          m.Config.PGHost,
-		Port:          m.Config.PGPort,
+		Database:      dbCtx.Creds.Database,
+		Host:          dbCtx.Creds.Host,
+		Port:          mustParsePort(dbCtx.Creds.Port),
 	}
 
 	// No index file needed - backups are discovered via filesystem scan
 
 	return info, nil
+}
+
+// backupFromContainer runs pg_dump inside the container via docker exec.
+// The backup file is written directly to the host backup directory (which should be bind-mounted).
+// mustParsePort converts a port string to int, returns 0 if invalid.
+func mustParsePort(portStr string) int {
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+	return port
 }
 
 // ListBackups returns all backups by scanning the filesystem.
@@ -553,87 +598,59 @@ func (m *Manager) RestoreBackup(ctx context.Context, backupPath string, opts Res
 
 	m.Logger.Printf("Restoring database from: %s (format: %s)", backupPath, format)
 
-	// STRICT CREDENTIAL RESOLUTION
-	var dbConfig *ContainerDBConfig
-	var containerName string
-	var credentialSource string
+	// STRICT CREDENTIAL RESOLUTION using shared dbexec package
+	executor := &executorWrapper{executor: m.Executor}
 
-	// Check if we have a remote database via environment variables
-	envHost := os.Getenv("POSTGRES_HOST")
-	if envHost != "" && !IsLocalDB(envHost) {
-		// RULE 1: Remote DB requires explicit credentials from environment
-		m.Logger.Printf("Remote database detected: %s", envHost)
-		dbConfig = &ContainerDBConfig{
-			Host:     envHost,
-			Port:     getEnvOrDefault("POSTGRES_PORT", "5432"),
-			Database: getEnvOrDefault("POSTGRES_DATABASE", getEnvOrDefault("POSTGRES_DB", "")),
-			Username: getEnvOrDefault("POSTGRES_USERNAME", getEnvOrDefault("POSTGRES_USER", "")),
-			Password: os.Getenv("POSTGRES_PASSWORD"),
-			SSLMode:  getEnvOrDefault("POSTGRES_SSLMODE", "disable"),
+	dbCtx, err := dbexec.DiscoverDBContext(ctx, executor, dbexec.DiscoverOpts{
+		ImagePattern: m.Config.ImagePattern,
+		BackupDir:    m.Config.Dir,
+		Logger:       m.Logger,
+	})
+	if err != nil {
+		// Check if credentials unavailable
+		if dbErr, ok := err.(*dbexec.DBError); ok && dbErr.Code == "CONTAINER_NOT_FOUND" {
+			return nil, fmt.Errorf("CREDENTIALS_UNAVAILABLE: no running container and no persisted credentials found.\n\nRecovery options:\n1. Start the Payram container and retry\n2. Ensure data/state/db.env exists with valid credentials\n3. For remote databases, set POSTGRES_* environment variables\n\nError: %w", err)
 		}
-		if err := dbConfig.Validate(); err != nil {
-			return nil, fmt.Errorf("CREDENTIALS_REQUIRED: remote database requires valid credentials in environment variables: %w", err)
+		return nil, err
+	}
+
+	m.Logger.Printf("Credential source: %s", dbCtx.CredSource)
+
+	// Select executor based on mode
+	var pgExec dbexec.PGExecutor
+	var executorType string
+	if dbCtx.Mode == dbexec.DBModeInContainer {
+		pgExec = dbexec.NewDockerPGExecutor(executor, m.Logger)
+		executorType = "docker"
+		// Override container name if provided in options
+		if opts.ContainerName != "" {
+			dbCtx.ContainerName = opts.ContainerName
+			m.Logger.Printf("Using provided container name: %s", opts.ContainerName)
 		}
-		credentialSource = "environment variables (remote database)"
+		if dbCtx.ContainerName == "" {
+			return nil, fmt.Errorf("RESTORE_FAILED: DBModeInContainer requires container name")
+		}
+		m.Logger.Printf("DB mode: in_container, Executor: docker, Container: %s", dbCtx.ContainerName)
 	} else {
-		// Local database - try container first, then persisted credentials
-
-		// RULE 2: Try to discover and extract from running container
-		imagePattern := m.Config.ImagePattern
-		if imagePattern == "" {
-			imagePattern = "payramapp/payram:"
+		hostExec := dbexec.NewHostPGExecutor(executor, m.Logger)
+		if m.Config.PGDumpBin != "" {
+			hostExec.PGDumpBin = m.Config.PGDumpBin
+			dir := filepath.Dir(m.Config.PGDumpBin)
+			hostExec.PSQLBin = filepath.Join(dir, "psql")
+			hostExec.PGRestoreBin = filepath.Join(dir, "pg_restore")
 		}
-		discoverer := container.NewDiscoverer("docker", imagePattern, m.Logger)
-		discovered, err := discoverer.DiscoverPayramContainer(ctx)
-
-		if err == nil {
-			// Container is running - extract credentials
-			containerName = discovered.Name
-			inspector := NewDockerInspector("docker", m.Executor)
-			dbConfig, err = inspector.GetDBConfig(ctx, containerName)
-			if err != nil {
-				return nil, fmt.Errorf("failed to extract credentials from running container: %w", err)
-			}
-			credentialSource = fmt.Sprintf("running container (%s)", containerName)
-			m.Logger.Printf("Using credentials from running container: %s (version: %s)", containerName, discovered.ImageTag)
-		} else {
-			// RULE 3: Container not running - try persisted credentials
-			m.Logger.Printf("No running Payram container found, attempting to load persisted credentials...")
-			dbConfig, err = LoadPersistedCredentials(m.Config.Dir)
-			if err != nil {
-				// RULE 4: No credentials available
-				return nil, fmt.Errorf("CREDENTIALS_UNAVAILABLE: no running container and no persisted credentials found.\n\nRecovery options:\n1. Start the Payram container and retry\n2. Ensure data/state/db.env exists with valid credentials\n3. For remote databases, set POSTGRES_* environment variables\n\nError: %w", err)
-			}
-			credentialSource = "persisted credentials (data/state/db.env)"
-			m.Logger.Printf("Using stored local DB credentials from data/state/db.env")
-
-			// Use provided container name if available (for local DB restore via docker exec)
-			if opts.ContainerName != "" {
-				containerName = opts.ContainerName
-				m.Logger.Printf("Using provided container name: %s", containerName)
-			}
-		}
+		pgExec = hostExec
+		executorType = "host"
+		m.Logger.Printf("DB mode: external, Executor: host, Host: %s:%s", dbCtx.Creds.Host, dbCtx.Creds.Port)
 	}
 
-	// Validate DB config
-	if err := dbConfig.Validate(); err != nil {
-		return nil, fmt.Errorf("INVALID_DB_CONFIG: %w", err)
+	// HARD GUARD: Fail fast if logic regresses
+	if dbCtx.Mode == dbexec.DBModeInContainer && executorType != "docker" {
+		return nil, fmt.Errorf("BUG: host pg_restore attempted for container database (mode=%s, executor=%s)", dbCtx.Mode, executorType)
 	}
 
-	m.Logger.Printf("Credential source: %s", credentialSource)
-
-	// Execute restore based on database location
-	isLocal := IsLocalDB(dbConfig.Host)
-
-	var err error
-	if format == "sql" {
-		err = m.restoreWithPsql(ctx, backupPath, dbConfig, containerName, isLocal)
-	} else if format == "dump" {
-		err = m.restoreWithPgRestore(ctx, backupPath, dbConfig, containerName, isLocal)
-	} else {
-		return nil, fmt.Errorf("INVALID_BACKUP_FORMAT: unknown format %s", format)
-	}
-
+	// Execute restore
+	err = pgExec.Restore(ctx, dbCtx, backupPath, format)
 	if err != nil {
 		return nil, err
 	}
@@ -649,14 +666,6 @@ func (m *Manager) RestoreBackup(ctx context.Context, backupPath string, opts Res
 	return result, nil
 }
 
-// getEnvOrDefault returns the value of an environment variable or a default value.
-func getEnvOrDefault(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
 // detectBackupFormat returns "sql", "dump", or "unknown" based on file extension.
 func detectBackupFormat(path string) string {
 	if strings.HasSuffix(path, ".sql") {
@@ -666,127 +675,6 @@ func detectBackupFormat(path string) string {
 		return "dump"
 	}
 	return "unknown"
-}
-
-// restoreWithPsql restores a plain SQL dump using psql.
-// For local databases, runs psql inside the container using docker exec.
-// For remote databases, runs psql from the host.
-func (m *Manager) restoreWithPsql(ctx context.Context, backupPath string, dbConfig *ContainerDBConfig, containerName string, isLocal bool) error {
-	psqlBin := "psql"
-	if m.Config.PGDumpBin != "pg_dump" && m.Config.PGDumpBin != "" {
-		dir := filepath.Dir(m.Config.PGDumpBin)
-		psqlBin = filepath.Join(dir, "psql")
-	}
-
-	var output []byte
-	var err error
-
-	if isLocal && containerName != "" {
-		// LOCAL DB: Run psql inside container using docker exec
-		m.Logger.Printf("Executing restore inside container: %s", containerName)
-
-		// Make backup file absolute path for docker exec
-		absBackupPath, err := filepath.Abs(backupPath)
-		if err != nil {
-			return fmt.Errorf("failed to get absolute path: %w", err)
-		}
-
-		// Create a command that pipes the backup content
-		// We'll use sh -c to pipe content through stdin
-		shellCmd := fmt.Sprintf("docker exec -i %s psql -U %s -d %s",
-			containerName, dbConfig.Username, dbConfig.Database)
-
-		output, err = m.Executor.Execute(ctx, "sh", []string{"-c", fmt.Sprintf("cat %s | %s", absBackupPath, shellCmd)}, nil)
-	} else {
-		// REMOTE DB: Run psql from host
-		m.Logger.Printf("Executing restore from host to remote database: %s:%s", dbConfig.Host, dbConfig.Port)
-
-		args := []string{
-			"-h", dbConfig.Host,
-			"-p", dbConfig.Port,
-			"-U", dbConfig.Username,
-			"-d", dbConfig.Database,
-			"-f", backupPath,
-		}
-
-		// Build environment with PGPASSWORD (NEVER log this)
-		env := os.Environ()
-		if dbConfig.Password != "" {
-			env = append(env, fmt.Sprintf("PGPASSWORD=%s", dbConfig.Password))
-		}
-
-		output, err = m.Executor.Execute(ctx, psqlBin, args, env)
-	}
-
-	if err != nil {
-		// NEVER include env in error (contains password)
-		return fmt.Errorf("psql failed: %w: %s", err, string(output))
-	}
-
-	m.Logger.Printf("Database restored successfully from: %s (using psql)", backupPath)
-	return nil
-}
-
-// restoreWithPgRestore restores a custom format dump using pg_restore.
-// For local databases, runs pg_restore inside the container using docker exec.
-// For remote databases, runs pg_restore from the host.
-func (m *Manager) restoreWithPgRestore(ctx context.Context, backupPath string, dbConfig *ContainerDBConfig, containerName string, isLocal bool) error {
-	pgRestoreBin := "pg_restore"
-	if m.Config.PGDumpBin != "pg_dump" && m.Config.PGDumpBin != "" {
-		dir := filepath.Dir(m.Config.PGDumpBin)
-		pgRestoreBin = filepath.Join(dir, "pg_restore")
-	}
-
-	var output []byte
-	var err error
-
-	if isLocal && containerName != "" {
-		// LOCAL DB: Run pg_restore inside container using docker exec
-		m.Logger.Printf("Executing restore inside container: %s", containerName)
-
-		// Make backup file absolute path
-		absBackupPath, err := filepath.Abs(backupPath)
-		if err != nil {
-			return fmt.Errorf("failed to get absolute path: %w", err)
-		}
-
-		// Build docker exec command - pg_restore can read from stdin
-		shellCmd := fmt.Sprintf("docker exec -i %s pg_restore --clean --if-exists --no-owner --no-privileges -U %s -d %s",
-			containerName, dbConfig.Username, dbConfig.Database)
-
-		output, err = m.Executor.Execute(ctx, "sh", []string{"-c", fmt.Sprintf("cat %s | %s", absBackupPath, shellCmd)}, nil)
-	} else {
-		// REMOTE DB: Run pg_restore from host
-		m.Logger.Printf("Executing restore from host to remote database: %s:%s", dbConfig.Host, dbConfig.Port)
-
-		args := []string{
-			"--clean",
-			"--if-exists",
-			"--no-owner",
-			"--no-privileges",
-			"-h", dbConfig.Host,
-			"-p", dbConfig.Port,
-			"-U", dbConfig.Username,
-			"-d", dbConfig.Database,
-			backupPath,
-		}
-
-		// Build environment with PGPASSWORD (NEVER log this)
-		env := os.Environ()
-		if dbConfig.Password != "" {
-			env = append(env, fmt.Sprintf("PGPASSWORD=%s", dbConfig.Password))
-		}
-
-		output, err = m.Executor.Execute(ctx, pgRestoreBin, args, env)
-	}
-
-	if err != nil {
-		// NEVER include env in error (contains password)
-		return fmt.Errorf("pg_restore failed: %w: %s", err, string(output))
-	}
-
-	m.Logger.Printf("Database restored successfully from: %s (using pg_restore)", backupPath)
-	return nil
 }
 
 // VerifyBackupFile checks that a backup file is valid for restore.
@@ -819,4 +707,13 @@ func (m *Manager) VerifyBackupFile(path string) error {
 	f.Close()
 
 	return nil
+}
+
+// executorWrapper wraps a backup.CommandExecutor to satisfy dbexec.CommandExecutor
+type executorWrapper struct {
+	executor CommandExecutor
+}
+
+func (e *executorWrapper) Execute(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
+	return e.executor.Execute(ctx, name, args, env)
 }
