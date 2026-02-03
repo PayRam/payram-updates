@@ -20,6 +20,9 @@ const (
 	JobStatePolicyFetching   JobState = "POLICY_FETCHING"
 	JobStateManifestFetching JobState = "MANIFEST_FETCHING"
 	JobStateReady            JobState = "READY"
+	JobStateBackingUp        JobState = "BACKING_UP"
+	JobStateExecuting        JobState = "EXECUTING"
+	JobStateVerifying        JobState = "VERIFYING"
 	JobStateFailed           JobState = "FAILED"
 )
 
@@ -32,6 +35,7 @@ type Job struct {
 	State           JobState  `json:"state"`
 	FailureCode     string    `json:"failure_code"`
 	Message         string    `json:"message"`
+	BackupPath      string    `json:"backup_path,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }

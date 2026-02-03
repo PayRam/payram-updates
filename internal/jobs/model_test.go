@@ -71,6 +71,9 @@ func TestJobStateValues(t *testing.T) {
 		{JobStatePolicyFetching, "POLICY_FETCHING"},
 		{JobStateManifestFetching, "MANIFEST_FETCHING"},
 		{JobStateReady, "READY"},
+		{JobStateBackingUp, "BACKING_UP"},
+		{JobStateExecuting, "EXECUTING"},
+		{JobStateVerifying, "VERIFYING"},
 		{JobStateFailed, "FAILED"},
 	}
 
