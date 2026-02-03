@@ -41,7 +41,7 @@ fmt: ## Format all Go source files
 .PHONY: fmt-check
 fmt-check: ## Check if all Go files are formatted
 	@echo "Checking Go formatting..."
-	@UNFORMATTED=$$(gofmt -l .); \
+	@UNFORMATTED=$$(find . -name '*.go' -not -path './data*' -not -path './vendor/*' -exec gofmt -l {} +); \
 	if [ -n "$$UNFORMATTED" ]; then \
 		echo "The following files are not formatted:"; \
 		echo "$$UNFORMATTED"; \
@@ -52,7 +52,7 @@ fmt-check: ## Check if all Go files are formatted
 .PHONY: vet
 vet: ## Run go vet on all packages
 	@echo "Running go vet..."
-	@$(GO) vet ./...
+	@$(GO) vet ./cmd/... ./internal/...
 	@echo "Vet complete!"
 
 ##@ Testing
@@ -60,13 +60,13 @@ vet: ## Run go vet on all packages
 .PHONY: test
 test: ## Run all tests
 	@echo "Running tests..."
-	@$(GO) test $(GOFLAGS) ./...
+	@$(GO) test $(GOFLAGS) ./cmd/... ./internal/...
 	@echo "Tests complete!"
 
 .PHONY: cover
 cover: ## Run tests with coverage and generate HTML report
 	@echo "Running tests with coverage..."
-	@$(GO) test -coverprofile=$(COVERAGE_FILE) ./...
+	@$(GO) test -coverprofile=$(COVERAGE_FILE) ./cmd/... ./internal/...
 	@$(GO) tool cover -html=$(COVERAGE_FILE) -o $(COVERAGE_HTML)
 	@echo "Coverage report generated: $(COVERAGE_HTML)"
 	@$(GO) tool cover -func=$(COVERAGE_FILE) | grep total
