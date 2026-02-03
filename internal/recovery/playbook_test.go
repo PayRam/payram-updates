@@ -444,16 +444,17 @@ func TestReplaceBackupPlaceholder(t *testing.T) {
 			name:       "empty backup path preserves placeholder",
 			step:       "Restore from <backup_path>",
 			backupPath: "",
-			want:       "Restore from ",
+			want:       "Restore from <backup_path>",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := replaceBackupPlaceholder(tc.step, tc.backupPath)
+			ctx := PlaybookContext{BackupPath: tc.backupPath}
+			got := renderTemplate(tc.step, ctx)
 			if got != tc.want {
-				t.Errorf("replaceBackupPlaceholder(%q, %q) = %q, want %q",
-					tc.step, tc.backupPath, got, tc.want)
+				t.Errorf("renderTemplate(%q, ctx) = %q, want %q",
+					tc.step, got, tc.want)
 			}
 		})
 	}
@@ -645,5 +646,365 @@ func TestDataRiskClassification(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRenderPlaybook verifies template placeholder replacement.
+func TestRenderPlaybook(t *testing.T) {
+	tests := []struct {
+		name     string
+		code     string
+		ctx      PlaybookContext
+		wantText string // substring to search for in rendered output
+	}{
+		{
+			name: "replaces container_name placeholder",
+			code: "DOCKER_ERROR",
+			ctx: PlaybookContext{
+				ContainerName: "payram-production",
+				HTTPPort:      "8080",
+				ImageRepo:     "payramapp/payram",
+			},
+			wantText: "docker logs payram-production",
+		},
+		{
+			name: "replaces http_port placeholder",
+			code: "DOCKER_ERROR",
+			ctx: PlaybookContext{
+				ContainerName: "payram-production",
+				HTTPPort:      "18080",
+				ImageRepo:     "payramapp/payram",
+			},
+			wantText: "grep 18080",
+		},
+		{
+			name: "replaces base_url placeholder",
+			code: "HEALTHCHECK_FAILED",
+			ctx: PlaybookContext{
+				ContainerName: "payram-core",
+				BaseURL:       "http://127.0.0.1:18080",
+				ImageRepo:     "payramapp/payram",
+			},
+			wantText: "curl http://127.0.0.1:18080/health",
+		},
+		{
+			name: "replaces backup_path placeholder",
+			code: "MIGRATION_FAILED",
+			ctx: PlaybookContext{
+				ContainerName: "payram-core",
+				BackupPath:    "/var/lib/payram/backups/payram-backup-20240101-120000.dump",
+			},
+			wantText: "payram-backup-20240101-120000.dump",
+		},
+		{
+			name: "replaces image_repo placeholder",
+			code: "CONTAINER_NOT_FOUND",
+			ctx: PlaybookContext{
+				ImageRepo: "customrepo/payram",
+			},
+			wantText: "grep customrepo/payram",
+		},
+		{
+			name: "handles multiple placeholders in one step",
+			code: "VERSION_MISMATCH",
+			ctx: PlaybookContext{
+				ContainerName: "payram-core",
+				BaseURL:       "http://127.0.0.1:9090",
+			},
+			wantText: "docker inspect payram-core",
+		},
+		{
+			name: "leaves unknown placeholders unchanged",
+			code: "DOCKER_ERROR",
+			ctx: PlaybookContext{
+				ContainerName: "payram-core",
+				// HTTPPort and ImageRepo not provided
+			},
+			wantText: "grep <http_port>", // should remain as placeholder
+		},
+		{
+			name:     "empty context leaves all placeholders",
+			code:     "HEALTHCHECK_FAILED",
+			ctx:      PlaybookContext{},
+			wantText: "<container_name>",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rendered := RenderPlaybook(tt.code, tt.ctx)
+
+			// Check if expected text appears in SSH steps
+			found := false
+			for _, step := range rendered.SSHSteps {
+				if strings.Contains(step, tt.wantText) {
+					found = true
+					break
+				}
+			}
+
+			if !found {
+				t.Errorf("Expected to find %q in rendered steps, got: %v", tt.wantText, rendered.SSHSteps)
+			}
+		})
+	}
+}
+
+// TestRenderPlaybook_BackupPathInStruct verifies BackupPath is set in the returned playbook.
+func TestRenderPlaybook_BackupPathInStruct(t *testing.T) {
+	backupPath := "/var/lib/payram/backups/test-backup.dump"
+	ctx := PlaybookContext{
+		BackupPath:    backupPath,
+		ContainerName: "payram-core",
+	}
+
+	rendered := RenderPlaybook("MIGRATION_FAILED", ctx)
+
+	if rendered.BackupPath != backupPath {
+		t.Errorf("Expected BackupPath to be set to %q, got %q", backupPath, rendered.BackupPath)
+	}
+}
+
+// TestRenderPlaybook_AllPlaceholders verifies all placeholder types are replaced.
+func TestRenderPlaybook_AllPlaceholders(t *testing.T) {
+	ctx := PlaybookContext{
+		ContainerName: "payram-prod",
+		BaseURL:       "http://127.0.0.1:18080",
+		HTTPPort:      "18080",
+		DBPort:        "15432",
+		ImageRepo:     "payramapp/payram",
+		BackupPath:    "/data/backups/test.dump",
+	}
+
+	// Test with MIGRATION_TIMEOUT which uses multiple placeholders
+	rendered := RenderPlaybook("MIGRATION_TIMEOUT", ctx)
+
+	// Verify all placeholders were replaced
+	for _, step := range rendered.SSHSteps {
+		if strings.Contains(step, "<container_name>") {
+			t.Errorf("Found unreplaced <container_name> in: %s", step)
+		}
+		if strings.Contains(step, "<base_url>") {
+			t.Errorf("Found unreplaced <base_url> in: %s", step)
+		}
+		if strings.Contains(step, "<http_port>") {
+			t.Errorf("Found unreplaced <http_port> in: %s", step)
+		}
+		if strings.Contains(step, "<backup_path>") {
+			t.Errorf("Found unreplaced <backup_path> in: %s", step)
+		}
+	}
+
+	// Verify expected replacements were made
+	stepsText := strings.Join(rendered.SSHSteps, "\n")
+	if !strings.Contains(stepsText, "payram-prod") {
+		t.Error("Expected container name 'payram-prod' to appear in rendered steps")
+	}
+	if !strings.Contains(stepsText, "http://127.0.0.1:18080") {
+		t.Error("Expected base URL to appear in rendered steps")
+	}
+}
+
+// TestRenderPlaybook_NoPlaceholders verifies playbooks without placeholders still work.
+func TestRenderPlaybook_NoPlaceholders(t *testing.T) {
+	// Test playbook with no placeholders (e.g., POLICY_FETCH_FAILED)
+	ctx := PlaybookContext{
+		ContainerName: "payram-core",
+		BaseURL:       "http://127.0.0.1:8080",
+	}
+
+	rendered := RenderPlaybook("POLICY_FETCH_FAILED", ctx)
+
+	// Should not panic or error
+	if len(rendered.SSHSteps) == 0 {
+		t.Error("Expected SSH steps to be present")
+	}
+
+	// Original steps should be unchanged
+	original := GetPlaybook("POLICY_FETCH_FAILED")
+	if len(rendered.SSHSteps) != len(original.SSHSteps) {
+		t.Errorf("Expected %d steps, got %d", len(original.SSHSteps), len(rendered.SSHSteps))
+	}
+}
+
+// TestRenderTemplate verifies the internal template rendering function.
+func TestRenderTemplate(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		ctx  PlaybookContext
+		want string
+	}{
+		{
+			name: "single placeholder",
+			text: "docker logs <container_name>",
+			ctx: PlaybookContext{
+				ContainerName: "payram-core",
+			},
+			want: "docker logs payram-core",
+		},
+		{
+			name: "multiple placeholders",
+			text: "curl <base_url>/health on port <http_port>",
+			ctx: PlaybookContext{
+				BaseURL:  "http://127.0.0.1:9090",
+				HTTPPort: "9090",
+			},
+			want: "curl http://127.0.0.1:9090/health on port 9090",
+		},
+		{
+			name: "no placeholders",
+			text: "Check network connectivity: curl -I https://github.com",
+			ctx: PlaybookContext{
+				ContainerName: "payram-core",
+			},
+			want: "Check network connectivity: curl -I https://github.com",
+		},
+		{
+			name: "empty context value leaves placeholder",
+			text: "docker exec <container_name> ps",
+			ctx: PlaybookContext{
+				ContainerName: "", // empty
+			},
+			want: "docker exec <container_name> ps",
+		},
+		{
+			name: "all placeholders",
+			text: "<container_name> <base_url> <http_port> <db_port> <image_repo> <backup_path>",
+			ctx: PlaybookContext{
+				ContainerName: "test-container",
+				BaseURL:       "http://localhost:8080",
+				HTTPPort:      "8080",
+				DBPort:        "5432",
+				ImageRepo:     "test/repo",
+				BackupPath:    "/backups/test.dump",
+			},
+			want: "test-container http://localhost:8080 8080 5432 test/repo /backups/test.dump",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := renderTemplate(tt.text, tt.ctx)
+			if got != tt.want {
+				t.Errorf("renderTemplate() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetPlaybookWithBackup_BackwardCompatibility verifies deprecated function still works.
+func TestGetPlaybookWithBackup_BackwardCompatibility(t *testing.T) {
+	backupPath := "/var/lib/payram/backups/test-backup.dump"
+
+	// Test the deprecated function still works
+	playbook := GetPlaybookWithBackup("MIGRATION_FAILED", backupPath)
+
+	if playbook.BackupPath != backupPath {
+		t.Errorf("Expected BackupPath to be %q, got %q", backupPath, playbook.BackupPath)
+	}
+
+	// Verify backup path appears in steps
+	found := false
+	for _, step := range playbook.SSHSteps {
+		if strings.Contains(step, backupPath) {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		t.Errorf("Expected backup path %q to appear in steps", backupPath)
+	}
+}
+
+// TestRenderPlaybook_PreservesMetadata verifies metadata is not changed during rendering.
+func TestRenderPlaybook_PreservesMetadata(t *testing.T) {
+	code := "MIGRATION_FAILED"
+	ctx := PlaybookContext{
+		ContainerName: "payram-core",
+		BackupPath:    "/test/backup.dump",
+	}
+
+	rendered := RenderPlaybook(code, ctx)
+	original := GetPlaybook(code)
+
+	// Verify metadata is preserved
+	if rendered.Code != original.Code {
+		t.Errorf("Code changed: got %q, want %q", rendered.Code, original.Code)
+	}
+	if rendered.Severity != original.Severity {
+		t.Errorf("Severity changed: got %q, want %q", rendered.Severity, original.Severity)
+	}
+	if rendered.Title != original.Title {
+		t.Errorf("Title changed: got %q, want %q", rendered.Title, original.Title)
+	}
+	if rendered.DocsURL != original.DocsURL {
+		t.Errorf("DocsURL changed: got %q, want %q", rendered.DocsURL, original.DocsURL)
+	}
+	if rendered.DataRisk != original.DataRisk {
+		t.Errorf("DataRisk changed: got %q, want %q", rendered.DataRisk, original.DataRisk)
+	}
+}
+
+// TestRenderPlaybook_NoHardcodedValues verifies all hardcoded values have been removed.
+func TestRenderPlaybook_NoHardcodedValues(t *testing.T) {
+	// Verify no playbooks contain hardcoded values
+	hardcodedValues := []string{
+		"payram-dummy",
+		"18080",
+		"http://127.0.0.1:18080",
+	}
+
+	for code, playbook := range playbooks {
+		for _, hardcoded := range hardcodedValues {
+			// Check SSH steps
+			for _, step := range playbook.SSHSteps {
+				if strings.Contains(step, hardcoded) {
+					t.Errorf("Playbook %s contains hardcoded value %q in step: %s", code, hardcoded, step)
+				}
+			}
+			// Check user message
+			if strings.Contains(playbook.UserMessage, hardcoded) {
+				t.Errorf("Playbook %s contains hardcoded value %q in UserMessage", code, hardcoded)
+			}
+		}
+	}
+
+	// Also check unknownPlaybook
+	for _, hardcoded := range hardcodedValues {
+		for _, step := range unknownPlaybook.SSHSteps {
+			if strings.Contains(step, hardcoded) {
+				t.Errorf("unknownPlaybook contains hardcoded value %q in step: %s", hardcoded, step)
+			}
+		}
+	}
+}
+
+// TestRenderPlaybook_UnknownCode verifies rendering works for unknown failure codes.
+func TestRenderPlaybook_UnknownCode(t *testing.T) {
+	ctx := PlaybookContext{
+		ContainerName: "payram-core",
+		BaseURL:       "http://127.0.0.1:8080",
+		ImageRepo:     "payramapp/payram",
+	}
+
+	rendered := RenderPlaybook("UNKNOWN_CODE_12345", ctx)
+
+	// Should return unknown playbook with rendered placeholders
+	if rendered.Code != "UNKNOWN_CODE_12345" {
+		t.Errorf("Expected code to be UNKNOWN_CODE_12345, got %s", rendered.Code)
+	}
+	if rendered.Severity != SeverityManual {
+		t.Errorf("Expected severity to be MANUAL_REQUIRED, got %s", rendered.Severity)
+	}
+
+	// Check that placeholders were replaced
+	stepsText := strings.Join(rendered.SSHSteps, "\n")
+	if strings.Contains(stepsText, "<container_name>") {
+		t.Error("Found unreplaced <container_name> in unknown playbook")
+	}
+	if !strings.Contains(stepsText, "payram-core") {
+		t.Error("Expected container_name replacement in unknown playbook")
 	}
 }

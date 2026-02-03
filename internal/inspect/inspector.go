@@ -164,8 +164,9 @@ func (i *Inspector) checkLastJob(result *InspectResult) {
 		})
 		result.OverallState = StateBroken
 
-		// Attach recovery playbook (enriched with backup path if available)
-		playbook := recovery.GetPlaybookWithBackup(job.FailureCode, job.BackupPath)
+		// Attach recovery playbook (rendered with runtime context if available)
+		ctx := i.buildPlaybookContext(job.BackupPath)
+		playbook := recovery.RenderPlaybook(job.FailureCode, ctx)
 		result.RecoveryPlaybook = &playbook
 	case jobs.JobStateBackingUp, jobs.JobStateExecuting, jobs.JobStateVerifying:
 		result.Checks["last_job"] = CheckResult{
@@ -636,4 +637,29 @@ func (i *Inspector) generateRecommendations(result *InspectResult) {
 			Priority:    priority,
 		})
 	}
+}
+
+// buildPlaybookContext constructs a PlaybookContext from available inspector state.
+// Uses containerName and coreBaseURL from inspector configuration.
+func (i *Inspector) buildPlaybookContext(backupPath string) recovery.PlaybookContext {
+	ctx := recovery.PlaybookContext{
+		BackupPath:    backupPath,
+		ContainerName: i.containerName,
+		BaseURL:       i.coreBaseURL,
+		ImageRepo:     "payramapp/payram", // default, could be made configurable
+	}
+
+	// Try to extract HTTP port from coreBaseURL (e.g., "http://127.0.0.1:8080")
+	// This is a best-effort extraction
+	if len(i.coreBaseURL) > 0 {
+		// Simple parsing: look for the port after the last colon
+		for j := len(i.coreBaseURL) - 1; j >= 0; j-- {
+			if i.coreBaseURL[j] == ':' {
+				ctx.HTTPPort = i.coreBaseURL[j+1:]
+				break
+			}
+		}
+	}
+
+	return ctx
 }

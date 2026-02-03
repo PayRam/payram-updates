@@ -105,7 +105,8 @@ func (s *Server) HandleUpgradeStatus() http.HandlerFunc {
 		// Build response with recovery playbook if job failed
 		response := UpgradeStatusResponse{Job: job}
 		if job.State == jobs.JobStateFailed && job.FailureCode != "" {
-			playbook := recovery.GetPlaybookWithBackup(job.FailureCode, job.BackupPath)
+			ctx := s.buildPlaybookContext(job.BackupPath)
+			playbook := recovery.RenderPlaybook(job.FailureCode, ctx)
 			response.RecoveryPlaybook = &playbook
 		}
 
@@ -381,7 +382,7 @@ func (s *Server) HandleUpgradePlaybook() http.HandlerFunc {
 			return
 		}
 
-		playbook := recovery.GetPlaybookWithBackup(job.FailureCode, job.BackupPath)
+		playbook := recovery.RenderPlaybook(job.FailureCode, s.buildPlaybookContext(job.BackupPath))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -642,4 +643,51 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 			Message:         "Upgrade job started",
 		})
 	}
+}
+
+// buildPlaybookContext constructs a PlaybookContext by discovering runtime information.
+// It attempts to discover the running Payram container and extract dynamic values.
+// Falls back to empty values if discovery fails (placeholders will remain in playbook).
+func (s *Server) buildPlaybookContext(backupPath string) recovery.PlaybookContext {
+	ctx := recovery.PlaybookContext{
+		BackupPath: backupPath,
+		ImageRepo:  "payramapp/payram", // default
+	}
+
+	// Determine image pattern for discovery
+	imagePattern := "payramapp/payram:"
+	if s.config.ImageRepoOverride != "" {
+		imagePattern = s.config.ImageRepoOverride + ":"
+		ctx.ImageRepo = s.config.ImageRepoOverride
+	}
+
+	// Try to discover running container
+	discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, log.Default())
+	discovered, err := discoverer.DiscoverPayramContainer(context.Background())
+	if err != nil {
+		// Container not found or discovery failed - return partial context
+		// Placeholders will remain in the playbook
+		return ctx
+	}
+
+	// Extract container name
+	ctx.ContainerName = discovered.Name
+
+	// Try to use the core client's base URL for port extraction
+	// The coreClient was initialized with discovered port in New()
+	if s.coreClient != nil {
+		// Extract port from base URL (e.g., "http://127.0.0.1:8080")
+		baseURL := s.coreClient.BaseURL
+		ctx.BaseURL = baseURL
+
+		// Simple port extraction from URL
+		for i := len(baseURL) - 1; i >= 0; i-- {
+			if baseURL[i] == ':' {
+				ctx.HTTPPort = baseURL[i+1:]
+				break
+			}
+		}
+	}
+
+	return ctx
 }

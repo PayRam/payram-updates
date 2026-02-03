@@ -3,6 +3,18 @@
 // SSH recovery steps, and documentation links.
 package recovery
 
+import "strings"
+
+// PlaybookContext contains runtime context for rendering playbook templates.
+type PlaybookContext struct {
+	ContainerName string // e.g. "payram-core"
+	BaseURL       string // e.g. "http://127.0.0.1:8080"
+	HTTPPort      string // host port mapped to container 8080
+	DBPort        string // host port mapped to container 5432
+	ImageRepo     string // e.g. "payramapp/payram"
+	BackupPath    string // path to backup file
+}
+
 // Severity indicates how serious a failure is and what action is needed.
 type Severity string
 
@@ -106,9 +118,9 @@ var playbooks = map[string]Playbook{
 		Title:       "Docker Operation Failed",
 		UserMessage: "A Docker operation failed. The container may be in an inconsistent state.",
 		SSHSteps: []string{
-			"1. Check container status: docker ps -a | grep payram",
-			"2. Check container logs: docker logs payram-dummy",
-			"3. Check port availability: ss -tlnp | grep 18080",
+			"1. Check container status: docker ps -a | grep <image_repo>",
+			"2. Check container logs: docker logs <container_name>",
+			"3. Check port availability: ss -tlnp | grep <http_port>",
 			"4. If port blocked, stop conflicting container/process",
 			"5. If container missing, run: payram-updater recover",
 			"6. If container crashed, check logs and restart manually",
@@ -123,16 +135,16 @@ var playbooks = map[string]Playbook{
 		Title:       "Health Check Failed",
 		UserMessage: "The new container started but failed health checks. Restore from backup and rollback to previous version.",
 		SSHSteps: []string{
-			"1. Check if container is running: docker ps | grep payram",
-			"2. Check container logs: docker logs payram-dummy --tail 100",
-			"3. Test health endpoint manually: curl http://127.0.0.1:18080/health",
+			"1. Check if container is running: docker ps | grep <image_repo>",
+			"2. Check container logs: docker logs <container_name> --tail 100",
+			"3. Test health endpoint manually: curl <base_url>/health",
 			"4. If health check fails, RESTORE FROM BACKUP:",
 			"   - List backups: payram-updater backup list",
 			"   - Find backup created by this job (check backup_path in job)",
 			"   - Restore: payram-updater backup restore --file <backup_path> --yes",
-			"5. Stop and remove the failing container: docker stop payram-dummy && docker rm payram-dummy",
+			"5. Stop and remove the failing container: docker stop <container_name> && docker rm <container_name>",
 			"6. Run the previous known-good version with the correct tag",
-			"7. Verify health: curl http://127.0.0.1:18080/health",
+			"7. Verify health: curl <base_url>/health",
 		},
 		DocsURL:  "https://docs.payram.com/troubleshooting/health",
 		DataRisk: DataRiskPossible,
@@ -144,14 +156,14 @@ var playbooks = map[string]Playbook{
 		Title:       "Version Mismatch",
 		UserMessage: "The container reports an unexpected version. Restore from backup if data may be corrupted.",
 		SSHSteps: []string{
-			"1. Check running container image: docker inspect payram-dummy --format='{{.Config.Image}}'",
-			"2. Check reported version: curl http://127.0.0.1:18080/version",
+			"1. Check running container image: docker inspect <container_name> --format='{{.Config.Image}}'",
+			"2. Check reported version: curl <base_url>/version",
 			"3. If migrations may have run with wrong version, RESTORE FROM BACKUP:",
 			"   - List backups: payram-updater backup list",
 			"   - Restore: payram-updater backup restore --file <backup_path> --yes",
-			"4. Stop the container: docker stop payram-dummy && docker rm payram-dummy",
+			"4. Stop the container: docker stop <container_name> && docker rm <container_name>",
 			"5. Run the correct version (pin to known-good image tag)",
-			"6. Verify: curl http://127.0.0.1:18080/version",
+			"6. Verify: curl <base_url>/version",
 		},
 		DocsURL:  "https://docs.payram.com/troubleshooting/version",
 		DataRisk: DataRiskPossible,
@@ -164,17 +176,17 @@ var playbooks = map[string]Playbook{
 		UserMessage: "Database migration failed. RESTORE FROM BACKUP before any other action.",
 		SSHSteps: []string{
 			"1. STOP: Do not retry the upgrade - this may cause data loss",
-			"2. Check migration logs: docker logs payram-dummy | grep -i migration",
+			"2. Check migration logs: docker logs <container_name> | grep -i migration",
 			"3. RESTORE DATABASE FROM BACKUP (MANDATORY before proceeding):",
 			"   - List backups: payram-updater backup list",
 			"   - Find the backup created by this job (check backup_path)",
 			"   - Restore: payram-updater backup restore --file <backup_path> --yes",
-			"4. Stop the failed container: docker stop payram-dummy && docker rm payram-dummy",
+			"4. Stop the failed container: docker stop <container_name> && docker rm <container_name>",
 			"5. Run the previous known-good version:",
 			"   - Use the from_version from the backup metadata",
-			"   - docker run -d --name payram-dummy <previous-image-tag>",
-			"6. Verify health: curl http://127.0.0.1:18080/health",
-			"7. Verify version: curl http://127.0.0.1:18080/version",
+			"   - docker run -d --name <container_name> <previous-image-tag>",
+			"6. Verify health: curl <base_url>/health",
+			"7. Verify version: curl <base_url>/version",
 			"8. Contact support if migrations continue to fail on future attempts",
 		},
 		DocsURL:  "https://docs.payram.com/troubleshooting/migrations",
@@ -252,10 +264,10 @@ var playbooks = map[string]Playbook{
 		Title:       "Application Container Not Found",
 		UserMessage: "The application container was not found. Ensure the container is running before upgrade.",
 		SSHSteps: []string{
-			"1. Check container status: docker ps -a | grep payram",
-			"2. If container exists but stopped, start it: docker start payram-core",
+			"1. Check container status: docker ps -a | grep <image_repo>",
+			"2. If container exists but stopped, start it: docker start <container_name>",
 			"3. If container doesn't exist, this may be a fresh install",
-			"4. Check container logs for errors: docker logs payram-core",
+			"4. Check container logs for errors: docker logs <container_name>",
 			"5. Contact support if the container should exist but doesn't",
 		},
 		DocsURL:  "https://docs.payram.com/troubleshooting/container",
@@ -268,7 +280,7 @@ var playbooks = map[string]Playbook{
 		Title:       "Invalid Database Configuration",
 		UserMessage: "Database configuration could not be extracted from the container. Check container environment.",
 		SSHSteps: []string{
-			"1. Check container environment: docker exec payram-core env | grep POSTGRES",
+			"1. Check container environment: docker exec <container_name> env | grep POSTGRES",
 			"2. Ensure these env vars are set: POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DATABASE, POSTGRES_USERNAME",
 			"3. If env vars are missing, the container may need reconfiguration",
 			"4. Check the container's entrypoint/startup script",
@@ -349,9 +361,9 @@ var playbooks = map[string]Playbook{
 		UserMessage: "Database migrations are still running after 30 seconds. Check migration status and database performance.",
 		SSHSteps: []string{
 			"1. Check container logs for migration progress: docker logs <container_name> | tail -50",
-			"2. Check migration status: curl http://localhost:<port>/admin/migrations/status",
+			"2. Check migration status: curl <base_url>/admin/migrations/status",
 			"3. If migrations completed successfully, the upgrade succeeded (false timeout)",
-			"4. If migrations are still running, monitor: watch 'curl -s http://localhost:<port>/admin/migrations/status'",
+			"4. If migrations are still running, monitor: watch 'curl -s <base_url>/admin/migrations/status'",
 			"5. If migrations failed, RESTORE FROM BACKUP:",
 			"   - List backups: payram-updater backup list",
 			"   - Restore: payram-updater backup restore --file <backup_path> --yes",
@@ -370,8 +382,8 @@ var unknownPlaybook = Playbook{
 	UserMessage: "An unexpected error occurred. Manual investigation required.",
 	SSHSteps: []string{
 		"1. Check upgrade logs: payram-updater logs",
-		"2. Check container status: docker ps -a | grep payram",
-		"3. Check container logs: docker logs payram-dummy",
+		"2. Check container status: docker ps -a | grep <image_repo>",
+		"3. Check container logs: docker logs <container_name>",
 		"4. Run diagnostics: payram-updater inspect",
 		"5. Contact support with the diagnostic output",
 	},
@@ -420,48 +432,55 @@ func HasDataRisk(code string) bool {
 		playbook.DataRisk == DataRiskUnknown
 }
 
-// GetPlaybookWithBackup returns a playbook enriched with the actual backup path.
-// This replaces <backup_path> placeholders in SSH steps with the real path.
-func GetPlaybookWithBackup(code string, backupPath string) Playbook {
+// RenderPlaybook returns a playbook with all placeholders replaced by context values.
+// Supports: <container_name>, <base_url>, <http_port>, <db_port>, <image_repo>, <backup_path>
+func RenderPlaybook(code string, ctx PlaybookContext) Playbook {
 	playbook := GetPlaybook(code)
 
-	if backupPath == "" {
-		return playbook
+	// Set backup path if provided
+	if ctx.BackupPath != "" {
+		playbook.BackupPath = ctx.BackupPath
 	}
 
-	playbook.BackupPath = backupPath
-
-	// Replace placeholder in SSH steps
-	enrichedSteps := make([]string, len(playbook.SSHSteps))
+	// Render SSH steps
+	renderedSteps := make([]string, len(playbook.SSHSteps))
 	for i, step := range playbook.SSHSteps {
-		enrichedSteps[i] = replaceBackupPlaceholder(step, backupPath)
+		renderedSteps[i] = renderTemplate(step, ctx)
 	}
-	playbook.SSHSteps = enrichedSteps
+	playbook.SSHSteps = renderedSteps
+
+	// Render user message
+	playbook.UserMessage = renderTemplate(playbook.UserMessage, ctx)
 
 	return playbook
 }
 
-// replaceBackupPlaceholder replaces <backup_path> with the actual path.
-func replaceBackupPlaceholder(step string, backupPath string) string {
-	const placeholder = "<backup_path>"
-	result := step
-	// Simple string replacement - handle the placeholder
-	for {
-		idx := indexOf(result, placeholder)
-		if idx == -1 {
-			break
-		}
-		result = result[:idx] + backupPath + result[idx+len(placeholder):]
+// renderTemplate replaces placeholders in a string with context values.
+func renderTemplate(text string, ctx PlaybookContext) string {
+	replacements := map[string]string{
+		"<container_name>": ctx.ContainerName,
+		"<base_url>":       ctx.BaseURL,
+		"<http_port>":      ctx.HTTPPort,
+		"<db_port>":        ctx.DBPort,
+		"<image_repo>":     ctx.ImageRepo,
+		"<backup_path>":    ctx.BackupPath,
 	}
+
+	result := text
+	for placeholder, value := range replacements {
+		if value != "" {
+			result = strings.ReplaceAll(result, placeholder, value)
+		}
+	}
+
 	return result
 }
 
-// indexOf finds the index of substr in s, or -1 if not found.
-func indexOf(s, substr string) int {
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
+// GetPlaybookWithBackup returns a playbook enriched with the actual backup path.
+// Deprecated: Use RenderPlaybook with PlaybookContext instead.
+// This function is kept for backward compatibility.
+func GetPlaybookWithBackup(code string, backupPath string) Playbook {
+	return RenderPlaybook(code, PlaybookContext{
+		BackupPath: backupPath,
+	})
 }
