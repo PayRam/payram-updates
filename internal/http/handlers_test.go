@@ -6,9 +6,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/payram/payram-updater/internal/config"
 	"github.com/payram/payram-updater/internal/jobs"
+	"github.com/payram/payram-updater/internal/recovery"
 )
 
 func TestHandleHealth(t *testing.T) {
@@ -149,6 +151,98 @@ func TestHandleUpgradeStatus_WithJob(t *testing.T) {
 	}
 	if job.Message != testJob.Message {
 		t.Errorf("expected message %q, got %q", testJob.Message, job.Message)
+	}
+}
+
+func TestHandleUpgradeStatus_FailedWithPlaybook(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{Port: 8080}
+	jobStore := jobs.NewStore(tmpDir)
+
+	// Create and save a failed job with MIGRATION_FAILED
+	testJob := jobs.NewJob("test-failed", jobs.JobModeManual, "v1.0.0")
+	testJob.State = jobs.JobStateFailed
+	testJob.FailureCode = "MIGRATION_FAILED"
+	testJob.Message = "Database migration failed"
+
+	if err := jobStore.Save(testJob); err != nil {
+		t.Fatalf("failed to save job: %v", err)
+	}
+
+	server := New(cfg, jobStore)
+
+	req := httptest.NewRequest(http.MethodGet, "/upgrade/status", nil)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradeStatus()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	var statusResp UpgradeStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&statusResp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if statusResp.State != jobs.JobStateFailed {
+		t.Errorf("expected state FAILED, got %s", statusResp.State)
+	}
+
+	// Verify recovery playbook is included
+	if statusResp.RecoveryPlaybook == nil {
+		t.Fatal("expected recovery playbook to be included for failed job")
+	}
+
+	// Verify MIGRATION_FAILED playbook specifics
+	if statusResp.RecoveryPlaybook.Code != "MIGRATION_FAILED" {
+		t.Errorf("expected playbook code MIGRATION_FAILED, got %s", statusResp.RecoveryPlaybook.Code)
+	}
+	if statusResp.RecoveryPlaybook.Severity != recovery.SeverityManual {
+		t.Errorf("expected severity MANUAL_REQUIRED, got %s", statusResp.RecoveryPlaybook.Severity)
+	}
+	if statusResp.RecoveryPlaybook.DataRisk != recovery.DataRiskLikely {
+		t.Errorf("expected data risk LIKELY, got %s", statusResp.RecoveryPlaybook.DataRisk)
+	}
+}
+
+func TestHandleUpgradeStatus_NotFailedNoPlaybook(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{Port: 8080}
+	jobStore := jobs.NewStore(tmpDir)
+
+	// Create and save a successful job
+	testJob := jobs.NewJob("test-success", jobs.JobModeManual, "v1.0.0")
+	testJob.State = jobs.JobStateReady
+	testJob.Message = "Upgrade complete"
+
+	if err := jobStore.Save(testJob); err != nil {
+		t.Fatalf("failed to save job: %v", err)
+	}
+
+	server := New(cfg, jobStore)
+
+	req := httptest.NewRequest(http.MethodGet, "/upgrade/status", nil)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradeStatus()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	var statusResp UpgradeStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&statusResp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// Playbook should NOT be included for non-failed jobs
+	if statusResp.RecoveryPlaybook != nil {
+		t.Error("expected no recovery playbook for non-failed job")
 	}
 }
 
@@ -336,6 +430,9 @@ func TestHandleUpgrade_Success_Dashboard(t *testing.T) {
 	if job.ResolvedTarget != "v1.7.0" {
 		t.Errorf("expected resolved_target v1.7.0, got %s", job.ResolvedTarget)
 	}
+
+	// Allow goroutine to complete before test cleanup
+	time.Sleep(50 * time.Millisecond)
 }
 
 func TestHandleUpgrade_Success_Manual(t *testing.T) {
@@ -401,6 +498,8 @@ func TestHandleUpgrade_Success_Manual(t *testing.T) {
 	if job.Mode != jobs.JobModeManual {
 		t.Errorf("expected mode MANUAL, got %s", job.Mode)
 	}
+	// Allow goroutine to complete before test cleanup
+	time.Sleep(50 * time.Millisecond)
 }
 
 func TestHandleUpgrade_PolicyFetchFailed_Dashboard(t *testing.T) {
@@ -766,6 +865,8 @@ func TestHandleUpgrade_BreakpointNotBlocked_Manual(t *testing.T) {
 	if job.FailureCode != "" {
 		t.Errorf("expected no failure code, got %s", job.FailureCode)
 	}
+	// Allow goroutine to complete before test cleanup
+	time.Sleep(50 * time.Millisecond)
 }
 
 func TestHandleUpgrade_NoBreakpointMatch(t *testing.T) {
@@ -840,5 +941,544 @@ func TestHandleUpgrade_NoBreakpointMatch(t *testing.T) {
 
 	if job.FailureCode != "" {
 		t.Errorf("expected no failure code, got %s", job.FailureCode)
+	}
+
+	// Allow goroutine to complete before test cleanup
+	time.Sleep(50 * time.Millisecond)
+}
+
+func TestHandleUpgradeLast_NoJob(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{Port: 8080}
+	jobStore := jobs.NewStore(tmpDir)
+	server := New(cfg, jobStore)
+
+	req := httptest.NewRequest(http.MethodGet, "/upgrade/last", nil)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradeLast()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	var result map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if result["message"] != "No upgrade job found" {
+		t.Errorf("expected message about no job, got %q", result["message"])
+	}
+}
+
+func TestHandleUpgradeLast_WithJob(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{Port: 8080}
+	jobStore := jobs.NewStore(tmpDir)
+
+	// Create a job
+	testJob := jobs.NewJob("test-123", jobs.JobModeManual, "v1.0.0")
+	testJob.State = jobs.JobStateReady
+	if err := jobStore.Save(testJob); err != nil {
+		t.Fatalf("failed to save job: %v", err)
+	}
+
+	server := New(cfg, jobStore)
+
+	req := httptest.NewRequest(http.MethodGet, "/upgrade/last", nil)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradeLast()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	var job jobs.Job
+	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if job.JobID != testJob.JobID {
+		t.Errorf("expected JobID %q, got %q", testJob.JobID, job.JobID)
+	}
+}
+
+func TestHandleUpgradePlaybook_NoJob(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{Port: 8080}
+	jobStore := jobs.NewStore(tmpDir)
+	server := New(cfg, jobStore)
+
+	req := httptest.NewRequest(http.MethodGet, "/upgrade/playbook", nil)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradePlaybook()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if result["playbook"] != nil {
+		t.Error("expected no playbook for no job")
+	}
+}
+
+func TestHandleUpgradePlaybook_FailedJob(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{Port: 8080}
+	jobStore := jobs.NewStore(tmpDir)
+
+	// Create a failed job
+	testJob := jobs.NewJob("test-123", jobs.JobModeManual, "v2.0.0")
+	testJob.State = jobs.JobStateFailed
+	testJob.FailureCode = "MIGRATION_FAILED"
+	testJob.Message = "migration error"
+	if err := jobStore.Save(testJob); err != nil {
+		t.Fatalf("failed to save job: %v", err)
+	}
+
+	server := New(cfg, jobStore)
+
+	req := httptest.NewRequest(http.MethodGet, "/upgrade/playbook", nil)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradePlaybook()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if result["playbook"] == nil {
+		t.Error("expected playbook for failed job")
+	}
+
+	if result["failure_code"] != "MIGRATION_FAILED" {
+		t.Errorf("expected failure_code MIGRATION_FAILED, got %v", result["failure_code"])
+	}
+}
+
+func TestHandleUpgradeInspect(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Port:               8080,
+		PolicyURL:          "http://example.com/policy.json",
+		RuntimeManifestURL: "http://example.com/manifest.json",
+		CoreBaseURL:        "http://localhost:8080",
+		DockerBin:          "docker",
+	}
+	jobStore := jobs.NewStore(tmpDir)
+	server := New(cfg, jobStore)
+
+	req := httptest.NewRequest(http.MethodGet, "/upgrade/inspect", nil)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradeInspect()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// Should have overall_state
+	if result["overall_state"] == nil {
+		t.Error("expected overall_state in response")
+	}
+
+	// Should have checks map
+	if result["checks"] == nil {
+		t.Error("expected checks in response")
+	}
+}
+
+func TestHandleUpgradeLast_MethodNotAllowed(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{Port: 8080}
+	jobStore := jobs.NewStore(tmpDir)
+	server := New(cfg, jobStore)
+
+	req := httptest.NewRequest(http.MethodPost, "/upgrade/last", nil)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradeLast()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("expected status %d, got %d", http.StatusMethodNotAllowed, resp.StatusCode)
+	}
+}
+
+func TestHandleUpgradePlan_Success(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create mock policy server
+	policyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"latest":   "v1.7.0",
+			"releases": []string{"v1.7.0", "v1.6.0"},
+		})
+	}))
+	defer policyServer.Close()
+
+	// Create mock manifest server
+	manifestServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"image": map[string]interface{}{
+				"repo": "ghcr.io/payram/runtime",
+			},
+			"defaults": map[string]interface{}{
+				"container_name": "payram-core",
+			},
+		})
+	}))
+	defer manifestServer.Close()
+
+	cfg := &config.Config{
+		Port:                8080,
+		PolicyURL:           policyServer.URL,
+		RuntimeManifestURL:  manifestServer.URL,
+		FetchTimeoutSeconds: 5,
+	}
+	jobStore := jobs.NewStore(tmpDir)
+	server := New(cfg, jobStore)
+
+	body := strings.NewReader(`{"mode":"DASHBOARD","requested_target":"v1.7.0"}`)
+	req := httptest.NewRequest(http.MethodPost, "/upgrade/plan", body)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradePlan()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	var planResp PlanResponse
+	if err := json.NewDecoder(resp.Body).Decode(&planResp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if planResp.State != "READY" {
+		t.Errorf("expected state READY, got %s", planResp.State)
+	}
+	if planResp.Mode != "DASHBOARD" {
+		t.Errorf("expected mode DASHBOARD, got %s", planResp.Mode)
+	}
+	if planResp.RequestedTarget != "v1.7.0" {
+		t.Errorf("expected requested_target v1.7.0, got %s", planResp.RequestedTarget)
+	}
+	if planResp.ImageRepo != "ghcr.io/payram/runtime" {
+		t.Errorf("expected image_repo ghcr.io/payram/runtime, got %s", planResp.ImageRepo)
+	}
+	if planResp.ContainerName != "payram-core" {
+		t.Errorf("expected container_name payram-core, got %s", planResp.ContainerName)
+	}
+
+	// Verify no job was created (dry-run is read-only)
+	job, err := jobStore.LoadLatest()
+	if err != nil {
+		t.Fatalf("failed to load job: %v", err)
+	}
+	if job != nil {
+		t.Error("expected no job to be created during plan, but found one")
+	}
+}
+
+func TestHandleUpgradePlan_PolicyFetchFailed_Dashboard(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create mock policy server that fails
+	policyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer policyServer.Close()
+
+	cfg := &config.Config{
+		Port:                8080,
+		PolicyURL:           policyServer.URL,
+		RuntimeManifestURL:  "http://localhost:1/manifest", // Will not be reached
+		FetchTimeoutSeconds: 5,
+	}
+	jobStore := jobs.NewStore(tmpDir)
+	server := New(cfg, jobStore)
+
+	body := strings.NewReader(`{"mode":"DASHBOARD","requested_target":"v1.7.0"}`)
+	req := httptest.NewRequest(http.MethodPost, "/upgrade/plan", body)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradePlan()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	var planResp PlanResponse
+	if err := json.NewDecoder(resp.Body).Decode(&planResp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if planResp.State != "FAILED" {
+		t.Errorf("expected state FAILED, got %s", planResp.State)
+	}
+	if planResp.FailureCode != "POLICY_FETCH_FAILED" {
+		t.Errorf("expected failure_code POLICY_FETCH_FAILED, got %s", planResp.FailureCode)
+	}
+}
+
+func TestHandleUpgradePlan_InvalidMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{Port: 8080}
+	jobStore := jobs.NewStore(tmpDir)
+	server := New(cfg, jobStore)
+
+	body := strings.NewReader(`{"mode":"INVALID","requested_target":"v1.7.0"}`)
+	req := httptest.NewRequest(http.MethodPost, "/upgrade/plan", body)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradePlan()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected status %d, got %d", http.StatusBadRequest, resp.StatusCode)
+	}
+}
+
+func TestHandleUpgradePlan_MethodNotAllowed(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{Port: 8080}
+	jobStore := jobs.NewStore(tmpDir)
+	server := New(cfg, jobStore)
+
+	req := httptest.NewRequest(http.MethodGet, "/upgrade/plan", nil)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradePlan()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("expected status %d, got %d", http.StatusMethodNotAllowed, resp.StatusCode)
+	}
+}
+
+func TestHandleUpgradeRun_Success(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create mock policy server
+	policyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"latest":   "v1.7.0",
+			"releases": []string{"v1.7.0", "v1.6.0"},
+		})
+	}))
+	defer policyServer.Close()
+
+	// Create mock manifest server
+	manifestServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"image": map[string]interface{}{
+				"repo": "ghcr.io/payram/runtime",
+			},
+			"defaults": map[string]interface{}{
+				"container_name": "payram-core",
+			},
+		})
+	}))
+	defer manifestServer.Close()
+
+	cfg := &config.Config{
+		Port:                8080,
+		PolicyURL:           policyServer.URL,
+		RuntimeManifestURL:  manifestServer.URL,
+		FetchTimeoutSeconds: 5,
+		DockerBin:           "echo", // Mock docker with echo
+	}
+	jobStore := jobs.NewStore(tmpDir)
+	server := New(cfg, jobStore)
+
+	body := strings.NewReader(`{"mode":"DASHBOARD","requested_target":"v1.7.0","source":"CLI"}`)
+	req := httptest.NewRequest(http.MethodPost, "/upgrade/run", body)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradeRun()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	var runResp RunResponse
+	if err := json.NewDecoder(resp.Body).Decode(&runResp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if runResp.JobID == "" {
+		t.Error("expected job_id to be set")
+	}
+	if runResp.Mode != "DASHBOARD" {
+		t.Errorf("expected mode DASHBOARD, got %s", runResp.Mode)
+	}
+	if runResp.RequestedTarget != "v1.7.0" {
+		t.Errorf("expected requested_target v1.7.0, got %s", runResp.RequestedTarget)
+	}
+
+	// Wait a bit for background execution
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify job was created
+	job, err := jobStore.LoadLatest()
+	if err != nil {
+		t.Fatalf("failed to load job: %v", err)
+	}
+	if job == nil {
+		t.Fatal("expected job to be created")
+	}
+	if job.JobID != runResp.JobID {
+		t.Errorf("job ID mismatch: expected %s, got %s", runResp.JobID, job.JobID)
+	}
+}
+
+func TestHandleUpgradeRun_Conflict(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := &config.Config{
+		Port:                8080,
+		PolicyURL:           "http://localhost:1/policy",
+		RuntimeManifestURL:  "http://localhost:1/manifest",
+		FetchTimeoutSeconds: 5,
+	}
+	jobStore := jobs.NewStore(tmpDir)
+
+	// Create an active job
+	activeJob := jobs.NewJob("existing-job", jobs.JobModeDashboard, "v1.6.0")
+	activeJob.State = jobs.JobStateExecuting
+	activeJob.UpdatedAt = time.Now().UTC()
+	jobStore.Save(activeJob)
+
+	server := New(cfg, jobStore)
+
+	body := strings.NewReader(`{"mode":"DASHBOARD","requested_target":"v1.7.0","source":"CLI"}`)
+	req := httptest.NewRequest(http.MethodPost, "/upgrade/run", body)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradeRun()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("expected status %d, got %d", http.StatusConflict, resp.StatusCode)
+	}
+
+	var errResp map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if errResp["error"] != "An active job already exists" {
+		t.Errorf("expected error message about active job, got %s", errResp["error"])
+	}
+	if errResp["job_id"] != "existing-job" {
+		t.Errorf("expected job_id existing-job, got %s", errResp["job_id"])
+	}
+}
+
+func TestHandleUpgradeRun_InvalidBody(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{Port: 8080}
+	jobStore := jobs.NewStore(tmpDir)
+	server := New(cfg, jobStore)
+
+	body := strings.NewReader(`{invalid json}`)
+	req := httptest.NewRequest(http.MethodPost, "/upgrade/run", body)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradeRun()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected status %d, got %d", http.StatusBadRequest, resp.StatusCode)
+	}
+}
+
+func TestHandleUpgradeRun_MissingTarget(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{Port: 8080}
+	jobStore := jobs.NewStore(tmpDir)
+	server := New(cfg, jobStore)
+
+	body := strings.NewReader(`{"mode":"DASHBOARD"}`)
+	req := httptest.NewRequest(http.MethodPost, "/upgrade/run", body)
+	w := httptest.NewRecorder()
+
+	handler := server.HandleUpgradeRun()
+	handler(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected status %d, got %d", http.StatusBadRequest, resp.StatusCode)
 	}
 }

@@ -8,14 +8,59 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/payram/payram-updater/internal/container"
+	"github.com/payram/payram-updater/internal/inspect"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/manifest"
 	"github.com/payram/payram-updater/internal/policy"
+	"github.com/payram/payram-updater/internal/recovery"
 )
 
 // HealthResponse represents the health check response.
 type HealthResponse struct {
 	Status string `json:"status"`
+}
+
+// UpgradeStatusResponse extends Job with recovery playbook for FAILED states.
+type UpgradeStatusResponse struct {
+	*jobs.Job
+	RecoveryPlaybook *recovery.Playbook `json:"recovery_playbook,omitempty"`
+}
+
+// PlanRequest represents the request body for POST /upgrade/plan.
+type PlanRequest struct {
+	Mode            string `json:"mode"`
+	RequestedTarget string `json:"requested_target"`
+}
+
+// PlanResponse represents the response for POST /upgrade/plan.
+type PlanResponse struct {
+	State           string `json:"state"`
+	Mode            string `json:"mode"`
+	RequestedTarget string `json:"requested_target"`
+	ResolvedTarget  string `json:"resolved_target,omitempty"`
+	FailureCode     string `json:"failure_code,omitempty"`
+	Message         string `json:"message"`
+	ImageRepo       string `json:"image_repo,omitempty"`
+	ContainerName   string `json:"container_name,omitempty"`
+}
+
+// RunRequest represents the request body for POST /upgrade/run.
+type RunRequest struct {
+	Mode            string `json:"mode"`
+	RequestedTarget string `json:"requested_target"`
+	Source          string `json:"source"` // "CLI" or "DASHBOARD"
+}
+
+// RunResponse represents the response for POST /upgrade/run.
+type RunResponse struct {
+	JobID           string `json:"job_id,omitempty"`
+	State           string `json:"state"`
+	Mode            string `json:"mode"`
+	RequestedTarget string `json:"requested_target"`
+	ResolvedTarget  string `json:"resolved_target,omitempty"`
+	FailureCode     string `json:"failure_code,omitempty"`
+	Message         string `json:"message"`
 }
 
 // HandleHealth returns a handler for the /health endpoint.
@@ -57,9 +102,16 @@ func (s *Server) HandleUpgradeStatus() http.HandlerFunc {
 			}
 		}
 
+		// Build response with recovery playbook if job failed
+		response := UpgradeStatusResponse{Job: job}
+		if job.State == jobs.JobStateFailed && job.FailureCode != "" {
+			playbook := recovery.GetPlaybookWithBackup(job.FailureCode, job.BackupPath)
+			response.RecoveryPlaybook = &playbook
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(job)
+		json.NewEncoder(w).Encode(response)
 	}
 }
 
@@ -233,6 +285,12 @@ func (s *Server) HandleUpgrade() http.HandlerFunc {
 
 		s.jobStore.AppendLog(fmt.Sprintf("Manifest fetched: repo=%s", manifestData.Image.Repo))
 
+		// Apply IMAGE_REPO_OVERRIDE if configured (for testing with dummy repos)
+		if s.config.ImageRepoOverride != "" {
+			s.jobStore.AppendLog(fmt.Sprintf("Applying IMAGE_REPO_OVERRIDE: %s -> %s", manifestData.Image.Repo, s.config.ImageRepoOverride))
+			manifestData.Image.Repo = s.config.ImageRepoOverride
+		}
+
 		// Resolve target (for now, just use requested_target)
 		job.ResolvedTarget = req.RequestedTarget
 		job.State = jobs.JobStateReady
@@ -247,6 +305,9 @@ func (s *Server) HandleUpgrade() http.HandlerFunc {
 
 		s.jobStore.AppendLog(fmt.Sprintf("Job ready: resolved_target=%s", job.ResolvedTarget))
 
+		// Launch background execution goroutine
+		go s.executeUpgrade(job, manifestData)
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(job)
@@ -255,7 +316,330 @@ func (s *Server) HandleUpgrade() http.HandlerFunc {
 
 // isJobActive returns true if the job is in an active state.
 func isJobActive(job *jobs.Job) bool {
-	return job.State != jobs.JobStateIdle &&
-		job.State != jobs.JobStateReady &&
-		job.State != jobs.JobStateFailed
+	// Active states are those that indicate ongoing work
+	return job.State == jobs.JobStatePolicyFetching ||
+		job.State == jobs.JobStateManifestFetching ||
+		job.State == jobs.JobStateExecuting ||
+		job.State == jobs.JobStateVerifying
+}
+
+// HandleUpgradeLast returns a handler for the /upgrade/last endpoint.
+// Returns only the last job state without recovery playbook.
+func (s *Server) HandleUpgradeLast() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Load the latest job
+		job, err := s.jobStore.LoadLatest()
+		if err != nil {
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		if job == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{
+				"message": "No upgrade job found",
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(job)
+	}
+}
+
+// HandleUpgradePlaybook returns a handler for the /upgrade/playbook endpoint.
+// Returns the recovery playbook for the last failed job, if any.
+func (s *Server) HandleUpgradePlaybook() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Load the latest job
+		job, err := s.jobStore.LoadLatest()
+		if err != nil {
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		// No job or job not failed - no playbook
+		if job == nil || job.State != jobs.JobStateFailed || job.FailureCode == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"playbook": nil,
+				"message":  "No recovery playbook needed",
+			})
+			return
+		}
+
+		playbook := recovery.GetPlaybookWithBackup(job.FailureCode, job.BackupPath)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"playbook":     &playbook,
+			"failure_code": job.FailureCode,
+			"backup_path":  job.BackupPath,
+		})
+	}
+}
+
+// HandleUpgradeInspect returns a handler for the /upgrade/inspect endpoint.
+// Returns full system inspection results.
+func (s *Server) HandleUpgradeInspect() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Resolve container name for inspection
+		// For inspect, we need to fetch the manifest first to get the container name
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+
+		// Fetch manifest to get container name
+		manifestClient := manifest.NewClient(time.Duration(s.config.FetchTimeoutSeconds) * time.Second)
+		manifestData, _ := manifestClient.Fetch(ctx, s.config.RuntimeManifestURL)
+
+		// Resolve container name
+		resolver := container.NewResolver(s.config.TargetContainerName, s.config.DockerBin, log.Default())
+		resolved, err := resolver.Resolve(manifestData)
+		if err != nil {
+			// For inspect, return error in JSON instead of failing
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(inspect.InspectResult{
+				OverallState: inspect.StateBroken,
+				Issues: []inspect.Issue{
+					{
+						Component:   "container",
+						Description: err.Error(),
+						Severity:    "CRITICAL",
+					},
+				},
+				Checks: map[string]inspect.CheckResult{
+					"container_name": {Status: "FAILED", Message: err.Error()},
+				},
+			})
+			return
+		}
+
+		containerName := resolved.Name
+		log.Printf("Target container resolved as: %s", containerName)
+
+		// Default ports
+		defaultPorts := []int{8080, 443}
+
+		inspector := inspect.NewInspector(
+			s.jobStore,
+			s.dockerRunner.DockerBin,
+			containerName,
+			s.coreClient.BaseURL, // Use resolved BaseURL from coreClient (handles auto-discovery)
+			s.config.PolicyURL,
+			s.config.RuntimeManifestURL,
+			defaultPorts,
+		)
+
+		result := inspector.Run(ctx)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(result)
+	}
+}
+
+// HandleUpgradePlan returns a handler for the POST /upgrade/plan endpoint.
+// This is a READ-ONLY endpoint that validates upgrade parameters without
+// creating jobs, mutating state, or executing docker commands.
+func (s *Server) HandleUpgradePlan() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse request body
+		var req PlanRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		// Validate mode
+		var mode jobs.JobMode
+		switch req.Mode {
+		case "DASHBOARD":
+			mode = jobs.JobModeDashboard
+		case "MANUAL":
+			mode = jobs.JobModeManual
+		default:
+			http.Error(w, "Invalid mode: must be DASHBOARD or MANUAL", http.StatusBadRequest)
+			return
+		}
+
+		// Validate requested_target
+		if req.RequestedTarget == "" {
+			http.Error(w, "requested_target is required", http.StatusBadRequest)
+			return
+		}
+
+		// Perform read-only planning
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+
+		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget)
+
+		// Build response
+		response := PlanResponse{
+			State:           string(plan.State),
+			Mode:            string(plan.Mode),
+			RequestedTarget: plan.RequestedTarget,
+			ResolvedTarget:  plan.ResolvedTarget,
+			FailureCode:     plan.FailureCode,
+			Message:         plan.Message,
+		}
+
+		// Add manifest info if available
+		if plan.Manifest != nil {
+			response.ImageRepo = plan.Manifest.Image.Repo
+			// Resolve container name using the resolver (env > manifest)
+			resolver := container.NewResolver(s.config.TargetContainerName, s.config.DockerBin, nil)
+			if resolved, err := resolver.Resolve(plan.Manifest); err == nil {
+				response.ContainerName = resolved.Name
+			} else {
+				// If resolution fails, report it in the response
+				response.ContainerName = ""
+				response.FailureCode = "CONTAINER_NAME_UNRESOLVED"
+				response.Message = err.Error()
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
+	}
+}
+
+// HandleUpgradeRun returns a handler for the POST /upgrade/run endpoint.
+// This endpoint creates a new upgrade job and executes it.
+func (s *Server) HandleUpgradeRun() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse request body
+		var req RunRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		// Validate mode
+		var mode jobs.JobMode
+		switch req.Mode {
+		case "DASHBOARD":
+			mode = jobs.JobModeDashboard
+		case "MANUAL":
+			mode = jobs.JobModeManual
+		default:
+			http.Error(w, "Invalid mode: must be DASHBOARD or MANUAL", http.StatusBadRequest)
+			return
+		}
+
+		// Validate requested_target
+		if req.RequestedTarget == "" {
+			http.Error(w, "requested_target is required", http.StatusBadRequest)
+			return
+		}
+
+		// Validate source
+		source := req.Source
+		if source == "" {
+			source = "UNKNOWN"
+		}
+
+		// Check for active job (concurrency check)
+		existingJob, err := s.jobStore.LoadLatest()
+		if err != nil {
+			log.Printf("Failed to load existing job: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		if existingJob != nil && isJobActive(existingJob) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error":   "An active job already exists",
+				"job_id":  existingJob.JobID,
+				"state":   string(existingJob.State),
+				"message": "Wait for the current job to complete or check its status",
+			})
+			return
+		}
+
+		// First, do a read-only plan to validate
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+
+		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget)
+		if plan.State == jobs.JobStateFailed {
+			// Planning failed - return error without creating a job
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(RunResponse{
+				State:           string(plan.State),
+				Mode:            string(plan.Mode),
+				RequestedTarget: plan.RequestedTarget,
+				FailureCode:     plan.FailureCode,
+				Message:         plan.Message,
+			})
+			return
+		}
+
+		// Planning succeeded - create and execute job
+		jobID := fmt.Sprintf("job-%d", time.Now().UnixNano())
+		job := jobs.NewJob(jobID, mode, req.RequestedTarget)
+		job.ResolvedTarget = plan.ResolvedTarget
+		job.State = jobs.JobStateReady
+		job.Message = "Upgrade job created"
+		job.UpdatedAt = time.Now().UTC()
+
+		// Save job
+		if err := s.jobStore.Save(job); err != nil {
+			log.Printf("Failed to save job: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		// Log start with source
+		s.jobStore.AppendLog(fmt.Sprintf("Starting upgrade job %s: mode=%s target=%s source=%s",
+			jobID, req.Mode, req.RequestedTarget, source))
+
+		// Launch background execution goroutine
+		go s.executeUpgrade(job, plan.Manifest)
+
+		// Return response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(RunResponse{
+			JobID:           job.JobID,
+			State:           string(job.State),
+			Mode:            string(job.Mode),
+			RequestedTarget: job.RequestedTarget,
+			ResolvedTarget:  job.ResolvedTarget,
+			Message:         "Upgrade job started",
+		})
+	}
 }
