@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -946,6 +947,46 @@ func runBackupList(mgr *backup.Manager) {
 	fmt.Println(string(jsonOut))
 }
 
+// parseBackupFilename extracts version metadata from a backup filename.
+// Expected format: payram-backup-YYYYMMDD-HHMMSS-fromVer-to-toVer.(sql|dump)
+func parseBackupFilename(filename string) struct {
+	FromVersion string
+	ToVersion   string
+} {
+	result := struct {
+		FromVersion string
+		ToVersion   string
+	}{
+		FromVersion: "unknown",
+		ToVersion:   "unknown",
+	}
+
+	// Strip prefix and extension
+	name := strings.TrimPrefix(filename, "payram-backup-")
+	name = strings.TrimSuffix(name, ".sql")
+	name = strings.TrimSuffix(name, ".dump")
+
+	// Split by '-'
+	parts := strings.Split(name, "-")
+	if len(parts) < 4 {
+		return result
+	}
+
+	// Parse versions: YYYYMMDD-HHMMSS-fromVer-to-toVer
+	// Find "to" separator
+	for i := 2; i < len(parts)-1; i++ {
+		if parts[i] == "to" {
+			// Everything before "to" is fromVersion
+			result.FromVersion = strings.Join(parts[2:i], "-")
+			// Everything after "to" is toVersion
+			result.ToVersion = strings.Join(parts[i+1:], "-")
+			break
+		}
+	}
+
+	return result
+}
+
 // performContainerRollback rolls back the Payram container to a previous version.
 // This function:
 // 1. Discovers the current running container
@@ -1066,13 +1107,109 @@ func runBackupRestore(mgr *backup.Manager) {
 		os.Exit(1)
 	}
 
+	// Parse backup metadata to determine if recovery is needed
+	ctx := context.Background()
+	filename := filepath.Base(*filePath)
+	metadata := parseBackupFilename(filename)
+	needsRecovery := metadata.FromVersion != "unknown" && metadata.ToVersion != "unknown"
+
+	// Determine if full recovery will be performed
+	doFullRecovery := *fullRecovery
+	var rollbackContainerName string
+
+	// If recovery is needed and not auto-confirmed, ask user BEFORE restoring
+	if needsRecovery && !*fullRecovery {
+		fmt.Fprintf(os.Stderr, "\nThis backup was created before upgrading:\n")
+		fmt.Fprintf(os.Stderr, "  FROM version: %s\n", metadata.FromVersion)
+		fmt.Fprintf(os.Stderr, "  TO version:   %s\n", metadata.ToVersion)
+		fmt.Fprintf(os.Stderr, "\nChoose recovery mode:\n")
+		fmt.Fprintf(os.Stderr, "  [1] Restore database only (leave container as-is)\n")
+		fmt.Fprintf(os.Stderr, "  [2] Restore database AND roll back service to %s (recommended)\n", metadata.FromVersion)
+		fmt.Fprintf(os.Stderr, "\nEnter choice [1/2]: ")
+
+		var choice string
+		fmt.Scanln(&choice)
+		choice = strings.TrimSpace(choice)
+
+		if choice == "2" || choice == "" {
+			// Default to option 2
+			doFullRecovery = true
+			// User has explicitly chosen full recovery - this counts as confirmation
+			// for the subsequent database restore (no redundant prompt needed)
+			*confirmed = true
+			fmt.Fprintln(os.Stderr, "\n✓ Full recovery mode selected - container rollback + database restore")
+		}
+	}
+
+	// If using --full-recovery flag, treat it as implicit confirmation
+	if *fullRecovery && needsRecovery {
+		*confirmed = true
+	}
+
+	// CRITICAL SEQUENCING FIX: If full recovery is requested, roll back container FIRST
+	// This ensures database restore happens inside the rollback container, not the failed one
+	if doFullRecovery && needsRecovery {
+		fmt.Fprintln(os.Stderr, "\n⚠️  Full recovery mode: Rolling back container BEFORE database restore...")
+		fmt.Fprintf(os.Stderr, "This ensures database restore happens inside the rollback container (version %s)\n\n", metadata.FromVersion)
+
+		if err := performContainerRollback(ctx, metadata.FromVersion); err != nil {
+			errResp := map[string]interface{}{
+				"success": false,
+				"error":   fmt.Sprintf("❌ Container rollback failed: %v\nDatabase NOT restored.", err),
+			}
+			jsonOut, _ := json.MarshalIndent(errResp, "", "  ")
+			fmt.Println(string(jsonOut))
+			os.Exit(1)
+		}
+
+		fmt.Fprintf(os.Stderr, "✅ Container rolled back to version %s\n", metadata.FromVersion)
+		fmt.Fprintln(os.Stderr, "Waiting for database readiness...")
+		time.Sleep(5 * time.Second)
+
+		// Get the container name for restore
+		cfg, err := config.Load()
+		if err != nil {
+			errResp := map[string]interface{}{
+				"success": false,
+				"error":   fmt.Sprintf("Failed to load config: %v", err),
+			}
+			jsonOut, _ := json.MarshalIndent(errResp, "", "  ")
+			fmt.Println(string(jsonOut))
+			os.Exit(1)
+		}
+
+		imagePattern := "payramapp/payram:"
+		if cfg.ImageRepoOverride != "" {
+			imagePattern = cfg.ImageRepoOverride + ":"
+		}
+
+		discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, log.Default())
+		discovered, err := discoverer.DiscoverPayramContainer(ctx)
+		if err != nil {
+			errResp := map[string]interface{}{
+				"success": false,
+				"error":   fmt.Sprintf("Failed to discover rollback container: %v", err),
+			}
+			jsonOut, _ := json.MarshalIndent(errResp, "", "  ")
+			fmt.Println(string(jsonOut))
+			os.Exit(1)
+		}
+		rollbackContainerName = discovered.Name
+		fmt.Fprintf(os.Stderr, "Rollback container ready: %s\n", rollbackContainerName)
+	}
+
 	// Interactive confirmation if --yes not provided
+	// (Full recovery users already confirmed via recovery mode selection)
 	if !*confirmed {
-		fmt.Println("WARNING: This will restore the database from backup.")
+		fmt.Println("\nWARNING: This will restore the database from backup.")
 		fmt.Println("All current data will be REPLACED with backup contents.")
 		fmt.Printf("\nBackup file: %s\n", *filePath)
-		fmt.Printf("Target database: %s@%s:%d/%s\n",
-			mgr.Config.PGUser, mgr.Config.PGHost, mgr.Config.PGPort, mgr.Config.PGDB)
+		if doFullRecovery && needsRecovery {
+			fmt.Printf("Target: Rollback container (version %s)\n", metadata.FromVersion)
+		} else {
+			fmt.Printf("Target database: %s@%s:%d/%s\n",
+				mgr.Config.PGUser, mgr.Config.PGHost, mgr.Config.PGPort, mgr.Config.PGDB)
+		}
 		fmt.Print("\nType 'yes' to confirm: ")
 
 		var input string
@@ -1082,14 +1219,20 @@ func runBackupRestore(mgr *backup.Manager) {
 			os.Exit(0)
 		}
 		*confirmed = true
+	} else if doFullRecovery && needsRecovery {
+		// Log why confirmation was skipped for full recovery
+		fmt.Fprintln(os.Stderr, "✓ Skipping redundant confirmation (already confirmed via recovery mode selection)")
 	}
 
-	fmt.Fprintln(os.Stderr, "Restoring database from backup...")
+	fmt.Fprintln(os.Stderr, "\nRestoring database from backup...")
+	if doFullRecovery && needsRecovery {
+		fmt.Fprintf(os.Stderr, "Executing restore inside rollback container (version %s)...\n", metadata.FromVersion)
+	}
 
-	ctx := context.Background()
 	result, err := mgr.RestoreBackup(ctx, *filePath, backup.RestoreOptions{
-		Confirmed:    *confirmed,
-		FullRecovery: *fullRecovery,
+		Confirmed:     *confirmed,
+		ContainerName: rollbackContainerName, // Use rollback container if full recovery
+		FullRecovery:  doFullRecovery,
 	})
 	if err != nil {
 		errResp := map[string]interface{}{
@@ -1103,42 +1246,9 @@ func runBackupRestore(mgr *backup.Manager) {
 
 	fmt.Fprintln(os.Stderr, "\n✅ Database restored successfully.")
 
-	// Interactive recovery prompt (unless --full-recovery was specified)
-	doFullRecovery := *fullRecovery
-	if result.NeedsRecovery && !*fullRecovery {
-		fmt.Fprintf(os.Stderr, "\nThis backup was created before upgrading:\n")
-		fmt.Fprintf(os.Stderr, "  FROM version: %s\n", result.FromVersion)
-		fmt.Fprintf(os.Stderr, "  TO version:   %s\n", result.ToVersion)
-		fmt.Fprintf(os.Stderr, "\nChoose recovery mode:\n")
-		fmt.Fprintf(os.Stderr, "  [1] Restore database only (leave container as-is)\n")
-		fmt.Fprintf(os.Stderr, "  [2] Restore database AND roll back service to %s (recommended)\n", result.FromVersion)
-		fmt.Fprintf(os.Stderr, "\nEnter choice [1/2]: ")
-
-		var choice string
-		fmt.Scanln(&choice)
-		choice = strings.TrimSpace(choice)
-
-		if choice == "2" || choice == "" {
-			// Default to option 2
-			doFullRecovery = true
-		}
-	}
-
-	// Perform full recovery if requested
-	if doFullRecovery && result.NeedsRecovery {
-		fmt.Fprintln(os.Stderr, "\nPerforming full recovery...")
-		if err := performContainerRollback(ctx, result.FromVersion); err != nil {
-			errResp := map[string]interface{}{
-				"success": false,
-				"error":   fmt.Sprintf("❌ Database restored, but service rollback failed: %v\nManual intervention required.", err),
-			}
-			jsonOut, _ := json.MarshalIndent(errResp, "", "  ")
-			fmt.Println(string(jsonOut))
-			os.Exit(1)
-		}
-
+	if doFullRecovery && needsRecovery {
 		fmt.Fprintf(os.Stderr, "\n✅ Full recovery completed successfully.\n")
-		fmt.Fprintf(os.Stderr, "Service restored to version %s.\n", result.FromVersion)
+		fmt.Fprintf(os.Stderr, "Service restored to version %s with database from backup.\n", metadata.FromVersion)
 	}
 
 	response := map[string]interface{}{
