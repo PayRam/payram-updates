@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/payram/payram-updater/internal/container"
+	"github.com/payram/payram-updater/internal/history"
 	"github.com/payram/payram-updater/internal/inspect"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/manifest"
@@ -27,10 +30,17 @@ type UpgradeStatusResponse struct {
 	RecoveryPlaybook *recovery.Playbook `json:"recovery_playbook,omitempty"`
 }
 
+// HistoryResponse represents the response for history queries.
+type HistoryResponse struct {
+	Events []history.Event `json:"events"`
+	Count  int             `json:"count"`
+}
+
 // PlanRequest represents the request body for POST /upgrade/plan.
 type PlanRequest struct {
 	Mode            string `json:"mode"`
 	RequestedTarget string `json:"requested_target"`
+	Source          string `json:"source"`
 }
 
 // PlanResponse represents the response for POST /upgrade/plan.
@@ -49,7 +59,31 @@ type PlanResponse struct {
 type RunRequest struct {
 	Mode            string `json:"mode"`
 	RequestedTarget string `json:"requested_target"`
-	Source          string `json:"source"` // "CLI" or "DASHBOARD"
+	Source          string `json:"source"` // Origin of request, defaults to "UNKNOWN"
+}
+
+func parseJobMode(value string) (jobs.JobMode, error) {
+	if strings.TrimSpace(value) == "" {
+		return jobs.JobModeDashboard, nil
+	}
+
+	upper := strings.ToUpper(strings.TrimSpace(value))
+	switch upper {
+	case string(jobs.JobModeDashboard):
+		return jobs.JobModeDashboard, nil
+	case string(jobs.JobModeManual):
+		return jobs.JobModeManual, nil
+	default:
+		return "", fmt.Errorf("invalid mode %q", value)
+	}
+}
+
+func resolveMode(requestedMode, source string) (jobs.JobMode, error) {
+	if strings.EqualFold(strings.TrimSpace(source), "CLI") {
+		return parseJobMode(requestedMode)
+	}
+
+	return jobs.JobModeDashboard, nil
 }
 
 // RunResponse represents the response for POST /upgrade/run.
@@ -139,9 +173,42 @@ func (s *Server) HandleUpgradeLogs() http.HandlerFunc {
 	}
 }
 
+// HandleHistory returns a handler for history queries.
+// Supports query params: ?type=upgrade|backup|restore&status=started|succeeded|failed&limit=100
+func (s *Server) HandleHistory() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		q := r.URL.Query()
+		typeFilter := strings.TrimSpace(q.Get("type"))
+		statusFilter := strings.TrimSpace(q.Get("status"))
+		limit := 100
+		if rawLimit := strings.TrimSpace(q.Get("limit")); rawLimit != "" {
+			parsed, err := strconv.Atoi(rawLimit)
+			if err != nil || parsed <= 0 {
+				http.Error(w, "invalid limit", http.StatusBadRequest)
+				return
+			}
+			limit = parsed
+		}
+
+		events, err := s.historyStore.List(limit, typeFilter, statusFilter)
+		if err != nil {
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(HistoryResponse{Events: events, Count: len(events)})
+	}
+}
+
 // UpgradeRequest represents the request body for POST /upgrade.
 type UpgradeRequest struct {
-	Mode            string `json:"mode"`
 	RequestedTarget string `json:"requested_target"`
 }
 
@@ -160,17 +227,8 @@ func (s *Server) HandleUpgrade() http.HandlerFunc {
 			return
 		}
 
-		// Validate mode
-		var mode jobs.JobMode
-		switch req.Mode {
-		case "DASHBOARD":
-			mode = jobs.JobModeDashboard
-		case "MANUAL":
-			mode = jobs.JobModeManual
-		default:
-			http.Error(w, "Invalid mode: must be DASHBOARD or MANUAL", http.StatusBadRequest)
-			return
-		}
+		// Legacy endpoint always uses DASHBOARD mode
+		mode := jobs.JobModeDashboard
 
 		// Validate requested_target
 		if req.RequestedTarget == "" {
@@ -204,7 +262,7 @@ func (s *Server) HandleUpgrade() http.HandlerFunc {
 		}
 
 		// Log start
-		s.jobStore.AppendLog(fmt.Sprintf("Starting upgrade job %s: mode=%s target=%s", jobID, req.Mode, req.RequestedTarget))
+		s.jobStore.AppendLog(fmt.Sprintf("Starting upgrade job %s: mode=%s target=%s", jobID, mode, req.RequestedTarget))
 
 		// Fetch policy
 		policyClient := policy.NewClient(time.Duration(s.config.FetchTimeoutSeconds) * time.Second)
@@ -475,15 +533,9 @@ func (s *Server) HandleUpgradePlan() http.HandlerFunc {
 			return
 		}
 
-		// Validate mode
-		var mode jobs.JobMode
-		switch req.Mode {
-		case "DASHBOARD":
-			mode = jobs.JobModeDashboard
-		case "MANUAL":
-			mode = jobs.JobModeManual
-		default:
-			http.Error(w, "Invalid mode: must be DASHBOARD or MANUAL", http.StatusBadRequest)
+		mode, err := resolveMode(req.Mode, req.Source)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
@@ -546,15 +598,9 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 			return
 		}
 
-		// Validate mode
-		var mode jobs.JobMode
-		switch req.Mode {
-		case "DASHBOARD":
-			mode = jobs.JobModeDashboard
-		case "MANUAL":
-			mode = jobs.JobModeManual
-		default:
-			http.Error(w, "Invalid mode: must be DASHBOARD or MANUAL", http.StatusBadRequest)
+		mode, err := resolveMode(req.Mode, req.Source)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
@@ -626,7 +672,7 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 
 		// Log start with source
 		s.jobStore.AppendLog(fmt.Sprintf("Starting upgrade job %s: mode=%s target=%s source=%s",
-			jobID, req.Mode, req.RequestedTarget, source))
+			jobID, mode, req.RequestedTarget, source))
 
 		// Launch background execution goroutine
 		go s.executeUpgrade(job, plan.Manifest)

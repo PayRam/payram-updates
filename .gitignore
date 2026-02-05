@@ -45,3 +45,4 @@ temp/
 *.env.*
 !.env.example
 data*/
+API.md

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,19 +12,24 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/payram/payram-updater/internal/autoupdate"
 	"github.com/payram/payram-updater/internal/backup"
 	"github.com/payram/payram-updater/internal/cli"
 	"github.com/payram/payram-updater/internal/config"
 	"github.com/payram/payram-updater/internal/container"
 	"github.com/payram/payram-updater/internal/coreclient"
+	"github.com/payram/payram-updater/internal/corecompat"
 	"github.com/payram/payram-updater/internal/dockerexec"
+	"github.com/payram/payram-updater/internal/history"
 	internalhttp "github.com/payram/payram-updater/internal/http"
 	"github.com/payram/payram-updater/internal/inspect"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/manifest"
+	"github.com/payram/payram-updater/internal/policy"
 	"github.com/payram/payram-updater/internal/recover"
 	"github.com/payram/payram-updater/internal/recovery"
 )
@@ -43,6 +49,8 @@ func main() {
 	}
 
 	switch command {
+	case "init":
+		runInit()
 	case "serve":
 		runServe()
 	case "status":
@@ -75,6 +83,7 @@ USAGE:
   payram-updater [COMMAND]
 
 COMMANDS:
+	init             Initialize updater configuration
   serve            Start the upgrade daemon (default)
   status           Get current upgrade status
   logs             Get upgrade logs
@@ -95,6 +104,9 @@ RUN FLAGS:
   --to string      Target version (required)
   --yes            Skip confirmation prompt (default: false)
 
+LOGS FLAGS:
+	-f, --follow     Follow logs (like tail -f)
+
 BACKUP SUBCOMMANDS:
   backup create           Create a new database backup manually
   backup list             List all available backups
@@ -105,13 +117,15 @@ BACKUP FLAGS:
   --yes            Skip confirmation prompt (for restore)
 
 EXAMPLES:
+	payram-updater init
   payram-updater serve
   payram-updater status
-  payram-updater logs
-  payram-updater dry-run --mode dashboard --to v1.7.0
-  payram-updater dry-run --mode manual --to v1.2.3
-  payram-updater run --mode dashboard --to v1.7.0
-  payram-updater run --mode manual --to v1.2.3 --yes
+	payram-updater logs
+	payram-updater logs -f
+	payram-updater dry-run --mode dashboard --to 1.7.0
+	payram-updater dry-run --mode manual --to 1.2.3
+	payram-updater run --mode dashboard --to 1.7.0
+	payram-updater run --mode manual --to 1.2.3 --yes
   payram-updater run --mode manual --to latest
   payram-updater inspect
   payram-updater recover
@@ -179,6 +193,28 @@ func runServe() {
 		os.Exit(1)
 	}
 
+	settingsPath, err := autoupdate.DefaultPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to resolve auto update config path: %v\n", err)
+		os.Exit(1)
+	}
+	settings, err := autoupdate.Load(settingsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintln(os.Stderr, "Updater is not initialized. Run 'payram-updater init' first.")
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Failed to load auto update config: %v\n", err)
+		os.Exit(1)
+	}
+	if !settings.Initialized {
+		fmt.Fprintln(os.Stderr, "Updater is not initialized. Run 'payram-updater init' first.")
+		os.Exit(1)
+	}
+
+	cfg.AutoUpdateEnabled = settings.AutoUpdateEnabled
+	cfg.AutoUpdateInterval = settings.AutoUpdateIntervalHours
+
 	log.Printf("payram-updater starting with config:")
 	log.Printf("  Port: %d", cfg.Port)
 	log.Printf("  PolicyURL: %s", cfg.PolicyURL)
@@ -189,6 +225,8 @@ func runServe() {
 	log.Printf("  CoreBaseURL: %s", cfg.CoreBaseURL)
 	log.Printf("  ExecutionMode: %s", cfg.ExecutionMode)
 	log.Printf("  DockerBin: %s", cfg.DockerBin)
+	log.Printf("  AutoUpdateEnabled: %v", cfg.AutoUpdateEnabled)
+	log.Printf("  AutoUpdateIntervalHours: %d", cfg.AutoUpdateInterval)
 
 	// Create job store
 	jobStore := jobs.NewStore(cfg.StateDir)
@@ -198,6 +236,78 @@ func runServe() {
 	if err := server.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+func runInit() {
+	reader := bufio.NewReader(os.Stdin)
+
+	defaultEnabled := config.DefaultAutoUpdateEnabled
+	autoUpdateEnabled := promptYesNo(reader, "Enable auto updates?", defaultEnabled)
+
+	defaultInterval := config.DefaultAutoUpdateIntervalHours
+	autoUpdateInterval := defaultInterval
+	if autoUpdateEnabled {
+		autoUpdateInterval = promptInt(reader, "Auto update interval (hours)", defaultInterval)
+	}
+
+	settings := &autoupdate.Settings{
+		AutoUpdateEnabled:       autoUpdateEnabled,
+		AutoUpdateIntervalHours: autoUpdateInterval,
+		Initialized:             true,
+	}
+
+	settingsPath, err := autoupdate.DefaultPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to resolve auto update config path: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := autoupdate.Save(settingsPath, settings); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to write auto update config: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Initialization complete. Updated %s\n", settingsPath)
+}
+
+func promptYesNo(reader *bufio.Reader, prompt string, defaultValue bool) bool {
+	defaultLabel := "y"
+	if !defaultValue {
+		defaultLabel = "n"
+	}
+	for {
+		fmt.Printf("%s [y/n] (default: %s): ", prompt, defaultLabel)
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(strings.ToLower(input))
+		if input == "" {
+			return defaultValue
+		}
+		switch input {
+		case "y", "yes":
+			return true
+		case "n", "no":
+			return false
+		default:
+			fmt.Println("Please enter 'y' or 'n'.")
+		}
+	}
+}
+
+func promptInt(reader *bufio.Reader, prompt string, defaultValue int) int {
+	for {
+		fmt.Printf("%s (default: %d): ", prompt, defaultValue)
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+		if input == "" {
+			return defaultValue
+		}
+		value, err := strconv.Atoi(input)
+		if err != nil || value < 1 {
+			fmt.Println("Please enter a valid integer >= 1.")
+			continue
+		}
+		return value
 	}
 }
 
@@ -496,35 +606,72 @@ func runSync() {
 	// Determine CoreBaseURL: if not provided, discover it dynamically
 	coreBaseURL := discoverCoreBaseURLOrDefault(ctx, cfg)
 
-	// Get current running version from /version endpoint
 	coreClient := coreclient.NewClient(coreBaseURL)
+
+	// Fetch policy init point (if available)
+	policyClient := policy.NewClient(time.Duration(cfg.FetchTimeoutSeconds) * time.Second)
+	policyData, _ := policyClient.Fetch(ctx, cfg.PolicyURL)
+	initVersion := ""
+	if policyData != nil {
+		initVersion = strings.TrimSpace(policyData.UpdaterAPIInitVersion)
+	}
+
+	// Get current running version (API or label fallback)
+	var currentVersion string
 	versionResp, err := coreClient.Version(ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get running version: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Is the container running and healthy?\n")
-		os.Exit(1)
+	if err == nil && versionResp != nil && versionResp.Version != "" {
+		currentVersion = versionResp.Version
+	} else {
+		labelVersion, labelErr := corecompat.VersionFromLabels(ctx, cfg.DockerBin, containerName)
+		if labelErr != nil {
+			fmt.Fprintf(os.Stderr, "Failed to get running version: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Is the container running and healthy?\n")
+			os.Exit(1)
+		}
+		currentVersion = labelVersion
+	}
+
+	useLegacy := false
+	if initVersion != "" {
+		if before, compareErr := corecompat.IsBeforeInit(currentVersion, initVersion); compareErr == nil {
+			useLegacy = before
+		}
 	}
 
 	// Verify health
-	healthResp, err := coreClient.Health(ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to verify health: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Cannot sync state when health check fails.\n")
-		os.Exit(1)
-	}
+	healthStatus := ""
+	healthDB := ""
+	if useLegacy {
+		if err := corecompat.LegacyHealth(ctx, coreBaseURL); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to verify health: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Cannot sync state when health check fails.\n")
+			os.Exit(1)
+		}
+		healthStatus = "ok"
+		healthDB = "unknown"
+	} else {
+		healthResp, err := coreClient.Health(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to verify health: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Cannot sync state when health check fails.\n")
+			os.Exit(1)
+		}
 
-	if healthResp.Status != "ok" || healthResp.DB != "ok" {
-		fmt.Fprintf(os.Stderr, "Health check not OK (status=%s, db=%s)\n", healthResp.Status, healthResp.DB)
-		fmt.Fprintf(os.Stderr, "Cannot sync state when system is unhealthy.\n")
-		os.Exit(1)
+		if healthResp.Status != "ok" || (healthResp.DB != "" && healthResp.DB != "ok") {
+			fmt.Fprintf(os.Stderr, "Health check not OK (status=%s, db=%s)\n", healthResp.Status, healthResp.DB)
+			fmt.Fprintf(os.Stderr, "Cannot sync state when system is unhealthy.\n")
+			os.Exit(1)
+		}
+		healthStatus = healthResp.Status
+		healthDB = healthResp.DB
 	}
 
 	// Load existing job to check if sync is needed
 	jobStore := jobs.NewStore(cfg.StateDir)
 	existingJob, _ := jobStore.LoadLatest()
 
-	if existingJob != nil && existingJob.State == jobs.JobStateReady && existingJob.ResolvedTarget == versionResp.Version {
-		fmt.Printf("Internal state already matches running version (%s). No sync needed.\n", versionResp.Version)
+	if existingJob != nil && existingJob.State == jobs.JobStateReady && existingJob.ResolvedTarget == currentVersion {
+		fmt.Printf("Internal state already matches running version (%s). No sync needed.\n", currentVersion)
 		return
 	}
 
@@ -537,8 +684,8 @@ func runSync() {
 	// Create a synthetic job to reflect the external upgrade
 	// Generate a unique job ID
 	jobID := fmt.Sprintf("sync-%d", time.Now().UnixNano())
-	syncJob := jobs.NewJob(jobID, jobs.JobModeManual, versionResp.Version)
-	syncJob.ResolvedTarget = versionResp.Version
+	syncJob := jobs.NewJob(jobID, jobs.JobModeManual, currentVersion)
+	syncJob.ResolvedTarget = currentVersion
 	syncJob.State = jobs.JobStateReady
 	syncJob.Message = fmt.Sprintf("Synced from external upgrade (was %s, now %s)", previousVersion, versionResp.Version)
 
@@ -549,7 +696,7 @@ func runSync() {
 	}
 
 	// Log the sync
-	logMsg := fmt.Sprintf("SYNC: External upgrade detected and synced. Running version: %s (was: %s)", versionResp.Version, previousVersion)
+	logMsg := fmt.Sprintf("SYNC: External upgrade detected and synced. Running version: %s (was: %s)", currentVersion, previousVersion)
 	if err := jobStore.AppendLog(logMsg); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to write log: %v\n", err)
 	}
@@ -559,33 +706,89 @@ func runSync() {
 	fmt.Println("✅ SYNC SUCCESSFUL")
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Printf("\nPrevious tracked version: %s\n", previousVersion)
-	fmt.Printf("Current running version:  %s\n", versionResp.Version)
-	fmt.Printf("Health status:            OK (status=%s, db=%s)\n", healthResp.Status, healthResp.DB)
+	fmt.Printf("Current running version:  %s\n", currentVersion)
+	fmt.Printf("Health status:            OK (status=%s, db=%s)\n", healthStatus, healthDB)
 	fmt.Println("\nInternal state has been updated to match the running version.")
 	fmt.Println("Run 'payram-updater inspect' to verify.")
 	fmt.Println(strings.Repeat("=", 60))
 }
 
 func runLogs() {
+	logsCmd := flag.NewFlagSet("logs", flag.ExitOnError)
+	followShort := logsCmd.Bool("f", false, "Follow logs (like tail -f)")
+	followLong := logsCmd.Bool("follow", false, "Follow logs (like tail -f)")
+	logsCmd.Parse(os.Args[2:])
+
+	follow := *followShort || *followLong
+
 	port := getPort()
 	url := fmt.Sprintf("http://127.0.0.1:%d/upgrade/logs", port)
 
-	resp, err := http.Get(url)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect to daemon: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Is the payram-updater daemon running?\n")
-		os.Exit(1)
+	fetchLogs := func() (string, int, error) {
+		resp, err := http.Get(url)
+		if err != nil {
+			return "", 0, err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", resp.StatusCode, err
+		}
+		return string(body), resp.StatusCode, nil
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read response: %v\n", err)
-		os.Exit(1)
+	if !follow {
+		body, status, err := fetchLogs()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to connect to daemon: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Is the payram-updater daemon running?\n")
+			os.Exit(1)
+		}
+		if status != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "Failed to read logs: HTTP %d\n", status)
+			os.Exit(1)
+		}
+
+		// Print plain text logs directly
+		fmt.Print(body)
+		return
 	}
 
-	// Print plain text logs directly
-	fmt.Print(string(body))
+	lastSize := 0
+	first := true
+	for {
+		body, status, err := fetchLogs()
+		if err != nil {
+			if first {
+				fmt.Fprintf(os.Stderr, "Failed to connect to daemon: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Is the payram-updater daemon running?\n")
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "Warning: failed to fetch logs: %v\n", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		if status != http.StatusOK {
+			if first {
+				fmt.Fprintf(os.Stderr, "Failed to read logs: HTTP %d\n", status)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "Warning: failed to read logs: HTTP %d\n", status)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		if len(body) < lastSize {
+			fmt.Print(body)
+			lastSize = len(body)
+		} else if len(body) > lastSize {
+			fmt.Print(body[lastSize:])
+			lastSize = len(body)
+		}
+
+		first = false
+		time.Sleep(1 * time.Second)
+	}
 }
 
 func runDryRun() {
@@ -611,6 +814,7 @@ func runDryRun() {
 	payload := map[string]string{
 		"mode":             string(req.Mode),
 		"requested_target": req.RequestedTarget,
+		"source":           "CLI",
 	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -686,6 +890,7 @@ func runRun() {
 	planPayload := map[string]string{
 		"mode":             string(req.Mode),
 		"requested_target": req.RequestedTarget,
+		"source":           "CLI",
 	}
 	planPayloadBytes, err := json.Marshal(planPayload)
 	if err != nil {
@@ -893,6 +1098,11 @@ func runBackupCreate(mgr *backup.Manager) {
 	// Backups are always enabled
 	fmt.Fprintln(os.Stderr, "Creating database backup...")
 
+	var historyStore *history.Store
+	if cfg, err := config.Load(); err == nil {
+		historyStore = history.NewStore(cfg.StateDir)
+	}
+
 	ctx := context.Background()
 	info, err := mgr.CreateBackup(ctx, backup.BackupMeta{
 		FromVersion:   "manual",
@@ -900,6 +1110,17 @@ func runBackupCreate(mgr *backup.Manager) {
 		JobID:         fmt.Sprintf("manual-%d", time.Now().Unix()),
 	})
 	if err != nil {
+		if historyStore != nil {
+			_ = historyStore.Append(history.Event{
+				Type:    "backup",
+				Status:  "failed",
+				Message: err.Error(),
+				Data: map[string]string{
+					"from_version":   "manual",
+					"target_version": "manual",
+				},
+			})
+		}
 		errResp := map[string]interface{}{
 			"success": false,
 			"error":   err.Error(),
@@ -907,6 +1128,21 @@ func runBackupCreate(mgr *backup.Manager) {
 		jsonOut, _ := json.MarshalIndent(errResp, "", "  ")
 		fmt.Println(string(jsonOut))
 		os.Exit(1)
+	}
+
+	if historyStore != nil {
+		data := map[string]string{
+			"from_version":   "manual",
+			"target_version": "manual",
+			"backup_path":    info.Path,
+			"size_bytes":     fmt.Sprintf("%d", info.Size),
+		}
+		_ = historyStore.Append(history.Event{
+			Type:    "backup",
+			Status:  "succeeded",
+			Message: "Backup completed",
+			Data:    data,
+		})
 	}
 
 	// Prune old backups
@@ -1113,6 +1349,11 @@ func runBackupRestore(mgr *backup.Manager) {
 	metadata := parseBackupFilename(filename)
 	needsRecovery := metadata.FromVersion != "unknown" && metadata.ToVersion != "unknown"
 
+	var historyStore *history.Store
+	if cfg, err := config.Load(); err == nil {
+		historyStore = history.NewStore(cfg.StateDir)
+	}
+
 	// Determine if full recovery will be performed
 	doFullRecovery := *fullRecovery
 	var rollbackContainerName string
@@ -1235,6 +1476,19 @@ func runBackupRestore(mgr *backup.Manager) {
 		FullRecovery:  doFullRecovery,
 	})
 	if err != nil {
+		if historyStore != nil {
+			_ = historyStore.Append(history.Event{
+				Type:    "restore",
+				Status:  "failed",
+				Message: err.Error(),
+				Data: map[string]string{
+					"backup_file":   *filePath,
+					"from_version":  metadata.FromVersion,
+					"to_version":    metadata.ToVersion,
+					"full_recovery": fmt.Sprintf("%t", doFullRecovery),
+				},
+			})
+		}
 		errResp := map[string]interface{}{
 			"success": false,
 			"error":   err.Error(),
@@ -1242,6 +1496,20 @@ func runBackupRestore(mgr *backup.Manager) {
 		jsonOut, _ := json.MarshalIndent(errResp, "", "  ")
 		fmt.Println(string(jsonOut))
 		os.Exit(1)
+	}
+
+	if historyStore != nil {
+		_ = historyStore.Append(history.Event{
+			Type:    "restore",
+			Status:  "succeeded",
+			Message: "Database restored",
+			Data: map[string]string{
+				"backup_file":   *filePath,
+				"from_version":  result.FromVersion,
+				"to_version":    result.ToVersion,
+				"full_recovery": fmt.Sprintf("%t", doFullRecovery),
+			},
+		})
 	}
 
 	fmt.Fprintln(os.Stderr, "\n✅ Database restored successfully.")

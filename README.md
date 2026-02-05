@@ -115,6 +115,13 @@ Response when no job exists:
 curl http://127.0.0.1:2359/upgrade/logs
 ```
 
+### Get History (Upgrades/Backups/Restores)
+
+```bash
+curl http://127.0.0.1:2359/history
+curl "http://127.0.0.1:2359/history?type=upgrade&status=failed&limit=50"
+```
+
 Response:
 ```json
 {
@@ -135,7 +142,7 @@ Manual mode (user-controlled):
 ```bash
 curl -X POST http://127.0.0.1:2359/upgrade \
   -H "Content-Type: application/json" \
-  -d '{"mode":"MANUAL","requested_target":"v1.2.3"}'
+  -d '{"mode":"MANUAL","requested_target":"1.2.3"}'
 ```
 
 Response:
@@ -160,9 +167,9 @@ Dashboard upgrade blocked by breakpoint:
   "state": "FAILED",
   "mode": "DASHBOARD",
   "requested_target": "latest",
-  "resolved_target": "v1.2.3",
+  "resolved_target": "1.2.3",
   "error_code": "MANUAL_UPGRADE_REQUIRED",
-  "error_message": "Dashboard upgrades to v1.2.3 are not allowed: Breaking database schema changes. See: https://docs.example.com/migration-guide"
+  "error_message": "Dashboard upgrades to 1.2.3 are not allowed: Breaking database schema changes. See: https://docs.example.com/migration-guide"
 }
 ```
 
@@ -202,8 +209,8 @@ The `payram-updater` binary provides CLI commands for interacting with the daemo
 Validates an upgrade without making any changes:
 
 ```bash
-payram-updater dry-run --mode dashboard --to v1.7.0
-payram-updater dry-run --mode manual --to v1.5.0
+payram-updater dry-run --mode dashboard --to 1.7.0
+payram-updater dry-run --mode manual --to 1.5.0
 ```
 
 - Fetches policy and manifest
@@ -218,10 +225,10 @@ Executes an upgrade via the daemon. **Interactive by default**.
 
 ```bash
 # Interactive mode (prompts for confirmation)
-payram-updater run --mode dashboard --to v1.7.0
+payram-updater run --mode dashboard --to 1.7.0
 
 # Non-interactive mode (for automation)
-payram-updater run --mode manual --to v1.5.0 --yes
+payram-updater run --mode manual --to 1.5.0 --yes
 ```
 
 Behavior:
@@ -237,7 +244,7 @@ Exit codes:
 
 Flags:
 - `--mode` (required): `dashboard` or `manual`
-- `--to` (required): Target version (e.g., `v1.7.0`, or `latest` for manual mode only)
+- `--to` (required): Target version (e.g., `1.7.0`, or `latest` for manual mode only)
 - `--yes`: Skip confirmation prompt (required for non-interactive/automated use)
 
 Example output:
@@ -246,7 +253,7 @@ Example output:
 ║                     UPGRADE SUMMARY                          ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Mode:             DASHBOARD                                 ║
-║  Requested Target: v1.7.0                                    ║
+║  Requested Target: 1.7.0                                     ║
 ║  Image:            ghcr.io/payram/runtime                    ║
 ║  Container:        payram-core                               ║
 ╠══════════════════════════════════════════════════════════════╣
@@ -258,14 +265,15 @@ Example output:
 
 Proceed? (y/N): y
 Started upgrade job job-1234567890 (state=EXECUTING).
-Use 'payram-updater status' to check progress and 'payram-updater logs' for details.
+Use 'payram-updater status' to check progress and 'payram-updater logs -f' to follow progress.
 ```
 
 ### Other Commands
 
 ```bash
 payram-updater status    # Get current upgrade status
-payram-updater logs      # Get upgrade logs
+payram-updater logs      # Get upgrade logs (snapshot)
+payram-updater logs -f   # Follow upgrade logs
 payram-updater inspect   # Read-only system diagnostics
 payram-updater recover   # Attempt automated recovery
 payram-updater backup    # Manage database backups
@@ -347,7 +355,7 @@ Breakpoints in the policy file prevent dashboard upgrades to specific versions:
 {
   "breakpoints": [
     {
-      "version": "v1.2.3",
+      "version": "1.2.3",
       "reason": "Breaking database schema changes",
       "docs": "https://docs.example.com/migration-guide"
     }
@@ -594,7 +602,7 @@ payram-updater recover
 5. **For MIGRATION_FAILED - follow manual steps:**
 ```bash
 # Check logs
-payram-updater logs
+payram-updater logs -f
 
 # SSH to server and follow playbook:
 # 1. Check PostgreSQL migration state
@@ -656,7 +664,7 @@ payram-updater dry-run --mode dashboard --to 1.9.0
 
 7. **View logs**:
 ```bash
-payram-updater logs
+payram-updater logs -f
 ```
 
 8. **Test actual upgrade execution** (requires Docker and dummy container):

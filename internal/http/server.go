@@ -16,9 +16,12 @@ import (
 	"github.com/payram/payram-updater/internal/config"
 	"github.com/payram/payram-updater/internal/container"
 	"github.com/payram/payram-updater/internal/coreclient"
+	"github.com/payram/payram-updater/internal/corecompat"
 	"github.com/payram/payram-updater/internal/dockerexec"
+	"github.com/payram/payram-updater/internal/history"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/manifest"
+	"github.com/payram/payram-updater/internal/policy"
 )
 
 // discoverCoreBaseURL discovers the Payram Core base URL by:
@@ -65,6 +68,7 @@ type Server struct {
 	coreClient          *coreclient.Client
 	backupManager       *backup.Manager
 	containerBackupExec *backup.ContainerBackupExecutor
+	historyStore        *history.Store
 }
 
 // New creates a new HTTP server instance.
@@ -124,6 +128,7 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 		coreClient:          coreClient,
 		backupManager:       backupMgr,
 		containerBackupExec: containerBackupExec,
+		historyStore:        history.NewStore(cfg.StateDir),
 	}
 
 	mux := http.NewServeMux()
@@ -136,6 +141,8 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 	mux.HandleFunc("/upgrade/plan", s.HandleUpgradePlan())
 	mux.HandleFunc("/upgrade/run", s.HandleUpgradeRun())
 	mux.HandleFunc("/upgrade", s.HandleUpgrade())
+	mux.HandleFunc("/history", s.HandleHistory())
+	mux.HandleFunc("/upgrade/history", s.HandleHistory())
 
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 	s.httpServer = &http.Server{
@@ -149,6 +156,9 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 // Start starts the HTTP server and blocks until shutdown.
 // It handles graceful shutdown on SIGINT and SIGTERM.
 func (s *Server) Start() error {
+	autoUpdateCtx, autoUpdateCancel := context.WithCancel(context.Background())
+	defer autoUpdateCancel()
+
 	// Create a channel to listen for shutdown signals
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -172,9 +182,14 @@ func (s *Server) Start() error {
 		}
 	}()
 
+	if s.config.AutoUpdateEnabled {
+		go s.startAutoUpdateLoop(autoUpdateCtx)
+	}
+
 	// Wait for either a signal or server error
 	select {
 	case err := <-serverErrors:
+		autoUpdateCancel()
 		return err
 	case sig := <-stop:
 		log.Printf("Received signal %v, initiating graceful shutdown", sig)
@@ -190,6 +205,133 @@ func (s *Server) Start() error {
 
 	log.Println("Server stopped gracefully")
 	return nil
+}
+
+func (s *Server) startAutoUpdateLoop(ctx context.Context) {
+	interval := time.Duration(s.config.AutoUpdateInterval) * time.Hour
+	if interval <= 0 {
+		log.Printf("Auto update disabled due to invalid interval: %d hours", s.config.AutoUpdateInterval)
+		return
+	}
+
+	log.Printf("Auto update enabled. Checking every %d hours", s.config.AutoUpdateInterval)
+
+	// Run once at startup
+	s.runAutoUpdateOnce(ctx)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Auto update loop stopped")
+			return
+		case <-ticker.C:
+			s.runAutoUpdateOnce(ctx)
+		}
+	}
+}
+
+func (s *Server) recordHistory(event history.Event) {
+	if s.historyStore == nil {
+		return
+	}
+	if err := s.historyStore.Append(event); err != nil {
+		if s.jobStore != nil {
+			s.jobStore.AppendLog(fmt.Sprintf("Warning: failed to record history: %v", err))
+		}
+	}
+}
+
+func (s *Server) runAutoUpdateOnce(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Skip if an active job exists
+	existingJob, err := s.jobStore.LoadLatest()
+	if err != nil {
+		log.Printf("Auto update: failed to load latest job: %v", err)
+		return
+	}
+	if existingJob != nil {
+		if isJobActive(existingJob) {
+			log.Printf("Auto update: active job %s in state %s, skipping", existingJob.JobID, existingJob.State)
+			return
+		}
+		if existingJob.State == jobs.JobStateFailed {
+			log.Printf("Auto update: last job failed (%s), skipping", existingJob.FailureCode)
+			return
+		}
+	}
+
+	// Fetch policy to get latest version
+	policyClient := policy.NewClient(time.Duration(s.config.FetchTimeoutSeconds) * time.Second)
+	policyCtx, cancel2 := context.WithTimeout(ctx, time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
+	defer cancel2()
+	policyData, err := policyClient.Fetch(policyCtx, s.config.PolicyURL)
+	if err != nil {
+		log.Printf("Auto update: failed to fetch policy: %v", err)
+		return
+	}
+	latest := strings.TrimSpace(policyData.Latest)
+	if latest == "" {
+		log.Printf("Auto update: policy latest is empty, skipping")
+		return
+	}
+	initVersion := strings.TrimSpace(policyData.UpdaterAPIInitVersion)
+
+	containerName, err := s.discoverContainerName(ctx)
+	if err != nil {
+		log.Printf("Auto update: failed to discover container: %v", err)
+		return
+	}
+
+	// Fetch current version (API or label fallback)
+	versionCtx, cancel := context.WithTimeout(ctx, time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
+	defer cancel()
+	currentVersion, _, err := s.resolveCoreVersion(versionCtx, containerName, initVersion)
+	if err != nil {
+		log.Printf("Auto update: failed to resolve current version: %v", err)
+		return
+	}
+
+	if currentVersion == latest {
+		log.Printf("Auto update: already on latest version %s", latest)
+		return
+	}
+
+	// Plan upgrade using DASHBOARD mode
+	planCtx, cancel3 := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel3()
+	plan := s.PlanUpgrade(planCtx, jobs.JobModeDashboard, latest)
+	if plan.State == jobs.JobStateFailed {
+		log.Printf("Auto update: planning failed (%s): %s", plan.FailureCode, plan.Message)
+		return
+	}
+
+	// Re-check for active job to avoid race
+	existingJob, err = s.jobStore.LoadLatest()
+	if err == nil && existingJob != nil && isJobActive(existingJob) {
+		log.Printf("Auto update: active job %s in state %s, skipping", existingJob.JobID, existingJob.State)
+		return
+	}
+
+	jobID := fmt.Sprintf("job-%d", time.Now().UnixNano())
+	job := jobs.NewJob(jobID, jobs.JobModeDashboard, plan.RequestedTarget)
+	job.ResolvedTarget = plan.ResolvedTarget
+	job.State = jobs.JobStateReady
+	job.Message = "Auto update job created"
+	job.UpdatedAt = time.Now().UTC()
+
+	if err := s.jobStore.Save(job); err != nil {
+		log.Printf("Auto update: failed to save job: %v", err)
+		return
+	}
+
+	s.jobStore.AppendLog(fmt.Sprintf("Starting auto update job %s: mode=%s target=%s source=AUTO", jobID, "DASHBOARD", plan.RequestedTarget))
+	go s.executeUpgrade(job, plan.Manifest)
 }
 
 // executeUpgrade runs the upgrade execution in the background.
@@ -218,6 +360,57 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 	ctx := context.Background()
 	isDryRun := s.config.ExecutionMode == "dry-run"
 	imageTag := job.ResolvedTarget
+	policyInitVersion := s.fetchPolicyInitVersion(ctx)
+
+	upgradeData := map[string]string{
+		"job_id":           job.JobID,
+		"mode":             string(job.Mode),
+		"requested_target": job.RequestedTarget,
+		"resolved_target":  job.ResolvedTarget,
+		"execution_mode":   s.config.ExecutionMode,
+	}
+	if isDryRun {
+		upgradeData["dry_run"] = "true"
+	}
+	s.recordHistory(history.Event{
+		Type:    "upgrade",
+		Status:  "started",
+		Message: "Upgrade started",
+		Data:    upgradeData,
+	})
+
+	defer func() {
+		status := ""
+		message := job.Message
+		data := map[string]string{
+			"job_id":           job.JobID,
+			"mode":             string(job.Mode),
+			"requested_target": job.RequestedTarget,
+			"resolved_target":  job.ResolvedTarget,
+			"execution_mode":   s.config.ExecutionMode,
+		}
+		if job.State == jobs.JobStateFailed {
+			status = "failed"
+			if job.FailureCode != "" {
+				data["failure_code"] = job.FailureCode
+			}
+		} else if job.State == jobs.JobStateReady {
+			if isDryRun {
+				status = "validated"
+			} else {
+				status = "succeeded"
+			}
+		}
+		if status == "" {
+			return
+		}
+		s.recordHistory(history.Event{
+			Type:    "upgrade",
+			Status:  status,
+			Message: message,
+			Data:    data,
+		})
+	}()
 
 	// All config comes from manifest
 	imageRepo := manifestData.Image.Repo
@@ -325,11 +518,22 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 
 	// Get current version for backup metadata
 	currentVersion := "unknown"
-	if versionInfo, err := s.coreClient.Version(ctx); err == nil && versionInfo != nil {
-		currentVersion = versionInfo.Version
+	if versionInfo, _, err := s.resolveCoreVersion(ctx, containerName, policyInitVersion); err == nil && versionInfo != "" {
+		currentVersion = versionInfo
 	}
 
 	s.jobStore.AppendLog(fmt.Sprintf("Creating pre-upgrade backup (from %s to %s)...", currentVersion, imageTag))
+	s.recordHistory(history.Event{
+		Type:    "backup",
+		Status:  "started",
+		Message: "Backup started",
+		Data: map[string]string{
+			"job_id":         job.JobID,
+			"from_version":   currentVersion,
+			"target_version": imageTag,
+			"container":      containerName,
+		},
+	})
 
 	// Use container-aware backup: extracts DB credentials from running container
 	backupResult := s.containerBackupExec.ExecuteBackup(ctx, containerName, backup.BackupMeta{
@@ -345,6 +549,17 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 		job.UpdatedAt = time.Now().UTC()
 		s.jobStore.Save(job)
 		s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s", job.FailureCode, job.Message))
+		s.recordHistory(history.Event{
+			Type:    "backup",
+			Status:  "failed",
+			Message: backupResult.ErrorMessage,
+			Data: map[string]string{
+				"job_id":         job.JobID,
+				"from_version":   currentVersion,
+				"target_version": imageTag,
+				"failure_code":   backupResult.FailureCode,
+			},
+		})
 
 		// Provide context-specific recovery guidance
 		switch backupResult.FailureCode {
@@ -371,6 +586,24 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 		}
 		s.jobStore.AppendLog(fmt.Sprintf("Database: %s@%s:%s (%s)", backupResult.DBConfig.Database, backupResult.DBConfig.Host, backupResult.DBConfig.Port, dbType))
 	}
+	backupData := map[string]string{
+		"job_id":         job.JobID,
+		"from_version":   currentVersion,
+		"target_version": imageTag,
+		"backup_path":    backupResult.Path,
+		"size_bytes":     fmt.Sprintf("%d", backupResult.Size),
+	}
+	if backupResult.DBConfig != nil {
+		backupData["db_host"] = backupResult.DBConfig.Host
+		backupData["db_port"] = backupResult.DBConfig.Port
+		backupData["db_name"] = backupResult.DBConfig.Database
+	}
+	s.recordHistory(history.Event{
+		Type:    "backup",
+		Status:  "succeeded",
+		Message: "Backup completed",
+		Data:    backupData,
+	})
 
 	// Prune old backups (using legacy manager for retention logic)
 	if _, err := s.backupManager.PruneBackups(s.backupManager.Config.Retention); err != nil {
@@ -478,16 +711,31 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 	}
 	s.jobStore.AppendLog("Container is running")
 
-	// Step 6: Verify /health endpoint with retries
+	// Step 6: Verify health endpoint with retries
 	job.Message = "Verifying health endpoint"
 	job.UpdatedAt = time.Now().UTC()
 	s.jobStore.Save(job)
-	s.jobStore.AppendLog("Verifying /health endpoint (6 retries, 2s apart)...")
+
+	useLegacyHealth := s.shouldUseLegacyForTarget(policyInitVersion, imageTag)
+	if useLegacyHealth {
+		s.jobStore.AppendLog("Verifying legacy health endpoint (6 retries, 2s apart)...")
+	} else {
+		s.jobStore.AppendLog("Verifying /health endpoint (6 retries, 2s apart)...")
+	}
 
 	healthOK := false
 	for attempt := 1; attempt <= 6; attempt++ {
 		healthCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		healthResp, err := s.coreClient.Health(healthCtx)
+		var healthResp *coreclient.HealthResponse
+		var err error
+		if useLegacyHealth {
+			err = corecompat.LegacyHealth(healthCtx, s.coreClient.BaseURL)
+			if err == nil {
+				healthResp = &coreclient.HealthResponse{Status: "ok"}
+			}
+		} else {
+			healthResp, err = s.coreClient.Health(healthCtx)
+		}
 		cancel()
 
 		// Require status == "ok"
@@ -529,14 +777,29 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 		return
 	}
 
-	// Step 7: Verify /version matches target
+	// Step 7: Verify version matches target
 	job.Message = "Verifying version"
 	job.UpdatedAt = time.Now().UTC()
 	s.jobStore.Save(job)
-	s.jobStore.AppendLog("Verifying /version matches target...")
+
+	if useLegacyHealth {
+		s.jobStore.AppendLog("Verifying container label version matches target...")
+	} else {
+		s.jobStore.AppendLog("Verifying /version matches target...")
+	}
 
 	versionCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	versionResp, err := s.coreClient.Version(versionCtx)
+	var versionResp *coreclient.VersionResponse
+	if useLegacyHealth {
+		versionValue, labelErr := corecompat.VersionFromLabels(versionCtx, s.config.DockerBin, containerName)
+		if labelErr == nil {
+			versionResp = &coreclient.VersionResponse{Version: versionValue}
+		} else {
+			err = labelErr
+		}
+	} else {
+		versionResp, err = s.coreClient.Version(versionCtx)
+	}
 	cancel()
 
 	if err != nil {
@@ -564,6 +827,16 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 	job.Message = "Verifying migrations"
 	job.UpdatedAt = time.Now().UTC()
 	s.jobStore.Save(job)
+
+	if useLegacyHealth {
+		s.jobStore.AppendLog("Skipping migrations check (legacy core version)")
+		job.State = jobs.JobStateReady
+		job.Message = "Upgrade completed successfully"
+		job.UpdatedAt = time.Now().UTC()
+		s.jobStore.Save(job)
+		return
+	}
+
 	s.jobStore.AppendLog("Verifying migrations status...")
 
 	// Poll migration status with retries (up to 30 seconds for running migrations)
@@ -595,7 +868,6 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 			// Success!
 			s.jobStore.AppendLog(fmt.Sprintf("Migrations verified: state=%s (attempt %d)", migrationsResp.State, attempt))
 			migrationsComplete = true
-			break
 		case "running":
 			// Migrations still in progress - wait and retry
 			if attempt < 15 {
@@ -643,4 +915,65 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 	job.UpdatedAt = time.Now().UTC()
 	s.jobStore.Save(job)
 	s.jobStore.AppendLog(fmt.Sprintf("SUCCESS: Upgrade to %s completed successfully", imageTag))
+}
+
+func (s *Server) fetchPolicyInitVersion(ctx context.Context) string {
+	policyClient := policy.NewClient(time.Duration(s.config.FetchTimeoutSeconds) * time.Second)
+	policyCtx, cancel := context.WithTimeout(ctx, time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
+	defer cancel()
+	policyData, err := policyClient.Fetch(policyCtx, s.config.PolicyURL)
+	if err != nil {
+		log.Printf("Warning: failed to fetch policy for init version: %v", err)
+		return ""
+	}
+	return strings.TrimSpace(policyData.UpdaterAPIInitVersion)
+}
+
+func (s *Server) resolveCoreVersion(ctx context.Context, containerName, initVersion string) (string, bool, error) {
+	versionResp, err := s.coreClient.Version(ctx)
+	if err == nil && versionResp != nil && versionResp.Version != "" {
+		legacy, legacyErr := corecompat.IsBeforeInit(versionResp.Version, initVersion)
+		if legacyErr != nil {
+			log.Printf("Warning: failed to compare versions: %v", legacyErr)
+			return versionResp.Version, false, nil
+		}
+		return versionResp.Version, legacy, nil
+	}
+
+	labelVersion, err := corecompat.VersionFromLabels(ctx, s.config.DockerBin, containerName)
+	if err != nil {
+		return "", false, err
+	}
+
+	legacy, legacyErr := corecompat.IsBeforeInit(labelVersion, initVersion)
+	if legacyErr != nil {
+		log.Printf("Warning: failed to compare versions: %v", legacyErr)
+		return labelVersion, false, nil
+	}
+
+	return labelVersion, legacy, nil
+}
+
+func (s *Server) shouldUseLegacyForTarget(initVersion, targetVersion string) bool {
+	legacy, err := corecompat.IsBeforeInit(targetVersion, initVersion)
+	if err != nil {
+		log.Printf("Warning: failed to compare target version: %v", err)
+		return false
+	}
+	return legacy
+}
+
+func (s *Server) discoverContainerName(ctx context.Context) (string, error) {
+	imagePattern := "payramapp/payram:"
+	if s.config.ImageRepoOverride != "" {
+		imagePattern = s.config.ImageRepoOverride + ":"
+	}
+
+	discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, log.Default())
+	discovered, err := discoverer.DiscoverPayramContainer(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	return discovered.Name, nil
 }
