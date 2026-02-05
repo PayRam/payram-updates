@@ -29,9 +29,10 @@ type Breakpoint struct {
 
 // Policy represents the update policy fetched from GitHub.
 type Policy struct {
-	Latest      string       `json:"latest"`
-	Releases    []string     `json:"releases"`
-	Breakpoints []Breakpoint `json:"breakpoints"`
+	Latest                string       `json:"latest"`
+	UpdaterAPIInitVersion string       `json:"updater_api_init_version"`
+	Releases              []string     `json:"releases"`
+	Breakpoints           []Breakpoint `json:"breakpoints"`
 }
 
 // Client is an HTTP client for fetching policy data.

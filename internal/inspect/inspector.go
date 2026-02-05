@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/payram/payram-updater/internal/coreclient"
+	"github.com/payram/payram-updater/internal/corecompat"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/manifest"
 	"github.com/payram/payram-updater/internal/policy"
@@ -64,6 +65,8 @@ type Inspector struct {
 	policyURL     string
 	manifestURL   string
 	manifestPorts []int
+	policyInitVer string
+	policyInitSet bool
 }
 
 // NewInspector creates a new inspector with the given configuration.
@@ -355,11 +358,8 @@ func (i *Inspector) checkHealth(ctx context.Context, result *InspectResult) {
 		return
 	}
 
-	client := coreclient.NewClient(i.coreBaseURL)
-	healthCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	healthResp, err := client.Health(healthCtx)
+	initVersion := i.getPolicyInitVersion(ctx)
+	_, useLegacy, err := i.resolveCoreVersion(ctx, initVersion)
 	if err != nil {
 		result.Checks["health"] = CheckResult{
 			Status:  "WARNING",
@@ -376,7 +376,36 @@ func (i *Inspector) checkHealth(ctx context.Context, result *InspectResult) {
 		return
 	}
 
-	if healthResp.Status == "ok" && healthResp.DB == "ok" {
+	client := coreclient.NewClient(i.coreBaseURL)
+	healthCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	var healthResp *coreclient.HealthResponse
+	if useLegacy {
+		err = corecompat.LegacyHealth(healthCtx, i.coreBaseURL)
+		if err == nil {
+			healthResp = &coreclient.HealthResponse{Status: "ok"}
+		}
+	} else {
+		healthResp, err = client.Health(healthCtx)
+	}
+	if err != nil {
+		result.Checks["health"] = CheckResult{
+			Status:  "WARNING",
+			Message: fmt.Sprintf("Health check failed: %v", err),
+		}
+		result.Issues = append(result.Issues, Issue{
+			Component:   "health",
+			Description: fmt.Sprintf("Health endpoint not responding: %v", err),
+			Severity:    "WARNING",
+		})
+		if result.OverallState == StateOK {
+			result.OverallState = StateDegraded
+		}
+		return
+	}
+
+	if healthResp.Status == "ok" && (healthResp.DB == "ok" || healthResp.DB == "") {
 		result.Checks["health"] = CheckResult{
 			Status:  "OK",
 			Message: fmt.Sprintf("Health OK (status=%s, db=%s)", healthResp.Status, healthResp.DB),
@@ -408,11 +437,11 @@ func (i *Inspector) checkVersion(ctx context.Context, result *InspectResult) {
 		return
 	}
 
-	client := coreclient.NewClient(i.coreBaseURL)
+	initVersion := i.getPolicyInitVersion(ctx)
 	versionCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	versionResp, err := client.Version(versionCtx)
+	versionValue, _, err := i.resolveCoreVersion(versionCtx, initVersion)
 	if err != nil {
 		result.Checks["version"] = CheckResult{
 			Status:  "WARNING",
@@ -431,23 +460,23 @@ func (i *Inspector) checkVersion(ctx context.Context, result *InspectResult) {
 
 	result.Checks["version"] = CheckResult{
 		Status:  "OK",
-		Message: fmt.Sprintf("Running version: %s", versionResp.Version),
+		Message: fmt.Sprintf("Running version: %s", versionValue),
 	}
 
 	// Check for version mismatch with last successful job
 	if result.LastJob != nil && result.LastJob.State == jobs.JobStateReady {
-		if versionResp.Version != result.LastJob.ResolvedTarget {
-			cmp := compareVersions(versionResp.Version, result.LastJob.ResolvedTarget)
+		if versionValue != result.LastJob.ResolvedTarget {
+			cmp := compareVersions(versionValue, result.LastJob.ResolvedTarget)
 
 			if cmp < 0 {
 				// Running version is LOWER than expected - downgrade detected
 				result.Checks["version"] = CheckResult{
 					Status:  "FAILED",
-					Message: fmt.Sprintf("Downgrade detected: running %s (expected %s)", versionResp.Version, result.LastJob.ResolvedTarget),
+					Message: fmt.Sprintf("Downgrade detected: running %s (expected %s)", versionValue, result.LastJob.ResolvedTarget),
 				}
 				result.Issues = append(result.Issues, Issue{
 					Component:   "version",
-					Description: fmt.Sprintf("Downgrade detected: running %s but last upgrade targeted %s", versionResp.Version, result.LastJob.ResolvedTarget),
+					Description: fmt.Sprintf("Downgrade detected: running %s but last upgrade targeted %s", versionValue, result.LastJob.ResolvedTarget),
 					Severity:    "CRITICAL",
 				})
 				result.OverallState = StateBroken
@@ -458,22 +487,22 @@ func (i *Inspector) checkVersion(ctx context.Context, result *InspectResult) {
 				if healthOK && healthCheck.Status == "OK" {
 					result.Checks["version"] = CheckResult{
 						Status:  "WARNING",
-						Message: fmt.Sprintf("External upgrade detected: running %s (expected %s)", versionResp.Version, result.LastJob.ResolvedTarget),
+						Message: fmt.Sprintf("External upgrade detected: running %s (expected %s)", versionValue, result.LastJob.ResolvedTarget),
 					}
 					result.Issues = append(result.Issues, Issue{
 						Component:   "version",
-						Description: fmt.Sprintf("External upgrade detected: running %s but last upgrade targeted %s. System is healthy.", versionResp.Version, result.LastJob.ResolvedTarget),
+						Description: fmt.Sprintf("External upgrade detected: running %s but last upgrade targeted %s. System is healthy.", versionValue, result.LastJob.ResolvedTarget),
 						Severity:    "INFO",
 					})
 					// Don't degrade state if health is OK - this is recoverable
 				} else {
 					result.Checks["version"] = CheckResult{
 						Status:  "WARNING",
-						Message: fmt.Sprintf("External upgrade detected: running %s (expected %s), health not confirmed", versionResp.Version, result.LastJob.ResolvedTarget),
+						Message: fmt.Sprintf("External upgrade detected: running %s (expected %s), health not confirmed", versionValue, result.LastJob.ResolvedTarget),
 					}
 					result.Issues = append(result.Issues, Issue{
 						Component:   "version",
-						Description: fmt.Sprintf("External upgrade detected: running %s but last upgrade targeted %s. Health status unclear.", versionResp.Version, result.LastJob.ResolvedTarget),
+						Description: fmt.Sprintf("External upgrade detected: running %s but last upgrade targeted %s. Health status unclear.", versionValue, result.LastJob.ResolvedTarget),
 						Severity:    "WARNING",
 					})
 					if result.OverallState == StateOK {
@@ -484,11 +513,11 @@ func (i *Inspector) checkVersion(ctx context.Context, result *InspectResult) {
 				// Versions are same but strings differ (shouldn't happen often)
 				result.Checks["version"] = CheckResult{
 					Status:  "WARNING",
-					Message: fmt.Sprintf("Running version: %s (expected %s from last upgrade)", versionResp.Version, result.LastJob.ResolvedTarget),
+					Message: fmt.Sprintf("Running version: %s (expected %s from last upgrade)", versionValue, result.LastJob.ResolvedTarget),
 				}
 				result.Issues = append(result.Issues, Issue{
 					Component:   "version",
-					Description: fmt.Sprintf("Version mismatch: running %s but last upgrade targeted %s", versionResp.Version, result.LastJob.ResolvedTarget),
+					Description: fmt.Sprintf("Version mismatch: running %s but last upgrade targeted %s", versionValue, result.LastJob.ResolvedTarget),
 					Severity:    "WARNING",
 				})
 				if result.OverallState == StateOK {
@@ -497,6 +526,51 @@ func (i *Inspector) checkVersion(ctx context.Context, result *InspectResult) {
 			}
 		}
 	}
+}
+
+func (i *Inspector) getPolicyInitVersion(ctx context.Context) string {
+	if i.policyInitSet {
+		return i.policyInitVer
+	}
+	if i.policyURL == "" {
+		i.policyInitSet = true
+		return ""
+	}
+
+	client := policy.NewClient(5 * time.Second)
+	policyData, err := client.Fetch(ctx, i.policyURL)
+	if err != nil {
+		i.policyInitSet = true
+		return ""
+	}
+
+	i.policyInitVer = strings.TrimSpace(policyData.UpdaterAPIInitVersion)
+	i.policyInitSet = true
+	return i.policyInitVer
+}
+
+func (i *Inspector) resolveCoreVersion(ctx context.Context, initVersion string) (string, bool, error) {
+	client := coreclient.NewClient(i.coreBaseURL)
+	versionResp, err := client.Version(ctx)
+	if err == nil && versionResp != nil && versionResp.Version != "" {
+		legacy, legacyErr := corecompat.IsBeforeInit(versionResp.Version, initVersion)
+		if legacyErr != nil {
+			return versionResp.Version, false, nil
+		}
+		return versionResp.Version, legacy, nil
+	}
+
+	labelVersion, err := corecompat.VersionFromLabels(ctx, i.dockerBin, i.containerName)
+	if err != nil {
+		return "", false, err
+	}
+
+	legacy, legacyErr := corecompat.IsBeforeInit(labelVersion, initVersion)
+	if legacyErr != nil {
+		return labelVersion, false, nil
+	}
+
+	return labelVersion, legacy, nil
 }
 
 // compareVersions compares two semver strings.

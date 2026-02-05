@@ -396,7 +396,7 @@ func TestHandleUpgrade_Success_Dashboard(t *testing.T) {
 	cfg.PolicyURL = testServer.URL + "/policy.json"
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
-	requestBody := `{"mode": "DASHBOARD", "requested_target": "v1.7.0"}`
+	requestBody := `{"requested_target": "v1.7.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -471,7 +471,8 @@ func TestHandleUpgrade_Success_Manual(t *testing.T) {
 	cfg.PolicyURL = testServer.URL + "/policy.json"
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
-	requestBody := `{"mode": "MANUAL", "requested_target": "v1.5.0"}`
+	// Note: API always uses DASHBOARD mode, MANUAL mode not available via API
+	requestBody := `{"requested_target": "v1.5.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -490,13 +491,13 @@ func TestHandleUpgrade_Success_Manual(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	// MANUAL mode should succeed even if policy fetch fails
-	if job.State != jobs.JobStateReady {
-		t.Errorf("expected state READY, got %s", job.State)
+	// API always uses DASHBOARD mode, so policy fetch failure should fail the job
+	if job.State != jobs.JobStateFailed {
+		t.Errorf("expected state FAILED, got %s", job.State)
 	}
 
-	if job.Mode != jobs.JobModeManual {
-		t.Errorf("expected mode MANUAL, got %s", job.Mode)
+	if job.Mode != jobs.JobModeDashboard {
+		t.Errorf("expected mode DASHBOARD, got %s", job.Mode)
 	}
 	// Allow goroutine to complete before test cleanup
 	time.Sleep(50 * time.Millisecond)
@@ -523,7 +524,7 @@ func TestHandleUpgrade_PolicyFetchFailed_Dashboard(t *testing.T) {
 	cfg.PolicyURL = testServer.URL + "/policy.json"
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
-	requestBody := `{"mode": "DASHBOARD", "requested_target": "v1.7.0"}`
+	requestBody := `{"requested_target": "v1.7.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -581,7 +582,7 @@ func TestHandleUpgrade_ManifestFetchFailed(t *testing.T) {
 	cfg.PolicyURL = testServer.URL + "/policy.json"
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
-	requestBody := `{"mode": "DASHBOARD", "requested_target": "v1.7.0"}`
+	requestBody := `{"requested_target": "v1.7.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -628,7 +629,7 @@ func TestHandleUpgrade_Conflict(t *testing.T) {
 		t.Fatalf("failed to save existing job: %v", err)
 	}
 
-	requestBody := `{"mode": "DASHBOARD", "requested_target": "v1.7.0"}`
+	requestBody := `{"requested_target": "v1.7.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -643,34 +644,13 @@ func TestHandleUpgrade_Conflict(t *testing.T) {
 	}
 }
 
-func TestHandleUpgrade_InvalidMode(t *testing.T) {
-	tmpDir := t.TempDir()
-	cfg := &config.Config{Port: 8080}
-	jobStore := jobs.NewStore(tmpDir)
-	server := New(cfg, jobStore)
-
-	requestBody := `{"mode": "INVALID", "requested_target": "v1.7.0"}`
-	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
-	w := httptest.NewRecorder()
-
-	handler := server.HandleUpgrade()
-	handler(w, req)
-
-	resp := w.Result()
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("expected status %d, got %d", http.StatusBadRequest, resp.StatusCode)
-	}
-}
-
 func TestHandleUpgrade_MissingTarget(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg := &config.Config{Port: 8080}
 	jobStore := jobs.NewStore(tmpDir)
 	server := New(cfg, jobStore)
 
-	requestBody := `{"mode": "DASHBOARD"}`
+	requestBody := `{}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -753,13 +733,25 @@ func TestHandleUpgrade_BreakpointBlocked_Dashboard(t *testing.T) {
 					},
 				},
 			})
+		} else if strings.Contains(r.URL.Path, "manifest") {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"image": map[string]string{
+					"repo": "ghcr.io/payram/runtime",
+				},
+				"defaults": map[string]interface{}{
+					"container_name": "payram",
+					"restart_policy": "always",
+				},
+			})
 		}
 	}))
 	defer testServer.Close()
 
 	cfg.PolicyURL = testServer.URL + "/policy.json"
+	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
-	requestBody := `{"mode": "DASHBOARD", "requested_target": "v2.0.0"}`
+	requestBody := `{"requested_target": "v2.0.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -837,8 +829,8 @@ func TestHandleUpgrade_BreakpointNotBlocked_Manual(t *testing.T) {
 	cfg.PolicyURL = testServer.URL + "/policy.json"
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
-	// MANUAL mode should bypass breakpoint checks
-	requestBody := `{"mode": "MANUAL", "requested_target": "v2.0.0"}`
+	// API always uses DASHBOARD mode which enforces breakpoint checks
+	requestBody := `{"requested_target": "v2.0.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -857,16 +849,14 @@ func TestHandleUpgrade_BreakpointNotBlocked_Manual(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	// MANUAL mode should succeed despite breakpoint
-	if job.State != jobs.JobStateReady {
-		t.Errorf("expected state READY, got %s", job.State)
+	// API always uses DASHBOARD mode which should block breakpoints
+	if job.State != jobs.JobStateFailed {
+		t.Errorf("expected state FAILED, got %s", job.State)
 	}
 
-	if job.FailureCode != "" {
-		t.Errorf("expected no failure code, got %s", job.FailureCode)
+	if job.FailureCode != "MANUAL_UPGRADE_REQUIRED" {
+		t.Errorf("expected failure code MANUAL_UPGRADE_REQUIRED, got %s", job.FailureCode)
 	}
-	// Allow goroutine to complete before test cleanup
-	time.Sleep(50 * time.Millisecond)
 }
 
 func TestHandleUpgrade_NoBreakpointMatch(t *testing.T) {
@@ -915,7 +905,7 @@ func TestHandleUpgrade_NoBreakpointMatch(t *testing.T) {
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
 	// Target a version that's not a breakpoint
-	requestBody := `{"mode": "DASHBOARD", "requested_target": "v1.7.0"}`
+	requestBody := `{"requested_target": "v1.7.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -1182,7 +1172,7 @@ func TestHandleUpgradePlan_Success(t *testing.T) {
 	jobStore := jobs.NewStore(tmpDir)
 	server := New(cfg, jobStore)
 
-	body := strings.NewReader(`{"mode":"DASHBOARD","requested_target":"v1.7.0"}`)
+	body := strings.NewReader(`{"requested_target":"v1.7.0"}`)
 	req := httptest.NewRequest(http.MethodPost, "/upgrade/plan", body)
 	w := httptest.NewRecorder()
 
@@ -1245,7 +1235,7 @@ func TestHandleUpgradePlan_PolicyFetchFailed_Dashboard(t *testing.T) {
 	jobStore := jobs.NewStore(tmpDir)
 	server := New(cfg, jobStore)
 
-	body := strings.NewReader(`{"mode":"DASHBOARD","requested_target":"v1.7.0"}`)
+	body := strings.NewReader(`{"requested_target":"v1.7.0"}`)
 	req := httptest.NewRequest(http.MethodPost, "/upgrade/plan", body)
 	w := httptest.NewRecorder()
 
@@ -1269,27 +1259,6 @@ func TestHandleUpgradePlan_PolicyFetchFailed_Dashboard(t *testing.T) {
 	}
 	if planResp.FailureCode != "POLICY_FETCH_FAILED" {
 		t.Errorf("expected failure_code POLICY_FETCH_FAILED, got %s", planResp.FailureCode)
-	}
-}
-
-func TestHandleUpgradePlan_InvalidMode(t *testing.T) {
-	tmpDir := t.TempDir()
-	cfg := &config.Config{Port: 8080}
-	jobStore := jobs.NewStore(tmpDir)
-	server := New(cfg, jobStore)
-
-	body := strings.NewReader(`{"mode":"INVALID","requested_target":"v1.7.0"}`)
-	req := httptest.NewRequest(http.MethodPost, "/upgrade/plan", body)
-	w := httptest.NewRecorder()
-
-	handler := server.HandleUpgradePlan()
-	handler(w, req)
-
-	resp := w.Result()
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("expected status %d, got %d", http.StatusBadRequest, resp.StatusCode)
 	}
 }
 
@@ -1350,7 +1319,7 @@ func TestHandleUpgradeRun_Success(t *testing.T) {
 	jobStore := jobs.NewStore(tmpDir)
 	server := New(cfg, jobStore)
 
-	body := strings.NewReader(`{"mode":"DASHBOARD","requested_target":"v1.7.0","source":"CLI"}`)
+	body := strings.NewReader(`{"requested_target":"v1.7.0","source":"CLI"}`)
 	req := httptest.NewRequest(http.MethodPost, "/upgrade/run", body)
 	w := httptest.NewRecorder()
 
@@ -1414,7 +1383,7 @@ func TestHandleUpgradeRun_Conflict(t *testing.T) {
 
 	server := New(cfg, jobStore)
 
-	body := strings.NewReader(`{"mode":"DASHBOARD","requested_target":"v1.7.0","source":"CLI"}`)
+	body := strings.NewReader(`{"requested_target":"v1.7.0","source":"CLI"}`)
 	req := httptest.NewRequest(http.MethodPost, "/upgrade/run", body)
 	w := httptest.NewRecorder()
 
@@ -1468,7 +1437,7 @@ func TestHandleUpgradeRun_MissingTarget(t *testing.T) {
 	jobStore := jobs.NewStore(tmpDir)
 	server := New(cfg, jobStore)
 
-	body := strings.NewReader(`{"mode":"DASHBOARD"}`)
+	body := strings.NewReader(`{}`)
 	req := httptest.NewRequest(http.MethodPost, "/upgrade/run", body)
 	w := httptest.NewRecorder()
 

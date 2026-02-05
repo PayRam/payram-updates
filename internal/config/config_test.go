@@ -87,6 +87,12 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.StateDir != "/var/lib/payram-updater" {
 		t.Errorf("expected default state dir '/var/lib/payram-updater', got %s", cfg.StateDir)
 	}
+	if cfg.AutoUpdateEnabled != DefaultAutoUpdateEnabled {
+		t.Errorf("expected default auto update enabled %v, got %v", DefaultAutoUpdateEnabled, cfg.AutoUpdateEnabled)
+	}
+	if cfg.AutoUpdateInterval != DefaultAutoUpdateIntervalHours {
+		t.Errorf("expected default auto update interval %d, got %d", DefaultAutoUpdateIntervalHours, cfg.AutoUpdateInterval)
+	}
 }
 
 func TestLoad_BackupDefaults(t *testing.T) {

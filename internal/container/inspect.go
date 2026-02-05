@@ -30,6 +30,9 @@ type RuntimeState struct {
 	// Environment variables
 	Env []string
 
+	// Image labels
+	Labels map[string]string
+
 	// Network configuration
 	Networks []NetworkConfig
 
@@ -88,8 +91,9 @@ type dockerInspectOutput struct {
 	Name   string `json:"Name"`
 	Image  string `json:"Image"`
 	Config struct {
-		Image string   `json:"Image"`
-		Env   []string `json:"Env"`
+		Image  string            `json:"Image"`
+		Env    []string          `json:"Env"`
+		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	HostConfig struct {
 		RestartPolicy struct {
@@ -155,10 +159,11 @@ func (i *Inspector) ExtractRuntimeState(ctx context.Context, containerNameOrID s
 
 	// Build RuntimeState
 	state := &RuntimeState{
-		ID:    data.ID,
-		Name:  data.Name,
-		Image: data.Config.Image,
-		Env:   data.Config.Env,
+		ID:     data.ID,
+		Name:   data.Name,
+		Image:  data.Config.Image,
+		Env:    data.Config.Env,
+		Labels: data.Config.Labels,
 	}
 
 	// Parse image tag

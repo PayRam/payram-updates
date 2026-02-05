@@ -18,6 +18,14 @@ type BackupConfig struct {
 	PGPassword string
 }
 
+const (
+	// DefaultAutoUpdateEnabled controls the default auto-update setting.
+	// Change this constant to flip the default behavior globally.
+	DefaultAutoUpdateEnabled = false
+	// DefaultAutoUpdateIntervalHours is the default check interval in hours.
+	DefaultAutoUpdateIntervalHours = 24
+)
+
 // Config holds all configuration for the payram-updater service.
 // STATELESS DESIGN: This updater does not persist runtime configuration.
 // Container runtime details (ports, env vars, mounts, networks) are discovered
@@ -35,6 +43,8 @@ type Config struct {
 	DockerBin           string
 	TargetContainerName string // Optional: overrides manifest container_name
 	ImageRepoOverride   string // Optional: for testing with different image repos (e.g., payram-dummy)
+	AutoUpdateEnabled   bool
+	AutoUpdateInterval  int // Hours
 	Backup              BackupConfig
 }
 
@@ -78,6 +88,8 @@ func Load() (*Config, error) {
 		DockerBin:           getEnvString("DOCKER_BIN", "docker"),
 		TargetContainerName: os.Getenv("TARGET_CONTAINER_NAME"), // Optional: no default
 		ImageRepoOverride:   os.Getenv("IMAGE_REPO_OVERRIDE"),   // Optional: for testing (e.g., "payram-dummy")
+		AutoUpdateEnabled:   DefaultAutoUpdateEnabled,
+		AutoUpdateInterval:  DefaultAutoUpdateIntervalHours,
 		Backup: BackupConfig{
 			Dir:        getEnvString("BACKUP_DIR", "data/backups"),
 			Retention:  getEnvInt("BACKUP_RETENTION", 10),
@@ -100,6 +112,10 @@ func Load() (*Config, error) {
 	// Validate EXECUTION_MODE
 	if cfg.ExecutionMode != "dry-run" && cfg.ExecutionMode != "execute" {
 		return nil, fmt.Errorf("EXECUTION_MODE must be 'dry-run' or 'execute', got '%s'", cfg.ExecutionMode)
+	}
+
+	if cfg.AutoUpdateEnabled && cfg.AutoUpdateInterval < 1 {
+		return nil, fmt.Errorf("AUTO_UPDATE_INTERVAL_HOURS must be at least 1 when auto update is enabled, got %d", cfg.AutoUpdateInterval)
 	}
 
 	return cfg, nil
