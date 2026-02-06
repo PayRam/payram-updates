@@ -96,6 +96,17 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 		log.Printf("Discovered Payram Core at: %s", coreBaseURL)
 	}
 
+	// Discover Payram container IP for access control
+	log.Println("Discovering Payram container IP for access control...")
+	payramContainerIP, err := network.GetPayramContainerIP(cfg.DockerBin, imagePattern)
+	if err != nil {
+		log.Printf("WARNING: Failed to discover Payram container IP: %v", err)
+		log.Println("API access will be restricted to localhost only")
+		payramContainerIP = ""
+	} else {
+		log.Printf("Payram container IP: %s (API access restricted to localhost and this container)", payramContainerIP)
+	}
+
 	// Create core API client
 	coreClient := coreclient.NewClient(coreBaseURL)
 
@@ -145,11 +156,22 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 	mux.HandleFunc("/history", s.HandleHistory())
 	mux.HandleFunc("/upgrade/history", s.HandleHistory())
 
-	// Bind to 0.0.0.0 to allow access from Docker containers
-	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
+	// Apply IP restriction middleware to allow only localhost and Payram container
+	allowedIPs := []string{
+		"127.0.0.1", // localhost IPv4
+		"::1",       // localhost IPv6
+	}
+	if payramContainerIP != "" {
+		allowedIPs = append(allowedIPs, payramContainerIP)
+	}
+	handler := network.AllowedIPsMiddleware(allowedIPs, log.Default())(mux)
+	log.Printf("API access restricted to: %v", allowedIPs)
+
+	// Bind only to localhost and docker bridge (local machine only)
+	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 	s.httpServer = &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: handler,
 	}
 
 	return s
@@ -170,22 +192,37 @@ func (s *Server) Start() error {
 
 	// Start the server in a goroutine
 	go func() {
-		// Get Docker bridge IP for logging
+		// Get Docker bridge IP for logging and optional listener
 		dockerIP, err := network.GetDockerBridgeIP()
 		if err != nil {
 			log.Printf("WARNING: Could not detect Docker bridge IP: %v", err)
-			log.Printf("Starting HTTP server on 127.0.0.1:%d (Docker containers may not be able to access this)", s.port)
+			log.Printf("Starting HTTP server on localhost only: http://127.0.0.1:%d", s.port)
 		} else {
-			log.Printf("Starting HTTP server on port %d", s.port)
-			log.Printf("  - Accessible from localhost: http://127.0.0.1:%d", s.port)
-			log.Printf("  - Accessible from Docker containers: http://%s:%d", dockerIP, s.port)
+			log.Printf("Starting HTTP server on local interfaces")
+			log.Printf("  - Localhost: http://127.0.0.1:%d", s.port)
+			log.Printf("  - Docker bridge: http://%s:%d", dockerIP, s.port)
 		}
 
-		// Use a listener bound to 0.0.0.0 to allow access from both localhost and Docker
+		// Always listen on localhost
 		listener, err := net.Listen("tcp", s.httpServer.Addr)
 		if err != nil {
 			serverErrors <- fmt.Errorf("failed to create listener: %w", err)
 			return
+		}
+
+		// If docker bridge IP is available, start a second listener on it
+		if dockerIP != "" {
+			bridgeAddr := fmt.Sprintf("%s:%d", dockerIP, s.port)
+			bridgeListener, bridgeErr := net.Listen("tcp", bridgeAddr)
+			if bridgeErr != nil {
+				log.Printf("WARNING: Failed to bind docker bridge listener (%s): %v", bridgeAddr, bridgeErr)
+			} else {
+				go func() {
+					if err := s.httpServer.Serve(bridgeListener); err != nil && err != http.ErrServerClosed {
+						serverErrors <- fmt.Errorf("HTTP server error (docker bridge): %w", err)
+					}
+				}()
+			}
 		}
 
 		if err := s.httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {

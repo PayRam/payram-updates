@@ -1,10 +1,15 @@
 package network
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
+
+	"github.com/payram/payram-updater/internal/container"
 )
 
 // GetDockerBridgeIP retrieves the IPv4 address of the docker0 bridge interface.
@@ -27,4 +32,34 @@ func GetDockerBridgeIP() (string, error) {
 
 	ip := strings.TrimSpace(matches[1])
 	return ip, nil
+}
+
+// GetPayramContainerIP retrieves the IP address of the Payram container.
+// This is used to restrict API access to only the Payram container.
+func GetPayramContainerIP(dockerBin string, imagePattern string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Step 1: Discover the Payram container using the same selection logic as the updater
+	discoverer := container.NewDiscoverer(dockerBin, imagePattern, log.Default())
+	discovered, err := discoverer.DiscoverPayramContainer(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to discover Payram container: %w", err)
+	}
+
+	// Step 2: Inspect the container to read network IPs
+	inspector := container.NewInspector(dockerBin, log.Default())
+	runtimeState, err := inspector.ExtractRuntimeState(ctx, discovered.Name)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect Payram container %s: %w", discovered.Name, err)
+	}
+
+	// Step 3: Choose the first non-empty IP from the container networks
+	for _, network := range runtimeState.Networks {
+		if strings.TrimSpace(network.IPAddress) != "" {
+			return strings.TrimSpace(network.IPAddress), nil
+		}
+	}
+
+	return "", fmt.Errorf("Payram container %s has no IP address in any network", discovered.Name)
 }
