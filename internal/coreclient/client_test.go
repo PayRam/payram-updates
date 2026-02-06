@@ -39,8 +39,8 @@ func TestNewClient_TrailingSlash(t *testing.T) {
 // TestHealth_Success tests successful health check.
 func TestHealth_Success(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/health" {
-			t.Errorf("expected path /health, got %s", r.URL.Path)
+		if r.URL.Path != "/api/v1/health" {
+			t.Errorf("expected path /api/v1/health, got %s", r.URL.Path)
 		}
 		if r.Method != http.MethodGet {
 			t.Errorf("expected GET method, got %s", r.Method)
@@ -96,8 +96,8 @@ func TestHealth_WithDBField(t *testing.T) {
 // TestVersion_Success tests successful version retrieval.
 func TestVersion_Success(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/version" {
-			t.Errorf("expected path /version, got %s", r.URL.Path)
+		if r.URL.Path != "/api/v1/version" {
+			t.Errorf("expected path /api/v1/version, got %s", r.URL.Path)
 		}
 
 		w.Header().Set("Content-Type", "application/json")

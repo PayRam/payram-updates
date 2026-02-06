@@ -41,15 +41,6 @@ type VersionResponse struct {
 	Version string `json:"version"`
 }
 
-// MigrationsStatusResponse represents the response from the /admin/migrations/status endpoint.
-// The state field indicates migration status:
-//   - "complete" = migrations finished successfully
-//   - "running" = migrations currently in progress (caller should wait)
-//   - "failed" = migrations failed (requires manual recovery)
-type MigrationsStatusResponse struct {
-	State string `json:"state"`
-}
-
 // NewClient creates a new core API client with default timeout.
 func NewClient(baseURL string) *Client {
 	return &Client{
@@ -66,7 +57,7 @@ func NewClient(baseURL string) *Client {
 // Required: status == "ok" for a healthy state.
 // Optional: db (if present, must be "ok" for healthy state).
 func (c *Client) Health(ctx context.Context) (*HealthResponse, error) {
-	url := c.BaseURL + "/health"
+	url := c.BaseURL + "/api/v1/health"
 	var response HealthResponse
 	if err := c.doRequestLenient(ctx, url, &response); err != nil {
 		return nil, fmt.Errorf("health check failed: %w", err)
@@ -78,21 +69,10 @@ func (c *Client) Health(ctx context.Context) (*HealthResponse, error) {
 // The response is parsed leniently - only the "version" field is captured.
 // Additional fields like "build" and "image" are ignored.
 func (c *Client) Version(ctx context.Context) (*VersionResponse, error) {
-	url := c.BaseURL + "/version"
+	url := c.BaseURL + "/api/v1/version"
 	var response VersionResponse
 	if err := c.doRequestLenient(ctx, url, &response); err != nil {
 		return nil, fmt.Errorf("version check failed: %w", err)
-	}
-	return &response, nil
-}
-
-// MigrationsStatus retrieves the database migrations status.
-// The response is parsed leniently - only the "state" field is captured.
-func (c *Client) MigrationsStatus(ctx context.Context) (*MigrationsStatusResponse, error) {
-	url := c.BaseURL + "/admin/migrations/status"
-	var response MigrationsStatusResponse
-	if err := c.doRequestLenient(ctx, url, &response); err != nil {
-		return nil, fmt.Errorf("migrations status check failed: %w", err)
 	}
 	return &response, nil
 }

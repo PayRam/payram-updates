@@ -555,21 +555,6 @@ func runRecover() {
 		fmt.Printf("\nAction taken: %s\n", result.Action)
 	}
 
-	// If recovery failed due to MIGRATION_FAILED, provide additional guidance
-	if result.Code == "MIGRATION_FAILED" {
-		playbook := recovery.GetPlaybook("MIGRATION_FAILED")
-		fmt.Println("\n--- Manual Recovery Required ---")
-		fmt.Printf("Title: %s\n", playbook.Title)
-		fmt.Printf("Data Risk: %s\n", playbook.DataRisk)
-		fmt.Println("\nSSH Recovery Steps:")
-		for _, step := range playbook.SSHSteps {
-			fmt.Printf("  %s\n", step)
-		}
-		if playbook.DocsURL != "" {
-			fmt.Printf("\nDocumentation: %s\n", playbook.DocsURL)
-		}
-	}
-
 	fmt.Println(strings.Repeat("=", 60))
 
 	// Exit with non-zero if recovery failed

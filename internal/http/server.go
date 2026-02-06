@@ -482,9 +482,8 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 		s.jobStore.AppendLog(fmt.Sprintf("  3. Remove container: %s", containerName))
 		s.jobStore.AppendLog(fmt.Sprintf("  4. Run new container: docker %s", strings.Join(dockerArgs, " ")))
 		s.jobStore.AppendLog("  5. Verify: container running")
-		s.jobStore.AppendLog("  6. Verify: /health endpoint")
-		s.jobStore.AppendLog("  7. Verify: /version matches target")
-		s.jobStore.AppendLog("  8. Verify: migrations complete")
+		s.jobStore.AppendLog("  6. Verify: /api/v1/health endpoint")
+		s.jobStore.AppendLog("  7. Verify: /api/v1/version matches target")
 
 		job.State = jobs.JobStateReady
 		job.Message = "Dry-run validation complete"
@@ -720,7 +719,7 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 	if useLegacyHealth {
 		s.jobStore.AppendLog("Verifying legacy health endpoint (6 retries, 2s apart)...")
 	} else {
-		s.jobStore.AppendLog("Verifying /health endpoint (6 retries, 2s apart)...")
+		s.jobStore.AppendLog("Verifying /api/v1/health endpoint (6 retries, 2s apart)...")
 	}
 
 	healthOK := false
@@ -785,7 +784,7 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 	if useLegacyHealth {
 		s.jobStore.AppendLog("Verifying container label version matches target...")
 	} else {
-		s.jobStore.AppendLog("Verifying /version matches target...")
+		s.jobStore.AppendLog("Verifying /api/v1/version matches target...")
 	}
 
 	versionCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -823,93 +822,7 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 	}
 	s.jobStore.AppendLog(fmt.Sprintf("Version verified: %s", versionResp.Version))
 
-	// Step 8: Verify migrations status
-	job.Message = "Verifying migrations"
-	job.UpdatedAt = time.Now().UTC()
-	s.jobStore.Save(job)
-
-	if useLegacyHealth {
-		s.jobStore.AppendLog("Skipping migrations check (legacy core version)")
-		job.State = jobs.JobStateReady
-		job.Message = "Upgrade completed successfully"
-		job.UpdatedAt = time.Now().UTC()
-		s.jobStore.Save(job)
-		return
-	}
-
-	s.jobStore.AppendLog("Verifying migrations status...")
-
-	// Poll migration status with retries (up to 30 seconds for running migrations)
-	migrationsComplete := false
-	for attempt := 1; attempt <= 15; attempt++ {
-		migrationsCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		migrationsResp, err := s.coreClient.MigrationsStatus(migrationsCtx)
-		cancel()
-
-		if err != nil {
-			if attempt < 15 {
-				s.jobStore.AppendLog(fmt.Sprintf("Migration status check attempt %d failed: %v (retrying...)", attempt, err))
-				time.Sleep(2 * time.Second)
-				continue
-			}
-			// Final attempt failed
-			job.State = jobs.JobStateFailed
-			job.FailureCode = "MIGRATION_FAILED"
-			job.Message = fmt.Sprintf("Failed to get migrations status after %d attempts: %v", attempt, err)
-			job.UpdatedAt = time.Now().UTC()
-			s.jobStore.Save(job)
-			s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s (manual recovery required)", job.FailureCode, job.Message))
-			return
-		}
-
-		// Check migration state
-		switch migrationsResp.State {
-		case "complete":
-			// Success!
-			s.jobStore.AppendLog(fmt.Sprintf("Migrations verified: state=%s (attempt %d)", migrationsResp.State, attempt))
-			migrationsComplete = true
-		case "running":
-			// Migrations still in progress - wait and retry
-			if attempt < 15 {
-				s.jobStore.AppendLog(fmt.Sprintf("Migrations running (attempt %d/15) - waiting 2s...", attempt))
-				time.Sleep(2 * time.Second)
-				continue
-			}
-			// Timeout waiting for migrations to complete
-			job.State = jobs.JobStateFailed
-			job.FailureCode = "MIGRATION_TIMEOUT"
-			job.Message = "Migrations still running after 30 seconds"
-			job.UpdatedAt = time.Now().UTC()
-			s.jobStore.Save(job)
-			s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s (manual recovery required)", job.FailureCode, job.Message))
-			return
-		case "failed":
-			// Hard failure - requires manual recovery
-			job.State = jobs.JobStateFailed
-			job.FailureCode = "MIGRATION_FAILED"
-			job.Message = "Database migrations failed"
-			job.UpdatedAt = time.Now().UTC()
-			s.jobStore.Save(job)
-			s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s (manual recovery required)", job.FailureCode, job.Message))
-			return
-		default:
-			// Unknown state - treat as error
-			job.State = jobs.JobStateFailed
-			job.FailureCode = "MIGRATION_FAILED"
-			job.Message = fmt.Sprintf("Unknown migration state: %s", migrationsResp.State)
-			job.UpdatedAt = time.Now().UTC()
-			s.jobStore.Save(job)
-			s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s (manual recovery required)", job.FailureCode, job.Message))
-			return
-		}
-
-		// Break out of loop if complete
-		if migrationsComplete {
-			break
-		}
-	}
-
-	// Success!
+	// Success! All verification passed
 	job.State = jobs.JobStateReady
 	job.Message = "Upgrade completed successfully"
 	job.UpdatedAt = time.Now().UTC()
