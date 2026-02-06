@@ -21,6 +21,7 @@ func TestNewInspector(t *testing.T) {
 		"http://example.com/policy.json",
 		"http://example.com/manifest.json",
 		ports,
+		false, // debugMode
 	)
 
 	if inspector == nil {
@@ -46,6 +47,7 @@ func TestInspector_Run_NoJobOK(t *testing.T) {
 		"http://example.com/policy.json",
 		"http://example.com/manifest.json",
 		[]int{8080},
+		false, // debugMode
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -93,6 +95,7 @@ func TestInspector_Run_FailedJobWithPlaybook(t *testing.T) {
 		"http://example.com/policy.json",
 		"http://example.com/manifest.json",
 		[]int{8080},
+		false, // debugMode
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -164,6 +167,7 @@ func TestInspector_Run_CompletedJobOK(t *testing.T) {
 		"http://example.com/policy.json",
 		"http://example.com/manifest.json",
 		[]int{8080},
+		false, // debugMode
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -213,6 +217,7 @@ func TestInspector_Run_RetryableErrorDegraded(t *testing.T) {
 		"http://example.com/policy.json",
 		"http://example.com/manifest.json",
 		[]int{8080},
+		false, // debugMode
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

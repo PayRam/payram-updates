@@ -40,6 +40,24 @@ type Recommendation struct {
 	Priority    int    `json:"priority"` // 1 = highest
 }
 
+// UpdateInfo contains information about available updates.
+type UpdateInfo struct {
+	CurrentVersion        string          `json:"current_version"`
+	LatestVersion         string          `json:"latest_version"`
+	UpdateAvailable       bool            `json:"update_available"`
+	CanUpdateViaDashboard bool            `json:"can_update_via_dashboard"`
+	MaxDashboardVersion   string          `json:"max_dashboard_version,omitempty"`
+	NextBreakpoint        *BreakpointInfo `json:"next_breakpoint,omitempty"`
+	Message               string          `json:"message"`
+}
+
+// BreakpointInfo contains information about the next version breakpoint.
+type BreakpointInfo struct {
+	Version string `json:"version"`
+	Reason  string `json:"reason"`
+	Docs    string `json:"docs"`
+}
+
 // InspectResult contains the full inspection output.
 type InspectResult struct {
 	OverallState     OverallState           `json:"overall_state"`
@@ -47,6 +65,7 @@ type InspectResult struct {
 	Recommendations  []Recommendation       `json:"recommendations"`
 	LastJob          *jobs.Job              `json:"last_job,omitempty"`
 	RecoveryPlaybook *recovery.Playbook     `json:"recovery_playbook,omitempty"`
+	UpdateInfo       *UpdateInfo            `json:"update_info,omitempty"`
 	Checks           map[string]CheckResult `json:"checks"`
 }
 
@@ -67,6 +86,8 @@ type Inspector struct {
 	manifestPorts []int
 	policyInitVer string
 	policyInitSet bool
+	debugMode     bool
+	releaseOrder  []string // For debug mode version ordering
 }
 
 // NewInspector creates a new inspector with the given configuration.
@@ -78,6 +99,7 @@ func NewInspector(
 	policyURL string,
 	manifestURL string,
 	manifestPorts []int,
+	debugMode bool,
 ) *Inspector {
 	return &Inspector{
 		jobStore:      jobStore,
@@ -87,6 +109,7 @@ func NewInspector(
 		policyURL:     policyURL,
 		manifestURL:   manifestURL,
 		manifestPorts: manifestPorts,
+		debugMode:     debugMode,
 	}
 }
 
@@ -122,6 +145,9 @@ func (i *Inspector) Run(ctx context.Context) *InspectResult {
 
 	// Check 8: Running version (if container running)
 	i.checkVersion(ctx, result)
+
+	// Check 9: Update availability
+	i.checkUpdateAvailability(ctx, result)
 
 	// Generate recommendations based on state
 	i.generateRecommendations(result)
@@ -466,7 +492,7 @@ func (i *Inspector) checkVersion(ctx context.Context, result *InspectResult) {
 	// Check for version mismatch with last successful job
 	if result.LastJob != nil && result.LastJob.State == jobs.JobStateReady {
 		if versionValue != result.LastJob.ResolvedTarget {
-			cmp := compareVersions(versionValue, result.LastJob.ResolvedTarget)
+			cmp := i.compareVersions(versionValue, result.LastJob.ResolvedTarget)
 
 			if cmp < 0 {
 				// Running version is LOWER than expected - downgrade detected
@@ -573,9 +599,185 @@ func (i *Inspector) resolveCoreVersion(ctx context.Context, initVersion string) 
 	return labelVersion, legacy, nil
 }
 
-// compareVersions compares two semver strings.
+func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *InspectResult) {
+	if i.policyURL == "" {
+		result.Checks["update_check"] = CheckResult{
+			Status:  "UNKNOWN",
+			Message: "Policy URL not configured",
+		}
+		return
+	}
+
+	// Get current version from version check
+	versionCheck, versionExists := result.Checks["version"]
+	if !versionExists || versionCheck.Status != "OK" {
+		result.Checks["update_check"] = CheckResult{
+			Status:  "UNKNOWN",
+			Message: "Cannot check updates - current version unknown",
+		}
+		return
+	}
+
+	// Extract current version from version check message
+	currentVersion := ""
+	if strings.Contains(versionCheck.Message, "Running version: ") {
+		currentVersion = strings.TrimSpace(strings.TrimPrefix(versionCheck.Message, "Running version: "))
+	}
+	if currentVersion == "" {
+		result.Checks["update_check"] = CheckResult{
+			Status:  "UNKNOWN",
+			Message: "Cannot parse current version",
+		}
+		return
+	}
+
+	// Fetch policy
+	policyClient := policy.NewClient(5 * time.Second)
+	policyData, err := policyClient.Fetch(ctx, i.policyURL)
+	if err != nil {
+		result.Checks["update_check"] = CheckResult{
+			Status:  "WARNING",
+			Message: fmt.Sprintf("Failed to fetch policy: %v", err),
+		}
+		return
+	}
+
+	latestVersion := strings.TrimSpace(policyData.Latest)
+	if latestVersion == "" {
+		result.Checks["update_check"] = CheckResult{
+			Status:  "WARNING",
+			Message: "Policy does not specify latest version",
+		}
+		return
+	}
+
+	// Store release order for debug mode
+	i.releaseOrder = policyData.Releases
+
+	// Normalize versions for comparison
+	currentNorm := corecompat.NormalizeVersion(currentVersion)
+	latestNorm := corecompat.NormalizeVersion(latestVersion)
+
+	// Compare versions
+	cmp := i.compareVersions(currentNorm, latestNorm)
+
+	updateInfo := &UpdateInfo{
+		CurrentVersion:  currentVersion,
+		LatestVersion:   latestVersion,
+		UpdateAvailable: cmp < 0,
+	}
+
+	if cmp == 0 {
+		// Already on latest
+		updateInfo.CanUpdateViaDashboard = false
+		updateInfo.Message = "Already on latest version"
+		result.Checks["update_check"] = CheckResult{
+			Status:  "OK",
+			Message: fmt.Sprintf("Running latest version %s", currentVersion),
+		}
+	} else if cmp > 0 {
+		// Running version is ahead of policy latest (unusual)
+		updateInfo.CanUpdateViaDashboard = false
+		updateInfo.Message = "Running version is ahead of policy latest"
+		result.Checks["update_check"] = CheckResult{
+			Status:  "WARNING",
+			Message: fmt.Sprintf("Running version %s is ahead of latest %s", currentVersion, latestVersion),
+		}
+	} else {
+		// Update available
+		// Check if there's a breakpoint between current and latest
+		hasBreakpoint := false
+		var nextBreakpoint *policy.Breakpoint
+
+		for _, bp := range policyData.Breakpoints {
+			bpNorm := corecompat.NormalizeVersion(bp.Version)
+			// Check if breakpoint is between current and latest (or equal to latest)
+			cmpCurrent := i.compareVersions(bpNorm, currentNorm)
+			cmpLatest := i.compareVersions(bpNorm, latestNorm)
+
+			if cmpCurrent > 0 && cmpLatest <= 0 {
+				// Breakpoint is after current and at or before latest
+				hasBreakpoint = true
+				if nextBreakpoint == nil || i.compareVersions(bpNorm, corecompat.NormalizeVersion(nextBreakpoint.Version)) < 0 {
+					nextBreakpoint = &bp
+				}
+			}
+		}
+
+		if hasBreakpoint && nextBreakpoint != nil {
+			// Cannot update via dashboard - breakpoint in the way
+			updateInfo.CanUpdateViaDashboard = false
+			updateInfo.NextBreakpoint = &BreakpointInfo{
+				Version: nextBreakpoint.Version,
+				Reason:  nextBreakpoint.Reason,
+				Docs:    nextBreakpoint.Docs,
+			}
+
+			// Find max dashboard version (highest release before breakpoint)
+			maxDashboardVer := ""
+			breakpointNorm := corecompat.NormalizeVersion(nextBreakpoint.Version)
+			for _, release := range policyData.Releases {
+				releaseNorm := corecompat.NormalizeVersion(release)
+				// Release must be after current and before breakpoint
+				if i.compareVersions(releaseNorm, currentNorm) > 0 && i.compareVersions(releaseNorm, breakpointNorm) < 0 {
+					if maxDashboardVer == "" || i.compareVersions(releaseNorm, corecompat.NormalizeVersion(maxDashboardVer)) > 0 {
+						maxDashboardVer = release
+					}
+				}
+			}
+			if maxDashboardVer != "" {
+				updateInfo.MaxDashboardVersion = maxDashboardVer
+			}
+
+			updateInfo.Message = fmt.Sprintf("Update to %s available, but requires manual CLI upgrade (breakpoint at %s)", latestVersion, nextBreakpoint.Version)
+			result.Checks["update_check"] = CheckResult{
+				Status:  "WARNING",
+				Message: fmt.Sprintf("Update available but blocked by breakpoint at %s. Manual upgrade required.", nextBreakpoint.Version),
+			}
+		} else {
+			// Can update via dashboard
+			updateInfo.CanUpdateViaDashboard = true
+			updateInfo.MaxDashboardVersion = latestVersion
+			updateInfo.Message = fmt.Sprintf("Update to %s available via dashboard", latestVersion)
+			result.Checks["update_check"] = CheckResult{
+				Status:  "OK",
+				Message: fmt.Sprintf("Update available: %s → %s (dashboard upgrade)", currentVersion, latestVersion),
+			}
+		}
+	}
+
+	result.UpdateInfo = updateInfo
+}
+
+// compareVersions compares two version strings.
+// In debug mode, uses release list ordering. Otherwise uses semver parsing.
 // Returns: -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
-func compareVersions(v1, v2 string) int {
+func (i *Inspector) compareVersions(v1, v2 string) int {
+	// In debug mode, use release list ordering
+	if i.debugMode && len(i.releaseOrder) > 0 {
+		idx1 := -1
+		idx2 := -1
+		for idx, release := range i.releaseOrder {
+			if corecompat.NormalizeVersion(release) == v1 {
+				idx1 = idx
+			}
+			if corecompat.NormalizeVersion(release) == v2 {
+				idx2 = idx
+			}
+		}
+		// If both versions found in release list, compare by position
+		if idx1 != -1 && idx2 != -1 {
+			if idx1 < idx2 {
+				return -1
+			} else if idx1 > idx2 {
+				return 1
+			}
+			return 0
+		}
+		// Fall through to semver comparison if not found in list
+	}
+
+	// Standard semver comparison
 	// Strip leading 'v' if present
 	v1 = strings.TrimPrefix(v1, "v")
 	v2 = strings.TrimPrefix(v2, "v")

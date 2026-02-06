@@ -43,6 +43,7 @@ type Config struct {
 	DockerBin           string
 	TargetContainerName string // Optional: overrides manifest container_name
 	ImageRepoOverride   string // Optional: for testing with different image repos (e.g., payram-dummy)
+	DebugVersionMode    bool   // When true, allows arbitrary version names and uses release list ordering
 	AutoUpdateEnabled   bool
 	AutoUpdateInterval  int // Hours
 	Backup              BackupConfig
@@ -88,6 +89,7 @@ func Load() (*Config, error) {
 		DockerBin:           getEnvString("DOCKER_BIN", "docker"),
 		TargetContainerName: os.Getenv("TARGET_CONTAINER_NAME"), // Optional: no default
 		ImageRepoOverride:   os.Getenv("IMAGE_REPO_OVERRIDE"),   // Optional: for testing (e.g., "payram-dummy")
+		DebugVersionMode:    getEnvString("DEBUG_VERSION_MODE", "") == "true",
 		AutoUpdateEnabled:   DefaultAutoUpdateEnabled,
 		AutoUpdateInterval:  DefaultAutoUpdateIntervalHours,
 		Backup: BackupConfig{

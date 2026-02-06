@@ -506,6 +506,7 @@ func (s *Server) HandleUpgradeInspect() http.HandlerFunc {
 			s.config.PolicyURL,
 			s.config.RuntimeManifestURL,
 			defaultPorts,
+			s.config.DebugVersionMode,
 		)
 
 		result := inspector.Run(ctx)

@@ -423,6 +423,7 @@ func runInspect() {
 		cfg.PolicyURL,
 		cfg.RuntimeManifestURL,
 		defaultPorts,
+		cfg.DebugVersionMode,
 	)
 
 	result := inspector.Run(ctx)
