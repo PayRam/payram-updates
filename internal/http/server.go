@@ -463,11 +463,28 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 	// All config comes from manifest
 	imageRepo := manifestData.Image.Repo
 
-	// Resolve target container name (env > manifest, no defaults)
+	// Resolve target container name (env > manifest, fallback to discovery)
 	resolver := container.NewResolver(s.config.TargetContainerName, s.config.DockerBin, log.Default())
 	resolved, err := resolver.Resolve(manifestData)
 	if err != nil {
-		if resErr, ok := err.(*container.ResolutionError); ok {
+		if resErr, ok := err.(*container.ResolutionError); ok && resErr.GetFailureCode() == "CONTAINER_NAME_UNRESOLVED" {
+			imagePattern := "payramapp/payram:"
+			if s.config.ImageRepoOverride != "" {
+				imagePattern = s.config.ImageRepoOverride + ":"
+			}
+			discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, log.Default())
+			discovered, discoverErr := discoverer.DiscoverPayramContainer(ctx)
+			if discoverErr != nil {
+				job.State = jobs.JobStateFailed
+				job.FailureCode = resErr.GetFailureCode()
+				job.Message = resErr.Error()
+				job.UpdatedAt = time.Now().UTC()
+				s.jobStore.Save(job)
+				s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s", job.FailureCode, job.Message))
+				return
+			}
+			resolved = &container.ResolvedContainer{Name: discovered.Name}
+		} else if resErr, ok := err.(*container.ResolutionError); ok {
 			job.State = jobs.JobStateFailed
 			job.FailureCode = resErr.GetFailureCode()
 			job.Message = resErr.Error()
@@ -475,14 +492,15 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 			s.jobStore.Save(job)
 			s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s", job.FailureCode, job.Message))
 			return
+		} else {
+			job.State = jobs.JobStateFailed
+			job.FailureCode = "CONTAINER_NAME_UNRESOLVED"
+			job.Message = err.Error()
+			job.UpdatedAt = time.Now().UTC()
+			s.jobStore.Save(job)
+			s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s", job.FailureCode, job.Message))
+			return
 		}
-		job.State = jobs.JobStateFailed
-		job.FailureCode = "CONTAINER_NAME_UNRESOLVED"
-		job.Message = err.Error()
-		job.UpdatedAt = time.Now().UTC()
-		s.jobStore.Save(job)
-		s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s", job.FailureCode, job.Message))
-		return
 	}
 	containerName := resolved.Name
 	s.jobStore.AppendLog(fmt.Sprintf("Target container resolved as: %s", containerName))
