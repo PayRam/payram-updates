@@ -473,23 +473,52 @@ func (s *Server) HandleUpgradeInspect() http.HandlerFunc {
 		resolver := container.NewResolver(s.config.TargetContainerName, s.config.DockerBin, log.Default())
 		resolved, err := resolver.Resolve(manifestData)
 		if err != nil {
-			// For inspect, return error in JSON instead of failing
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(inspect.InspectResult{
-				OverallState: inspect.StateBroken,
-				Issues: []inspect.Issue{
-					{
-						Component:   "container",
-						Description: err.Error(),
-						Severity:    "CRITICAL",
+			if resErr, ok := err.(*container.ResolutionError); ok && resErr.GetFailureCode() == "CONTAINER_NAME_UNRESOLVED" {
+				imagePattern := "payramapp/payram:"
+				if s.config.ImageRepoOverride != "" {
+					imagePattern = s.config.ImageRepoOverride + ":"
+				}
+				discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, log.Default())
+				discovered, discoverErr := discoverer.DiscoverPayramContainer(ctx)
+				if discoverErr != nil {
+					// For inspect, return error in JSON instead of failing
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					json.NewEncoder(w).Encode(inspect.InspectResult{
+						OverallState: inspect.StateBroken,
+						Issues: []inspect.Issue{
+							{
+								Component:   "container",
+								Description: err.Error(),
+								Severity:    "CRITICAL",
+							},
+						},
+						Checks: map[string]inspect.CheckResult{
+							"container_name": {Status: "FAILED", Message: err.Error()},
+						},
+					})
+					return
+				}
+				resolved = &container.ResolvedContainer{Name: discovered.Name}
+			} else {
+				// For inspect, return error in JSON instead of failing
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(inspect.InspectResult{
+					OverallState: inspect.StateBroken,
+					Issues: []inspect.Issue{
+						{
+							Component:   "container",
+							Description: err.Error(),
+							Severity:    "CRITICAL",
+						},
 					},
-				},
-				Checks: map[string]inspect.CheckResult{
-					"container_name": {Status: "FAILED", Message: err.Error()},
-				},
-			})
-			return
+					Checks: map[string]inspect.CheckResult{
+						"container_name": {Status: "FAILED", Message: err.Error()},
+					},
+				})
+				return
+			}
 		}
 
 		containerName := resolved.Name
