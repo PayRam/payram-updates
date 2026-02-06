@@ -21,6 +21,7 @@ import (
 	"github.com/payram/payram-updater/internal/history"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/manifest"
+	"github.com/payram/payram-updater/internal/network"
 	"github.com/payram/payram-updater/internal/policy"
 )
 
@@ -144,7 +145,8 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 	mux.HandleFunc("/history", s.HandleHistory())
 	mux.HandleFunc("/upgrade/history", s.HandleHistory())
 
-	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
+	// Bind to 0.0.0.0 to allow access from Docker containers
+	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
 	s.httpServer = &http.Server{
 		Addr:    addr,
 		Handler: mux,
@@ -168,9 +170,18 @@ func (s *Server) Start() error {
 
 	// Start the server in a goroutine
 	go func() {
-		log.Printf("Starting HTTP server on 127.0.0.1:%d", s.port)
+		// Get Docker bridge IP for logging
+		dockerIP, err := network.GetDockerBridgeIP()
+		if err != nil {
+			log.Printf("WARNING: Could not detect Docker bridge IP: %v", err)
+			log.Printf("Starting HTTP server on 127.0.0.1:%d (Docker containers may not be able to access this)", s.port)
+		} else {
+			log.Printf("Starting HTTP server on port %d", s.port)
+			log.Printf("  - Accessible from localhost: http://127.0.0.1:%d", s.port)
+			log.Printf("  - Accessible from Docker containers: http://%s:%d", dockerIP, s.port)
+		}
 
-		// Use a listener to ensure we bind only to 127.0.0.1
+		// Use a listener bound to 0.0.0.0 to allow access from both localhost and Docker
 		listener, err := net.Listen("tcp", s.httpServer.Addr)
 		if err != nil {
 			serverErrors <- fmt.Errorf("failed to create listener: %w", err)

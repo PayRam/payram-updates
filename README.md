@@ -78,7 +78,13 @@ Expected response:
 
 ## API Usage
 
-The service listens on `127.0.0.1:2359` by default (configurable via `UPDATER_PORT`).
+The service listens on port `2359` by default (configurable via `UPDATER_PORT`) and binds to all interfaces to allow access from both localhost and Docker containers.
+
+**Access URLs:**
+- From localhost: `http://127.0.0.1:2359`
+- From Docker containers: `http://<docker-bridge-ip>:2359` (typically `http://172.17.0.1:2359`)
+
+The Docker bridge IP is automatically detected and logged on startup.
 
 ### Check Service Health
 
