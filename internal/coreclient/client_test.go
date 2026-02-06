@@ -119,34 +119,6 @@ func TestVersion_Success(t *testing.T) {
 	}
 }
 
-// TestMigrationsStatus_Success tests successful migrations status retrieval.
-func TestMigrationsStatus_Success(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/admin/migrations/status" {
-			t.Errorf("expected path /admin/migrations/status, got %s", r.URL.Path)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(MigrationsStatusResponse{
-			State: "complete",
-		})
-	}))
-	defer server.Close()
-
-	client := NewClient(server.URL)
-	ctx := context.Background()
-
-	response, err := client.MigrationsStatus(ctx)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if response.State != "complete" {
-		t.Errorf("expected state 'complete', got %s", response.State)
-	}
-}
-
 // TestHealth_Non200Status tests handling of non-200 status codes.
 func TestHealth_Non200Status(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -217,30 +189,6 @@ func TestHealth_UnknownFields(t *testing.T) {
 	}
 }
 
-// TestMigrationsStatus_ContextCancellation tests context cancellation.
-func TestMigrationsStatus_ContextCancellation(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Delay to allow context cancellation
-		time.Sleep(100 * time.Millisecond)
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(MigrationsStatusResponse{State: "complete"})
-	}))
-	defer server.Close()
-
-	client := NewClient(server.URL)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-
-	_, err := client.MigrationsStatus(ctx)
-	if err == nil {
-		t.Fatal("expected error for context timeout")
-	}
-
-	if !strings.Contains(err.Error(), "context deadline exceeded") {
-		t.Errorf("expected context deadline error, got: %v", err)
-	}
-}
-
 // TestHealth_ErrorWrapping tests that errors are properly wrapped.
 func TestHealth_ErrorWrapping(t *testing.T) {
 	// Test with invalid URL
@@ -268,21 +216,6 @@ func TestVersion_ErrorWrapping(t *testing.T) {
 	}
 
 	if !strings.Contains(err.Error(), "version check failed") {
-		t.Errorf("expected wrapped error with context, got: %v", err)
-	}
-}
-
-// TestMigrationsStatus_ErrorWrapping tests migrations status error wrapping.
-func TestMigrationsStatus_ErrorWrapping(t *testing.T) {
-	client := NewClient("http://invalid-host:99999")
-	ctx := context.Background()
-
-	_, err := client.MigrationsStatus(ctx)
-	if err == nil {
-		t.Fatal("expected error for invalid host")
-	}
-
-	if !strings.Contains(err.Error(), "migrations status check failed") {
 		t.Errorf("expected wrapped error with context, got: %v", err)
 	}
 }
@@ -344,62 +277,6 @@ func TestVersion_LargeResponse(t *testing.T) {
 	// Should get some error related to parsing or reading
 	if !strings.Contains(err.Error(), "failed to") {
 		t.Errorf("expected parse/read error, got: %v", err)
-	}
-}
-
-// TestMigrationsStatus_DifferentStates tests various migration states.
-func TestMigrationsStatus_DifferentStates(t *testing.T) {
-	testCases := []struct {
-		name     string
-		response MigrationsStatusResponse
-	}{
-		{
-			name: "complete",
-			response: MigrationsStatusResponse{
-				State: "complete",
-			},
-		},
-		{
-			name: "failed",
-			response: MigrationsStatusResponse{
-				State: "failed",
-			},
-		},
-		{
-			name: "pending",
-			response: MigrationsStatusResponse{
-				State: "pending",
-			},
-		},
-		{
-			name: "running",
-			response: MigrationsStatusResponse{
-				State: "running",
-			},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusOK)
-				json.NewEncoder(w).Encode(tc.response)
-			}))
-			defer server.Close()
-
-			client := NewClient(server.URL)
-			ctx := context.Background()
-
-			response, err := client.MigrationsStatus(ctx)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			if response.State != tc.response.State {
-				t.Errorf("expected state %s, got %s", tc.response.State, response.State)
-			}
-		})
 	}
 }
 
@@ -502,49 +379,5 @@ func TestVersion_WithExtraFields(t *testing.T) {
 
 	if response.Version != "1.2.3" {
 		t.Errorf("expected version '1.2.3', got %s", response.Version)
-	}
-}
-
-// TestMigrationsStatus_WithExtraFields tests that migrations status accepts extra fields (F3).
-func TestMigrationsStatus_WithExtraFields(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"state":"complete","pending_count":0,"applied_count":5,"last_migration":"20260202120000"}`))
-	}))
-	defer server.Close()
-
-	client := NewClient(server.URL)
-	ctx := context.Background()
-
-	response, err := client.MigrationsStatus(ctx)
-	if err != nil {
-		t.Fatalf("unexpected error: migrations should ignore extra fields, got: %v", err)
-	}
-
-	if response.State != "complete" {
-		t.Errorf("expected state 'complete', got %s", response.State)
-	}
-}
-
-// TestMigrationsStatus_RunningState tests the running state (F3).
-func TestMigrationsStatus_RunningState(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(MigrationsStatusResponse{State: "running"})
-	}))
-	defer server.Close()
-
-	client := NewClient(server.URL)
-	ctx := context.Background()
-
-	response, err := client.MigrationsStatus(ctx)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if response.State != "running" {
-		t.Errorf("expected state 'running', got %s", response.State)
 	}
 }

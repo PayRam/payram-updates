@@ -15,21 +15,6 @@ func testLogger() *log.Logger {
 	return log.New(log.Writer(), "", 0)
 }
 
-func TestCanRecover_MigrationFailedRefused(t *testing.T) {
-	// MIGRATION_FAILED must always refuse automated recovery
-	canRecover, reason := CanRecover("MIGRATION_FAILED")
-
-	if canRecover {
-		t.Error("expected MIGRATION_FAILED to refuse automated recovery")
-	}
-	if reason == "" {
-		t.Error("expected a reason for refusal")
-	}
-	if reason == "" || len(reason) < 10 {
-		t.Errorf("expected meaningful refusal reason, got: %q", reason)
-	}
-}
-
 func TestCanRecover_RetryableCodesAllowed(t *testing.T) {
 	retryableCodes := []string{
 		"DOCKER_PULL_FAILED",
@@ -133,41 +118,6 @@ func TestRecoverer_Run_JobNotFailed(t *testing.T) {
 	}
 	if result.Message == "" {
 		t.Error("expected a message explaining the failure")
-	}
-}
-
-func TestRecoverer_Run_MigrationFailedRefused(t *testing.T) {
-	tmpDir := t.TempDir()
-	jobStore := jobs.NewStore(tmpDir)
-
-	// Create a failed job with MIGRATION_FAILED
-	job := jobs.NewJob("test-job", jobs.JobModeDashboard, "v2.0.0")
-	job.State = jobs.JobStateFailed
-	job.FailureCode = "MIGRATION_FAILED"
-	job.Message = "migration failed"
-	if err := jobStore.Save(job); err != nil {
-		t.Fatalf("failed to save job: %v", err)
-	}
-
-	runner := &dockerexec.Runner{DockerBin: "docker", Logger: testLogger()}
-	recoverer := NewRecoverer(jobStore, runner, "payram-core", "http://localhost:8080")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	result, err := recoverer.Run(ctx)
-
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Success {
-		t.Error("expected MIGRATION_FAILED to refuse automated recovery")
-	}
-	if result.Refusals == "" {
-		t.Error("expected refusal reason to be provided")
-	}
-	if result.Code != "MIGRATION_FAILED" {
-		t.Errorf("expected code MIGRATION_FAILED, got %s", result.Code)
 	}
 }
 

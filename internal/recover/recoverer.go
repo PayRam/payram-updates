@@ -47,11 +47,6 @@ func NewRecoverer(
 func CanRecover(failureCode string) (bool, string) {
 	playbook := recovery.GetPlaybook(failureCode)
 
-	// MIGRATION_FAILED must always refuse automated recovery
-	if failureCode == "MIGRATION_FAILED" {
-		return false, "Migration failures require manual intervention due to potential data risk. Please follow the SSH steps in the playbook."
-	}
-
 	// Refuse recovery if playbook requires manual intervention
 	if recovery.RequiresManualIntervention(failureCode) {
 		return false, fmt.Sprintf("Failure code %s requires manual intervention: %s", failureCode, playbook.UserMessage)

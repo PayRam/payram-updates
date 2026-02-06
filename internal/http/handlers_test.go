@@ -10,7 +10,6 @@ import (
 
 	"github.com/payram/payram-updater/internal/config"
 	"github.com/payram/payram-updater/internal/jobs"
-	"github.com/payram/payram-updater/internal/recovery"
 )
 
 func TestHandleHealth(t *testing.T) {
@@ -151,62 +150,6 @@ func TestHandleUpgradeStatus_WithJob(t *testing.T) {
 	}
 	if job.Message != testJob.Message {
 		t.Errorf("expected message %q, got %q", testJob.Message, job.Message)
-	}
-}
-
-func TestHandleUpgradeStatus_FailedWithPlaybook(t *testing.T) {
-	tmpDir := t.TempDir()
-	cfg := &config.Config{Port: 8080}
-	jobStore := jobs.NewStore(tmpDir)
-
-	// Create and save a failed job with MIGRATION_FAILED
-	testJob := jobs.NewJob("test-failed", jobs.JobModeManual, "v1.0.0")
-	testJob.State = jobs.JobStateFailed
-	testJob.FailureCode = "MIGRATION_FAILED"
-	testJob.Message = "Database migration failed"
-
-	if err := jobStore.Save(testJob); err != nil {
-		t.Fatalf("failed to save job: %v", err)
-	}
-
-	server := New(cfg, jobStore)
-
-	req := httptest.NewRequest(http.MethodGet, "/upgrade/status", nil)
-	w := httptest.NewRecorder()
-
-	handler := server.HandleUpgradeStatus()
-	handler(w, req)
-
-	resp := w.Result()
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
-	}
-
-	var statusResp UpgradeStatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&statusResp); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
-
-	if statusResp.State != jobs.JobStateFailed {
-		t.Errorf("expected state FAILED, got %s", statusResp.State)
-	}
-
-	// Verify recovery playbook is included
-	if statusResp.RecoveryPlaybook == nil {
-		t.Fatal("expected recovery playbook to be included for failed job")
-	}
-
-	// Verify MIGRATION_FAILED playbook specifics
-	if statusResp.RecoveryPlaybook.Code != "MIGRATION_FAILED" {
-		t.Errorf("expected playbook code MIGRATION_FAILED, got %s", statusResp.RecoveryPlaybook.Code)
-	}
-	if statusResp.RecoveryPlaybook.Severity != recovery.SeverityManual {
-		t.Errorf("expected severity MANUAL_REQUIRED, got %s", statusResp.RecoveryPlaybook.Severity)
-	}
-	if statusResp.RecoveryPlaybook.DataRisk != recovery.DataRiskLikely {
-		t.Errorf("expected data risk LIKELY, got %s", statusResp.RecoveryPlaybook.DataRisk)
 	}
 }
 
@@ -1040,8 +983,8 @@ func TestHandleUpgradePlaybook_FailedJob(t *testing.T) {
 	// Create a failed job
 	testJob := jobs.NewJob("test-123", jobs.JobModeManual, "v2.0.0")
 	testJob.State = jobs.JobStateFailed
-	testJob.FailureCode = "MIGRATION_FAILED"
-	testJob.Message = "migration error"
+	testJob.FailureCode = "HEALTHCHECK_FAILED"
+	testJob.Message = "health check error"
 	if err := jobStore.Save(testJob); err != nil {
 		t.Fatalf("failed to save job: %v", err)
 	}
@@ -1070,8 +1013,8 @@ func TestHandleUpgradePlaybook_FailedJob(t *testing.T) {
 		t.Error("expected playbook for failed job")
 	}
 
-	if result["failure_code"] != "MIGRATION_FAILED" {
-		t.Errorf("expected failure_code MIGRATION_FAILED, got %v", result["failure_code"])
+	if result["failure_code"] != "HEALTHCHECK_FAILED" {
+		t.Errorf("expected failure_code HEALTHCHECK_FAILED, got %v", result["failure_code"])
 	}
 }
 
