@@ -594,15 +594,30 @@ func (s *Server) HandleUpgradePlan() http.HandlerFunc {
 		// Add manifest info if available
 		if plan.Manifest != nil {
 			response.ImageRepo = plan.Manifest.Image.Repo
-			// Resolve container name using the resolver (env > manifest)
+			// Resolve container name using the resolver (env > manifest), then fallback to discovery
 			resolver := container.NewResolver(s.config.TargetContainerName, s.config.DockerBin, nil)
 			if resolved, err := resolver.Resolve(plan.Manifest); err == nil {
 				response.ContainerName = resolved.Name
 			} else {
-				// If resolution fails, report it in the response
-				response.ContainerName = ""
-				response.FailureCode = "CONTAINER_NAME_UNRESOLVED"
-				response.Message = err.Error()
+				if resErr, ok := err.(*container.ResolutionError); ok && resErr.GetFailureCode() == "CONTAINER_NAME_UNRESOLVED" {
+					imagePattern := "payramapp/payram:"
+					if s.config.ImageRepoOverride != "" {
+						imagePattern = s.config.ImageRepoOverride + ":"
+					}
+					discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, log.Default())
+					if discovered, discoverErr := discoverer.DiscoverPayramContainer(ctx); discoverErr == nil {
+						response.ContainerName = discovered.Name
+					} else {
+						response.ContainerName = ""
+						response.FailureCode = "CONTAINER_NAME_UNRESOLVED"
+						response.Message = err.Error()
+					}
+				} else {
+					// If resolution fails, report it in the response
+					response.ContainerName = ""
+					response.FailureCode = "CONTAINER_NAME_UNRESOLVED"
+					response.Message = err.Error()
+				}
 			}
 		}
 
