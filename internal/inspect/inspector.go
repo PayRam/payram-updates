@@ -705,7 +705,7 @@ func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *Inspect
 		}
 
 		if hasBreakpoint && nextBreakpoint != nil {
-			// Cannot update via dashboard - breakpoint in the way
+			// Breakpoint in the way of latest - may still allow dashboard update up to max version
 			updateInfo.CanUpdateViaDashboard = false
 			updateInfo.NextBreakpoint = &BreakpointInfo{
 				Version: nextBreakpoint.Version,
@@ -729,10 +729,19 @@ func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *Inspect
 				updateInfo.MaxDashboardVersion = maxDashboardVer
 			}
 
-			updateInfo.Message = fmt.Sprintf("Update to %s available, but requires manual CLI upgrade (breakpoint at %s)", latestVersion, nextBreakpoint.Version)
-			result.Checks["update_check"] = CheckResult{
-				Status:  "WARNING",
-				Message: fmt.Sprintf("Update available but blocked by breakpoint at %s. Manual upgrade required.", nextBreakpoint.Version),
+			if maxDashboardVer != "" {
+				updateInfo.CanUpdateViaDashboard = true
+				updateInfo.Message = fmt.Sprintf("Update to %s available via dashboard; latest %s requires manual CLI upgrade (breakpoint at %s)", maxDashboardVer, latestVersion, nextBreakpoint.Version)
+				result.Checks["update_check"] = CheckResult{
+					Status:  "WARNING",
+					Message: fmt.Sprintf("Update available up to %s via dashboard; latest %s blocked by breakpoint at %s.", maxDashboardVer, latestVersion, nextBreakpoint.Version),
+				}
+			} else {
+				updateInfo.Message = fmt.Sprintf("Update to %s available, but requires manual CLI upgrade (breakpoint at %s)", latestVersion, nextBreakpoint.Version)
+				result.Checks["update_check"] = CheckResult{
+					Status:  "WARNING",
+					Message: fmt.Sprintf("Update available but blocked by breakpoint at %s. Manual upgrade required.", nextBreakpoint.Version),
+				}
 			}
 		} else {
 			// Can update via dashboard
