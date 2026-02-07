@@ -4,7 +4,6 @@ package inspect
 import (
 	"context"
 	"fmt"
-	"net"
 	"os/exec"
 	"strings"
 	"time"
@@ -83,7 +82,6 @@ type Inspector struct {
 	coreBaseURL   string
 	policyURL     string
 	manifestURL   string
-	manifestPorts []int
 	policyInitVer string
 	policyInitSet bool
 	debugMode     bool
@@ -98,7 +96,6 @@ func NewInspector(
 	coreBaseURL string,
 	policyURL string,
 	manifestURL string,
-	manifestPorts []int,
 	debugMode bool,
 ) *Inspector {
 	return &Inspector{
@@ -108,7 +105,6 @@ func NewInspector(
 		coreBaseURL:   coreBaseURL,
 		policyURL:     policyURL,
 		manifestURL:   manifestURL,
-		manifestPorts: manifestPorts,
 		debugMode:     debugMode,
 	}
 }
@@ -131,22 +127,19 @@ func (i *Inspector) Run(ctx context.Context) *InspectResult {
 	// Check 3: Container existence and running state
 	i.checkContainer(ctx, result)
 
-	// Check 4: Port availability
-	i.checkPorts(result)
-
-	// Check 5: Policy readability
+	// Check 4: Policy readability
 	i.checkPolicy(ctx, result)
 
-	// Check 6: Manifest readability
+	// Check 5: Manifest readability
 	i.checkManifest(ctx, result)
 
-	// Check 7: Health endpoint (if container running)
+	// Check 6: Health endpoint (if container running)
 	i.checkHealth(ctx, result)
 
-	// Check 8: Running version (if container running)
+	// Check 7: Running version (if container running)
 	i.checkVersion(ctx, result)
 
-	// Check 9: Update availability
+	// Check 8: Update availability
 	i.checkUpdateAvailability(ctx, result)
 
 	// Generate recommendations based on state
@@ -284,25 +277,6 @@ func (i *Inspector) checkContainer(ctx context.Context, result *InspectResult) {
 		})
 		if result.OverallState == StateOK {
 			result.OverallState = StateDegraded
-		}
-	}
-}
-
-func (i *Inspector) checkPorts(result *InspectResult) {
-	for _, port := range i.manifestPorts {
-		addr := fmt.Sprintf("127.0.0.1:%d", port)
-		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
-		if err != nil {
-			result.Checks[fmt.Sprintf("port_%d", port)] = CheckResult{
-				Status:  "OK",
-				Message: fmt.Sprintf("Port %d is available", port),
-			}
-		} else {
-			conn.Close()
-			result.Checks[fmt.Sprintf("port_%d", port)] = CheckResult{
-				Status:  "OK",
-				Message: fmt.Sprintf("Port %d is in use (expected if container running)", port),
-			}
 		}
 	}
 }

@@ -11,7 +11,6 @@ import (
 
 func TestNewInspector(t *testing.T) {
 	jobStore := jobs.NewStore(t.TempDir())
-	ports := []int{8080, 443}
 
 	inspector := NewInspector(
 		jobStore,
@@ -20,7 +19,6 @@ func TestNewInspector(t *testing.T) {
 		"http://localhost:8080",
 		"http://example.com/policy.json",
 		"http://example.com/manifest.json",
-		ports,
 		false, // debugMode
 	)
 
@@ -46,7 +44,6 @@ func TestInspector_Run_NoJobOK(t *testing.T) {
 		"http://localhost:8080",
 		"http://example.com/policy.json",
 		"http://example.com/manifest.json",
-		[]int{8080},
 		false, // debugMode
 	)
 
@@ -59,8 +56,8 @@ func TestInspector_Run_NoJobOK(t *testing.T) {
 		t.Fatal("expected non-nil result")
 	}
 
-	// Verify checks map has expected keys (ports are named port_N)
-	expectedChecks := []string{"last_job", "docker_daemon", "container", "port_8080", "policy", "manifest", "health"}
+	// Verify checks map has expected keys
+	expectedChecks := []string{"last_job", "docker_daemon", "container", "policy", "manifest", "health"}
 	for _, check := range expectedChecks {
 		if _, ok := result.Checks[check]; !ok {
 			t.Errorf("expected check %q in result.Checks", check)
@@ -94,7 +91,6 @@ func TestInspector_Run_FailedJobWithPlaybook(t *testing.T) {
 		"http://localhost:8080",
 		"http://example.com/policy.json",
 		"http://example.com/manifest.json",
-		[]int{8080},
 		false, // debugMode
 	)
 
@@ -166,7 +162,6 @@ func TestInspector_Run_CompletedJobOK(t *testing.T) {
 		"http://localhost:8080",
 		"http://example.com/policy.json",
 		"http://example.com/manifest.json",
-		[]int{8080},
 		false, // debugMode
 	)
 
@@ -216,7 +211,6 @@ func TestInspector_Run_RetryableErrorDegraded(t *testing.T) {
 		"http://localhost:8080",
 		"http://example.com/policy.json",
 		"http://example.com/manifest.json",
-		[]int{8080},
 		false, // debugMode
 	)
 

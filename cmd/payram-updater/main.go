@@ -433,9 +433,6 @@ func runInspect() {
 	// Determine CoreBaseURL: if not provided, discover it dynamically
 	coreBaseURL := discoverCoreBaseURLOrDefault(ctx, cfg)
 
-	// Default ports
-	defaultPorts := []int{8080, 443}
-
 	inspector := inspect.NewInspector(
 		jobStore,
 		cfg.DockerBin,
@@ -443,7 +440,6 @@ func runInspect() {
 		coreBaseURL, // Use resolved CoreBaseURL
 		cfg.PolicyURL,
 		cfg.RuntimeManifestURL,
-		defaultPorts,
 		cfg.DebugVersionMode,
 	)
 

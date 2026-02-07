@@ -524,9 +524,6 @@ func (s *Server) HandleUpgradeInspect() http.HandlerFunc {
 		containerName := resolved.Name
 		log.Printf("Target container resolved as: %s", containerName)
 
-		// Default ports
-		defaultPorts := []int{8080, 443}
-
 		inspector := inspect.NewInspector(
 			s.jobStore,
 			s.dockerRunner.DockerBin,
@@ -534,7 +531,6 @@ func (s *Server) HandleUpgradeInspect() http.HandlerFunc {
 			s.coreClient.BaseURL, // Use resolved BaseURL from coreClient (handles auto-discovery)
 			s.config.PolicyURL,
 			s.config.RuntimeManifestURL,
-			defaultPorts,
 			s.config.DebugVersionMode,
 		)
 
