@@ -155,8 +155,6 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 	mux.HandleFunc("/upgrade", s.HandleUpgrade())
 	mux.HandleFunc("/history", s.HandleHistory())
 	mux.HandleFunc("/upgrade/history", s.HandleHistory())
-	mux.HandleFunc("/admin/cleanup/state", s.HandleCleanupState())
-	mux.HandleFunc("/admin/cleanup/backups", s.HandleCleanupBackups())
 
 	// Apply IP restriction middleware to allow only localhost and Payram container
 	allowedIPs := []string{
