@@ -116,6 +116,13 @@ BACKUP FLAGS:
   --file string    Path to backup file (for restore)
   --yes            Skip confirmation prompt (for restore)
 
+ADMIN CLEANUP (API):
+	POST /admin/cleanup/state    Clear updater state (status/logs/history)
+	POST /admin/cleanup/backups  Clear all backup files
+
+	Body: {"confirm":"yes"} (required)
+	Note: Cleanup is blocked if a job is active.
+
 EXAMPLES:
 	payram-updater init
   payram-updater serve
@@ -133,6 +140,14 @@ EXAMPLES:
   payram-updater backup create
   payram-updater backup list
   payram-updater backup restore --file /path/to/backup.dump --yes
+
+	# API cleanup examples
+	curl -X POST http://127.0.0.1:2359/admin/cleanup/state \
+		-H 'Content-Type: application/json' \
+		-d '{"confirm":"yes"}'
+	curl -X POST http://127.0.0.1:2359/admin/cleanup/backups \
+		-H 'Content-Type: application/json' \
+		-d '{"confirm":"yes"}'
 
 CONFIG:
   Configuration is loaded from environment variables first,
