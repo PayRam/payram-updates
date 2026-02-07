@@ -775,11 +775,12 @@ func (i *Inspector) compareVersions(v1, v2 string) int {
 			}
 		}
 		// If both versions found in release list, compare by position
+		// Earlier index means newer version (list order is authoritative)
 		if idx1 != -1 && idx2 != -1 {
 			if idx1 < idx2 {
-				return -1
-			} else if idx1 > idx2 {
 				return 1
+			} else if idx1 > idx2 {
+				return -1
 			}
 			return 0
 		}
