@@ -89,7 +89,7 @@ func Load() (*Config, error) {
 		DockerBin:           getEnvString("DOCKER_BIN", "docker"),
 		TargetContainerName: os.Getenv("TARGET_CONTAINER_NAME"), // Optional: no default
 		ImageRepoOverride:   os.Getenv("IMAGE_REPO_OVERRIDE"),   // Optional: for testing (e.g., "payram-dummy")
-		DebugVersionMode:    getEnvString("DEBUG_VERSION_MODE", "") == "false",
+		DebugVersionMode:    getEnvString("DEBUG_VERSION_MODE", "") == "true",
 		AutoUpdateEnabled:   DefaultAutoUpdateEnabled,
 		AutoUpdateInterval:  DefaultAutoUpdateIntervalHours,
 		Backup: BackupConfig{
