@@ -119,6 +119,71 @@ func (r *Runner) InspectRunning(ctx context.Context, container string) (bool, er
 	return isRunning, nil
 }
 
+// PrunePayramImages removes old Payram images for the given repo.
+// It keeps the current tag and any tags used by running containers.
+// Best-effort: returns error only if listing images or containers fails.
+func (r *Runner) PrunePayramImages(ctx context.Context, imageRepo string, keepTag string) error {
+	if strings.TrimSpace(imageRepo) == "" {
+		return fmt.Errorf("image repo is required for pruning")
+	}
+
+	// Collect images used by running containers
+	psArgs := []string{"ps", "--format", "{{.Image}}"}
+	r.logCommand(psArgs)
+	psCmd := exec.CommandContext(ctx, r.DockerBin, psArgs...)
+	psOutput, err := psCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker ps failed: %w: %s", err, string(psOutput))
+	}
+	runningImages := map[string]struct{}{}
+	for _, line := range strings.Split(strings.TrimSpace(string(psOutput)), "\n") {
+		if line == "" {
+			continue
+		}
+		runningImages[strings.TrimSpace(line)] = struct{}{}
+	}
+
+	// List all images for the repo
+	listArgs := []string{"images", "--format", "{{.Repository}}:{{.Tag}}", "--filter", fmt.Sprintf("reference=%s:*", imageRepo)}
+	r.logCommand(listArgs)
+	listCmd := exec.CommandContext(ctx, r.DockerBin, listArgs...)
+	listOutput, err := listCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker images failed: %w: %s", err, string(listOutput))
+	}
+
+	currentRef := fmt.Sprintf("%s:%s", imageRepo, keepTag)
+	for _, ref := range strings.Split(strings.TrimSpace(string(listOutput)), "\n") {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		// Skip current tag and any running images
+		if ref == currentRef {
+			continue
+		}
+		if _, ok := runningImages[ref]; ok {
+			continue
+		}
+		// Skip invalid tags
+		if strings.HasSuffix(ref, ":<none>") {
+			continue
+		}
+
+		rmiArgs := []string{"rmi", ref}
+		r.logCommand(rmiArgs)
+		rmiCmd := exec.CommandContext(ctx, r.DockerBin, rmiArgs...)
+		rmiOutput, rmiErr := rmiCmd.CombinedOutput()
+		if rmiErr != nil {
+			r.Logger.Printf("Warning: failed to remove image %s: %v: %s", ref, rmiErr, strings.TrimSpace(string(rmiOutput)))
+			continue
+		}
+		r.Logger.Printf("Removed old image: %s", ref)
+	}
+
+	return nil
+}
+
 // logCommand logs the docker command being executed.
 func (r *Runner) logCommand(args []string) {
 	r.Logger.Printf("Executing: %s %s", r.DockerBin, strings.Join(args, " "))

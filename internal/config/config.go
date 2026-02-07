@@ -78,7 +78,7 @@ func Load() (*Config, error) {
 
 	// Build config from environment variables (OS env vars have highest priority)
 	cfg := &Config{
-		Port:                getEnvInt("UPDATER_PORT", 2359),
+		Port:                getEnvInt("UPDATER_PORT", 2567),
 		PolicyURL:           os.Getenv("POLICY_URL"),
 		RuntimeManifestURL:  os.Getenv("RUNTIME_MANIFEST_URL"),
 		FetchTimeoutSeconds: getEnvInt("FETCH_TIMEOUT_SECONDS", 10),
@@ -89,7 +89,7 @@ func Load() (*Config, error) {
 		DockerBin:           getEnvString("DOCKER_BIN", "docker"),
 		TargetContainerName: os.Getenv("TARGET_CONTAINER_NAME"), // Optional: no default
 		ImageRepoOverride:   os.Getenv("IMAGE_REPO_OVERRIDE"),   // Optional: for testing (e.g., "payram-dummy")
-		DebugVersionMode:    getEnvString("DEBUG_VERSION_MODE", "") == "true",
+		DebugVersionMode:    getEnvString("DEBUG_VERSION_MODE", "") == "false",
 		AutoUpdateEnabled:   DefaultAutoUpdateEnabled,
 		AutoUpdateInterval:  DefaultAutoUpdateIntervalHours,
 		Backup: BackupConfig{

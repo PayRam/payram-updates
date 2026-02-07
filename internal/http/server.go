@@ -894,6 +894,15 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 	job.UpdatedAt = time.Now().UTC()
 	s.jobStore.Save(job)
 	s.jobStore.AppendLog(fmt.Sprintf("SUCCESS: Upgrade to %s completed successfully", imageTag))
+
+	// Best-effort: prune old Payram images after successful upgrade
+	pruneCtx, cancelPrune := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelPrune()
+	if err := s.dockerRunner.PrunePayramImages(pruneCtx, imageRepo, imageTag); err != nil {
+		s.jobStore.AppendLog(fmt.Sprintf("Warning: failed to prune Payram images: %v", err))
+	} else {
+		s.jobStore.AppendLog("Pruned old Payram images")
+	}
 }
 
 func (s *Server) fetchPolicyInitVersion(ctx context.Context) string {

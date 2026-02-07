@@ -185,7 +185,7 @@ Environment variables (set in `/etc/payram/updater.env`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `UPDATER_PORT` | `2359` | HTTP server port |
+| `UPDATER_PORT` | `2567` | HTTP server port |
 | `POLICY_URL` | (required) | URL to policy.json |
 | `RUNTIME_MANIFEST_URL` | (required) | URL to manifest.json |
 | `FETCH_TIMEOUT_SECONDS` | `10` | HTTP client timeout |
