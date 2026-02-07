@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -97,6 +98,17 @@ type RunResponse struct {
 	Message         string `json:"message"`
 }
 
+// CleanupRequest represents confirmation for destructive cleanup actions.
+type CleanupRequest struct {
+	Confirm string `json:"confirm"`
+}
+
+// CleanupResponse represents the response for cleanup endpoints.
+type CleanupResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
 // HandleHealth returns a handler for the /health endpoint.
 func HandleHealth() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -170,6 +182,134 @@ func (s *Server) HandleUpgradeLogs() http.HandlerFunc {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(logs))
+	}
+}
+
+// HandleCleanupState clears updater state (status/logs/history) after confirmation.
+func (s *Server) HandleCleanupState() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req CleanupRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if strings.ToLower(strings.TrimSpace(req.Confirm)) != "yes" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(CleanupResponse{
+				Status:  "warning",
+				Message: "This will delete updater state. Set confirm to \"yes\" to proceed.",
+			})
+			return
+		}
+
+		// Block cleanup if a job is active
+		existingJob, err := s.jobStore.LoadLatest()
+		if err == nil && existingJob != nil && isJobActive(existingJob) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(CleanupResponse{
+				Status:  "warning",
+				Message: "Active job in progress. Cleanup is blocked.",
+			})
+			return
+		}
+
+		// Clear state directory
+		if err := os.RemoveAll(s.config.StateDir); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(CleanupResponse{
+				Status:  "error",
+				Message: fmt.Sprintf("Failed to remove state dir: %v", err),
+			})
+			return
+		}
+		if err := os.MkdirAll(s.config.StateDir, 0755); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(CleanupResponse{
+				Status:  "error",
+				Message: fmt.Sprintf("Failed to recreate state dir: %v", err),
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(CleanupResponse{
+			Status:  "ok",
+			Message: "Updater state cleared",
+		})
+	}
+}
+
+// HandleCleanupBackups clears backup files after confirmation.
+func (s *Server) HandleCleanupBackups() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req CleanupRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if strings.ToLower(strings.TrimSpace(req.Confirm)) != "yes" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(CleanupResponse{
+				Status:  "warning",
+				Message: "This will delete backup files. Set confirm to \"yes\" to proceed.",
+			})
+			return
+		}
+
+		// Block cleanup if a job is active
+		existingJob, err := s.jobStore.LoadLatest()
+		if err == nil && existingJob != nil && isJobActive(existingJob) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(CleanupResponse{
+				Status:  "warning",
+				Message: "Active job in progress. Cleanup is blocked.",
+			})
+			return
+		}
+
+		// Clear backups directory
+		if err := os.RemoveAll(s.config.Backup.Dir); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(CleanupResponse{
+				Status:  "error",
+				Message: fmt.Sprintf("Failed to remove backup dir: %v", err),
+			})
+			return
+		}
+		if err := os.MkdirAll(s.config.Backup.Dir, 0755); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(CleanupResponse{
+				Status:  "error",
+				Message: fmt.Sprintf("Failed to recreate backup dir: %v", err),
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(CleanupResponse{
+			Status:  "ok",
+			Message: "Backups cleared",
+		})
 	}
 }
 
