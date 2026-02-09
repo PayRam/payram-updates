@@ -7,7 +7,7 @@ Manages PayRam runtime upgrades with automated rollback and recovery capabilitie
 Download and run the installation script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/PayRam/payram-scripts/main/setup_payram_updater.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | sudo bash
 ```
 
 Verify the service is running:
