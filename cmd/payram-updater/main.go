@@ -103,7 +103,7 @@ COMMANDS:
   help             Show this help message
 
 DRY-RUN FLAGS:
-  --mode string    Upgrade mode: 'dashboard' or 'manual' (required)
+  --mode string    Upgrade mode: 'dashboard' or 'manual' (default: manual)
   --to string      Target version (required)
 
 RESTART:
@@ -146,11 +146,11 @@ EXAMPLES:
   payram-updater status
 	payram-updater logs
 	payram-updater logs -f
+	payram-updater dry-run --to latest
 	payram-updater dry-run --mode dashboard --to 1.7.0
-	payram-updater dry-run --mode manual --to 1.2.3
-	payram-updater run --mode dashboard --to 1.7.0
-	payram-updater run --mode manual --to 1.2.3 --yes
-  payram-updater run --mode manual --to latest
+	payram-updater run --to latest
+	payram-updater run --to 1.2.3 --yes
+	payram-updater run --mode dashboard --to latest
   payram-updater inspect
   payram-updater recover
   payram-updater sync
@@ -300,7 +300,7 @@ func runInit() {
 
 func runRestart() {
 	fmt.Println("Restarting payram-updater service...")
-	
+
 	// Check if systemctl is available
 	systemctlPath := "/usr/bin/systemctl"
 	if _, err := os.Stat(systemctlPath); os.IsNotExist(err) {
@@ -310,7 +310,7 @@ func runRestart() {
 			os.Exit(1)
 		}
 	}
-	
+
 	// Execute systemctl restart
 	cmd := exec.Command("sudo", systemctlPath, "restart", "payram-updater")
 	output, err := cmd.CombinedOutput()
@@ -321,12 +321,12 @@ func runRestart() {
 		}
 		os.Exit(1)
 	}
-	
+
 	fmt.Println("Service restarted successfully.")
-	
+
 	// Wait a moment for the service to start
 	time.Sleep(2 * time.Second)
-	
+
 	// Show status
 	fmt.Println("\nService status:")
 	statusCmd := exec.Command("sudo", systemctlPath, "status", "payram-updater", "--no-pager", "-l")
@@ -933,7 +933,7 @@ func runLogs() {
 func runDryRun() {
 	// Parse flags for dry-run command
 	dryRunCmd := flag.NewFlagSet("dry-run", flag.ExitOnError)
-	mode := dryRunCmd.String("mode", "", "Upgrade mode (dashboard or manual)")
+	mode := dryRunCmd.String("mode", "manual", "Upgrade mode (dashboard or manual)")
 	to := dryRunCmd.String("to", "", "Target version")
 
 	// Parse arguments after "dry-run"

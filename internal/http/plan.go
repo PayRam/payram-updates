@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/payram/payram-updater/internal/jobs"
@@ -64,19 +65,6 @@ func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTa
 		// MANUAL mode: continue without policy
 	} else {
 		plan.policyData = policyData
-
-		// Check for breakpoints (DASHBOARD mode only)
-		if mode == jobs.JobModeDashboard {
-			for _, breakpoint := range policyData.Breakpoints {
-				if breakpoint.Version == requestedTarget {
-					// Breakpoint hit - manual upgrade required
-					plan.State = jobs.JobStateFailed
-					plan.FailureCode = "MANUAL_UPGRADE_REQUIRED"
-					plan.Message = fmt.Sprintf("%s %s", breakpoint.Reason, breakpoint.Docs)
-					return plan
-				}
-			}
-		}
 	}
 
 	// Step 2: Fetch manifest
@@ -106,7 +94,34 @@ func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTa
 	}
 
 	// Step 3: Resolve target
-	plan.ResolvedTarget = requestedTarget
+	// If "latest" is requested, resolve it from the policy
+	resolvedTarget := requestedTarget
+	if strings.EqualFold(requestedTarget, "latest") {
+		if policyData != nil && strings.TrimSpace(policyData.Latest) != "" {
+			resolvedTarget = strings.TrimSpace(policyData.Latest)
+		} else {
+			// No policy or empty latest field
+			plan.State = jobs.JobStateFailed
+			plan.FailureCode = "POLICY_REQUIRED"
+			plan.Message = "Cannot resolve 'latest': policy not available or latest field is empty"
+			return plan
+		}
+	}
+
+	// Check for breakpoints after resolving (DASHBOARD mode only)
+	if mode == jobs.JobModeDashboard && policyData != nil {
+		for _, breakpoint := range policyData.Breakpoints {
+			if breakpoint.Version == resolvedTarget {
+				// Breakpoint hit - manual upgrade required
+				plan.State = jobs.JobStateFailed
+				plan.FailureCode = "MANUAL_UPGRADE_REQUIRED"
+				plan.Message = fmt.Sprintf("%s %s", breakpoint.Reason, breakpoint.Docs)
+				return plan
+			}
+		}
+	}
+
+	plan.ResolvedTarget = resolvedTarget
 	plan.State = jobs.JobStateReady
 	plan.Message = "Upgrade plan validated successfully"
 

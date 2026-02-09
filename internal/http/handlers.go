@@ -712,8 +712,8 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 		}
 
 		// Log start with source
-		s.jobStore.AppendLog(fmt.Sprintf("Starting upgrade job %s: mode=%s target=%s source=%s",
-			jobID, mode, req.RequestedTarget, source))
+		s.jobStore.AppendLog(fmt.Sprintf("Starting upgrade job %s: mode=%s target=%s (resolved: %s) source=%s",
+			jobID, mode, req.RequestedTarget, plan.ResolvedTarget, source))
 
 		// Launch background execution goroutine
 		go s.executeUpgrade(job, plan.Manifest)
