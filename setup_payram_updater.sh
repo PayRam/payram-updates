@@ -50,6 +50,7 @@ DOWNLOAD_URL="${PAYRAM_UPDATER_DOWNLOAD_URL:-https://github.com/${REPO_OWNER}/${
 TMP_BIN="/tmp/${BIN_NAME}"
 
 echo "Downloading ${DOWNLOAD_URL}"
+rm -f "$TMP_BIN"
 curl -fsSL "$DOWNLOAD_URL" -o "$TMP_BIN"
 chmod +x "$TMP_BIN"
 
