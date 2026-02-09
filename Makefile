@@ -80,6 +80,17 @@ build: ## Build the payram-updater binary
 	@$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(MAIN_PATH)
 	@echo "Build complete: $(BUILD_DIR)/$(BINARY_NAME)"
 
+.PHONY: build-release
+build-release: ## Build release binaries for all platforms
+	@echo "Building release binaries..."
+	@mkdir -p $(BUILD_DIR)/release
+	@echo "Building for Linux AMD64..."
+	@GOOS=linux GOARCH=amd64 $(GO) build -o $(BUILD_DIR)/release/$(BINARY_NAME)-linux-amd64 $(MAIN_PATH)
+	@echo "Building for Linux ARM64..."
+	@GOOS=linux GOARCH=arm64 $(GO) build -o $(BUILD_DIR)/release/$(BINARY_NAME)-linux-arm64 $(MAIN_PATH)
+	@echo "Release binaries built in $(BUILD_DIR)/release/"
+	@ls -lh $(BUILD_DIR)/release/
+
 ##@ Run
 
 .PHONY: run
