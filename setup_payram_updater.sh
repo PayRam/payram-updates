@@ -6,6 +6,19 @@
 #   Non-interactive:      curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | bash
 #   Force reinstall:      curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | FORCE_REINSTALL=true bash
 #   Specific version:     curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | PAYRAM_UPDATER_VERSION=v0.1.0 bash
+#   Custom port:          curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | UPDATER_PORT=3000 bash
+#   Debug mode:           curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | DEBUG_VERSION_MODE=true bash
+#
+# Environment Variables (optional):
+#   UPDATER_PORT              - API port (default: 2567)
+#   DEBUG_VERSION_MODE        - Enable debug mode (default: false)
+#   POLICY_URL                - Upgrade policy URL
+#   RUNTIME_MANIFEST_URL      - Runtime manifest URL
+#   FETCH_TIMEOUT_SECONDS     - Fetch timeout (default: 10)
+#   EXECUTION_MODE            - Execution mode: dry-run or execute (default: execute)
+#   DOCKER_BIN                - Docker binary path (default: docker)
+#   PAYRAM_UPDATER_VERSION    - Specific version to install (default: latest)
+#   FORCE_REINSTALL           - Skip all prompts and reinstall (default: false)
 #
 set -euo pipefail
 
@@ -143,6 +156,8 @@ LOG_DIR=${LOG_DIR}
 BACKUP_DIR=${BACKUP_DIR}
 EXECUTION_MODE=${EXECUTION_MODE:-execute}
 DOCKER_BIN=${DOCKER_BIN:-docker}
+UPDATER_PORT=${UPDATER_PORT:-2567}
+DEBUG_VERSION_MODE=${DEBUG_VERSION_MODE:-false}
 EOF
     log "Environment file created"
   else
@@ -160,6 +175,8 @@ LOG_DIR=${LOG_DIR}
 BACKUP_DIR=${BACKUP_DIR}
 EXECUTION_MODE=${EXECUTION_MODE:-execute}
 DOCKER_BIN=${DOCKER_BIN:-docker}
+UPDATER_PORT=${UPDATER_PORT:-2567}
+DEBUG_VERSION_MODE=${DEBUG_VERSION_MODE:-false}
 EOF
   log "Environment file created"
 fi
