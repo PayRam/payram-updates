@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# PayRam Updater Setup Script
+#
+# Usage:
+#   Interactive mode:     bash <(curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh)
+#   Non-interactive:      curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | bash
+#   Force reinstall:      curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | FORCE_REINSTALL=true bash
+#   Specific version:     curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | PAYRAM_UPDATER_VERSION=v0.1.0 bash
+#
 set -euo pipefail
 
 REPO_OWNER="PayRam"
@@ -11,6 +19,16 @@ STATE_DIR="/var/lib/payram-updater"
 LOG_DIR="/var/log/payram-updater"
 BACKUP_DIR="/var/lib/payram/backups"
 ROOT_CONFIG="/root/.payram-updates.config"
+
+# Check if running interactively
+if [[ -t 0 ]]; then
+  INTERACTIVE=true
+else
+  INTERACTIVE=false
+fi
+
+# Force reinstall mode (set FORCE_REINSTALL=true to skip prompts)
+FORCE_REINSTALL="${FORCE_REINSTALL:-false}"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
@@ -45,12 +63,12 @@ log "Detected: ${OS}-${ARCH}"
 log "Fetching latest version..."
 VERSION="${PAYRAM_UPDATER_VERSION:-}"
 if [[ -z "$VERSION" ]]; then
-  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest" | \
-    grep -m1 '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')"
+  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest" 2>&1 | \
+    grep -m1 '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
 fi
 
 if [[ -z "$VERSION" ]]; then
-  log "ERROR: Failed to detect latest version"
+  log "ERROR: Failed to detect latest version. Set PAYRAM_UPDATER_VERSION env var to specify manually."
   exit 1
 fi
 log "Latest version: $VERSION"
@@ -69,7 +87,17 @@ log "Download complete"
 if [[ -f "${INSTALL_DIR}/${BIN_NAME}" ]]; then
   CURRENT_VERSION=$("${INSTALL_DIR}/${BIN_NAME}" version 2>/dev/null || echo "unknown")
   log "Existing binary found (version: $CURRENT_VERSION)"
-  read -p "Override existing binary? [Y/n]: " OVERRIDE_BIN || true
+  
+  if [[ "$FORCE_REINSTALL" == "true" ]]; then
+    log "Force reinstall mode - overriding existing binary"
+    OVERRIDE_BIN="y"
+  elif [[ "$INTERACTIVE" == "true" ]]; then
+    read -p "Override existing binary? [Y/n]: " OVERRIDE_BIN
+  else
+    log "Non-interactive mode - overriding existing binary"
+    OVERRIDE_BIN="y"
+  fi
+  
   if [[ ! "$OVERRIDE_BIN" =~ ^[Nn] ]]; then
     log "Installing binary to ${INSTALL_DIR}/${BIN_NAME}..."
     sudo install -m 0755 "$TMP_BIN" "${INSTALL_DIR}/${BIN_NAME}"
@@ -92,7 +120,17 @@ log "Directories created"
 
 if [[ -f "$ENV_PATH" ]]; then
   log "Environment file already exists: $ENV_PATH"
-  read -p "Override existing environment file? [y/N]: " OVERRIDE_ENV || true
+  
+  if [[ "$FORCE_REINSTALL" == "true" ]]; then
+    log "Force reinstall mode - overriding environment file"
+    OVERRIDE_ENV="y"
+  elif [[ "$INTERACTIVE" == "true" ]]; then
+    read -p "Override existing environment file? [y/N]: " OVERRIDE_ENV
+  else
+    log "Non-interactive mode - keeping existing environment file"
+    OVERRIDE_ENV="n"
+  fi
+  
   if [[ "$OVERRIDE_ENV" =~ ^[Yy] ]]; then
     log "Creating new environment file at $ENV_PATH..."
     sudo tee "$ENV_PATH" >/dev/null <<EOF
@@ -128,7 +166,17 @@ fi
 
 if [[ -f "$SERVICE_PATH" ]]; then
   log "Systemd service already exists: $SERVICE_PATH"
-  read -p "Override existing service file? [y/N]: " OVERRIDE_SERVICE || true
+  
+  if [[ "$FORCE_REINSTALL" == "true" ]]; then
+    log "Force reinstall mode - overriding service file"
+    OVERRIDE_SERVICE="y"
+  elif [[ "$INTERACTIVE" == "true" ]]; then
+    read -p "Override existing service file? [y/N]: " OVERRIDE_SERVICE
+  else
+    log "Non-interactive mode - keeping existing service file"
+    OVERRIDE_SERVICE="n"
+  fi
+  
   if [[ "$OVERRIDE_SERVICE" =~ ^[Yy] ]]; then
     log "Installing systemd service at $SERVICE_PATH..."
     sudo tee "$SERVICE_PATH" >/dev/null <<'EOF'
@@ -199,7 +247,17 @@ fi
 log "Checking initialization status..."
 if sudo test -f "$ROOT_CONFIG" && sudo grep -q '"initialized": true' "$ROOT_CONFIG"; then
   log "Updater already initialized"
-  read -p "Re-run initialization? [y/N]: " REINIT || true
+  
+  if [[ "$FORCE_REINSTALL" == "true" ]]; then
+    log "Force reinstall mode - skipping re-initialization"
+    REINIT="n"
+  elif [[ "$INTERACTIVE" == "true" ]]; then
+    read -p "Re-run initialization? [y/N]: " REINIT
+  else
+    log "Non-interactive mode - skipping re-initialization"
+    REINIT="n"
+  fi
+  
   if [[ "$REINIT" =~ ^[Yy] ]]; then
     log "Running updater init (interactive)..."
     sudo "${INSTALL_DIR}/${BIN_NAME}" init
