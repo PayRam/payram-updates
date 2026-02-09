@@ -685,7 +685,7 @@ func TestRenderPlaybook(t *testing.T) {
 				BaseURL:       "http://127.0.0.1:18080",
 				ImageRepo:     "payramapp/payram",
 			},
-			wantText: "curl http://127.0.0.1:18080/health",
+			wantText: "curl http://127.0.0.1:18080/api/v1/health",
 		},
 		{
 			name: "replaces backup_path placeholder",
@@ -845,12 +845,12 @@ func TestRenderTemplate(t *testing.T) {
 		},
 		{
 			name: "multiple placeholders",
-			text: "curl <base_url>/health on port <http_port>",
+			text: "curl <base_url>/api/v1/health on port <http_port>",
 			ctx: PlaybookContext{
 				BaseURL:  "http://127.0.0.1:9090",
 				HTTPPort: "9090",
 			},
-			want: "curl http://127.0.0.1:9090/health on port 9090",
+			want: "curl http://127.0.0.1:9090/api/v1/health on port 9090",
 		},
 		{
 			name: "no placeholders",

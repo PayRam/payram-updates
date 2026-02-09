@@ -57,7 +57,7 @@ func TestInspector_Run_NoJobOK(t *testing.T) {
 	}
 
 	// Verify checks map has expected keys
-	expectedChecks := []string{"last_job", "docker_daemon", "container", "policy", "manifest", "health"}
+	expectedChecks := []string{"lastJob", "dockerDaemon", "container", "policy", "manifest", "health"}
 	for _, check := range expectedChecks {
 		if _, ok := result.Checks[check]; !ok {
 			t.Errorf("expected check %q in result.Checks", check)
@@ -65,8 +65,8 @@ func TestInspector_Run_NoJobOK(t *testing.T) {
 	}
 
 	// last_job should be OK when no job exists
-	if result.Checks["last_job"].Status != "OK" {
-		t.Errorf("expected last_job status to be OK when no job exists, got %s", result.Checks["last_job"].Status)
+	if result.Checks["lastJob"].Status != "OK" {
+		t.Errorf("expected lastJob status to be OK when no job exists, got %s", result.Checks["lastJob"].Status)
 	}
 }
 
@@ -128,8 +128,8 @@ func TestInspector_Run_FailedJobWithPlaybook(t *testing.T) {
 	}
 
 	// last_job check should be FAILED
-	if result.Checks["last_job"].Status != "FAILED" {
-		t.Errorf("expected last_job check status to be FAILED, got %s", result.Checks["last_job"].Status)
+	if result.Checks["lastJob"].Status != "FAILED" {
+		t.Errorf("expected lastJob check status to be FAILED, got %s", result.Checks["lastJob"].Status)
 	}
 
 	// Should have issues
@@ -144,7 +144,7 @@ func TestInspector_Run_FailedJobWithPlaybook(t *testing.T) {
 }
 
 func TestInspector_Run_CompletedJobOK(t *testing.T) {
-	// Test when there's a completed job - last_job check should be OK
+	// Test when there's a completed job - lastJob check should be OK
 	tmpDir := t.TempDir()
 	jobStore := jobs.NewStore(tmpDir)
 
@@ -174,9 +174,9 @@ func TestInspector_Run_CompletedJobOK(t *testing.T) {
 		t.Fatal("expected non-nil result")
 	}
 
-	// last_job check should be OK
-	if result.Checks["last_job"].Status != "OK" {
-		t.Errorf("expected last_job check status to be OK for completed job, got %s", result.Checks["last_job"].Status)
+	// lastJob check should be OK
+	if result.Checks["lastJob"].Status != "OK" {
+		t.Errorf("expected lastJob check status to be OK for completed job, got %s", result.Checks["lastJob"].Status)
 	}
 
 	// Should have the job attached

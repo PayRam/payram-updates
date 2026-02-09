@@ -14,9 +14,9 @@ import (
 type UpgradePlan struct {
 	State           jobs.JobState      `json:"state"`
 	Mode            jobs.JobMode       `json:"mode"`
-	RequestedTarget string             `json:"requested_target"`
-	ResolvedTarget  string             `json:"resolved_target"`
-	FailureCode     string             `json:"failure_code,omitempty"`
+	RequestedTarget string             `json:"requestedTarget"`
+	ResolvedTarget  string             `json:"resolvedTarget"`
+	FailureCode     string             `json:"failureCode,omitempty"`
 	Message         string             `json:"message"`
 	Manifest        *manifest.Manifest `json:"manifest,omitempty"`
 

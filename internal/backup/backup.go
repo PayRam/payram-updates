@@ -24,10 +24,10 @@ type BackupInfo struct {
 	Filename      string    `json:"filename"`
 	Size          int64     `json:"size"`
 	Checksum      string    `json:"checksum,omitempty"` // SHA256, optional
-	CreatedAt     time.Time `json:"created_at"`
-	FromVersion   string    `json:"from_version,omitempty"`
-	TargetVersion string    `json:"target_version,omitempty"`
-	JobID         string    `json:"job_id,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
+	FromVersion   string    `json:"fromVersion,omitempty"`
+	TargetVersion string    `json:"targetVersion,omitempty"`
+	JobID         string    `json:"jobId,omitempty"`
 	Database      string    `json:"database"`
 	Host          string    `json:"host"`
 	Port          int       `json:"port"`
@@ -35,13 +35,13 @@ type BackupInfo struct {
 
 // BackupListItem contains metadata for a backup file discovered from filesystem.
 type BackupListItem struct {
-	File        string `json:"file"`         // Full path
-	Filename    string `json:"filename"`     // Basename
-	Format      string `json:"format"`       // "sql" or "dump"
-	FromVersion string `json:"from_version"` // Parsed or "unknown"
-	ToVersion   string `json:"to_version"`   // Parsed or "unknown"
-	CreatedAt   string `json:"created_at"`   // RFC3339 if parseable, else empty
-	SizeBytes   int64  `json:"size_bytes"`
+	File        string `json:"file"`        // Full path
+	Filename    string `json:"filename"`    // Basename
+	Format      string `json:"format"`      // "sql" or "dump"
+	FromVersion string `json:"fromVersion"` // Parsed or "unknown"
+	ToVersion   string `json:"toVersion"`   // Parsed or "unknown"
+	CreatedAt   string `json:"createdAt"`   // RFC3339 if parseable, else empty
+	SizeBytes   int64  `json:"sizeBytes"`
 }
 
 // BackupMeta contains metadata to pass when creating a backup.
@@ -54,7 +54,7 @@ type BackupMeta struct {
 // BackupIndex stores the list of all backups.
 type BackupIndex struct {
 	Backups   []BackupInfo `json:"backups"`
-	UpdatedAt time.Time    `json:"updated_at"`
+	UpdatedAt time.Time    `json:"updatedAt"`
 }
 
 // CommandExecutor defines the interface for executing system commands.

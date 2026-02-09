@@ -9,8 +9,8 @@ import (
 
 // Settings stores auto update configuration.
 type Settings struct {
-	AutoUpdateEnabled       bool `json:"auto_update_enabled"`
-	AutoUpdateIntervalHours int  `json:"auto_update_interval_hours"`
+	AutoUpdateEnabled       bool `json:"autoUpdateEnabled"`
+	AutoUpdateIntervalHours int  `json:"autoUpdateIntervalHours"`
 	Initialized             bool `json:"initialized"`
 }
 

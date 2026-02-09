@@ -42,11 +42,11 @@ type Playbook struct {
 	Code        string   `json:"code"`
 	Severity    Severity `json:"severity"`
 	Title       string   `json:"title"`
-	UserMessage string   `json:"user_message"` // short, dashboard-safe
-	SSHSteps    []string `json:"ssh_steps"`    // exact commands or steps
-	DocsURL     string   `json:"docs_url,omitempty"`
-	DataRisk    DataRisk `json:"data_risk"`
-	BackupPath  string   `json:"backup_path,omitempty"` // populated when job has backup
+	UserMessage string   `json:"userMessage"` // short, dashboard-safe
+	SSHSteps    []string `json:"sshSteps"`    // exact commands or steps
+	DocsURL     string   `json:"docsUrl,omitempty"`
+	DataRisk    DataRisk `json:"dataRisk"`
+	BackupPath  string   `json:"backupPath,omitempty"` // populated when job has backup
 }
 
 // playbooks maps failure codes to their recovery playbooks.
@@ -167,6 +167,25 @@ var playbooks = map[string]Playbook{
 		},
 		DocsURL:  "https://docs.payram.com/troubleshooting/version",
 		DataRisk: DataRiskPossible,
+	},
+
+	"MIGRATION_FAILED": {
+		Code:        "MIGRATION_FAILED",
+		Severity:    SeverityManual,
+		Title:       "Database Migration Failed",
+		UserMessage: "Database migration failed. STOP and follow recovery steps to prevent data corruption.",
+		SSHSteps: []string{
+			"1. STOP: Do not retry the upgrade until recovery is complete",
+			"2. Review migration logs: docker logs <container_name> --tail 200",
+			"3. RESTORE FROM BACKUP (recommended):",
+			"   - List backups: payram-updater backup list",
+			"   - Restore: payram-updater backup restore --file <backup_path> --yes",
+			"4. Stop and remove the failing container: docker stop <container_name> && docker rm <container_name>",
+			"5. Run the previous known-good version with the correct tag",
+			"6. Verify health: curl <base_url>/api/v1/health",
+		},
+		DocsURL:  "https://docs.payram.com/troubleshooting/migrations",
+		DataRisk: DataRiskLikely,
 	},
 
 	"DISK_SPACE_LOW": {
@@ -412,6 +431,9 @@ func HasDataRisk(code string) bool {
 // Supports: <container_name>, <base_url>, <http_port>, <db_port>, <image_repo>, <backup_path>
 func RenderPlaybook(code string, ctx PlaybookContext) Playbook {
 	playbook := GetPlaybook(code)
+	if len(playbook.SSHSteps) > 0 {
+		playbook.SSHSteps = append([]string(nil), playbook.SSHSteps...)
+	}
 
 	// Set backup path if provided
 	if ctx.BackupPath != "" {

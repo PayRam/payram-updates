@@ -108,10 +108,10 @@ Response when no job exists:
 {
   "state": "IDLE",
   "mode": "",
-  "requested_target": "",
-  "resolved_target": "",
-  "error_code": "",
-  "error_message": ""
+  "requestedTarget": "",
+  "resolvedTarget": "",
+  "failureCode": "",
+  "message": ""
 }
 ```
 
@@ -141,14 +141,14 @@ Dashboard mode (policy-controlled):
 ```bash
 curl -X POST http://127.0.0.1:2359/upgrade \
   -H "Content-Type: application/json" \
-  -d '{"mode":"DASHBOARD","requested_target":"latest"}'
+  -d '{"mode":"DASHBOARD","requestedTarget":"latest"}'
 ```
 
 Manual mode (user-controlled):
 ```bash
 curl -X POST http://127.0.0.1:2359/upgrade \
   -H "Content-Type: application/json" \
-  -d '{"mode":"MANUAL","requested_target":"1.2.3"}'
+  -d '{"mode":"MANUAL","requestedTarget":"1.2.3"}'
 ```
 
 Response:
@@ -172,10 +172,10 @@ Dashboard upgrade blocked by breakpoint:
 {
   "state": "FAILED",
   "mode": "DASHBOARD",
-  "requested_target": "latest",
-  "resolved_target": "1.2.3",
-  "error_code": "MANUAL_UPGRADE_REQUIRED",
-  "error_message": "Dashboard upgrades to 1.2.3 are not allowed: Breaking database schema changes. See: https://docs.example.com/migration-guide"
+  "requestedTarget": "latest",
+  "resolvedTarget": "1.2.3",
+  "failureCode": "MANUAL_UPGRADE_REQUIRED",
+  "message": "Dashboard upgrades to 1.2.3 are not allowed: Breaking database schema changes. See: https://docs.example.com/migration-guide"
 }
 ```
 
@@ -321,7 +321,7 @@ This runs:
 - `READY`: Dry-run complete, ready for actual upgrade (or upgrade completed successfully)
 - `EXECUTING`: Performing Docker operations (pull, stop, remove, run)
 - `VERIFYING`: Verifying deployment (health, version, migrations)
-- `FAILED`: Job failed (check failure_code/message)
+- `FAILED`: Job failed (check failureCode/message)
 
 ### Execution Modes
 
@@ -569,7 +569,7 @@ payram-updater backup restore --file /path/to/pre-upgrade-backup.dump --yes
 
 4. **Run the previous known-good version:**
 ```bash
-# Get the previous image tag from the backup's from_version
+# Get the previous image tag from the backup's fromVersion
 docker run -d --name payram-dummy payram/payram-dummy:1.7.8 ...
 ```
 
@@ -584,13 +584,13 @@ payram-updater inspect
 1. **Detect failure:**
 ```bash
 payram-updater status
-# Shows: state=FAILED, failure_code=HEALTHCHECK_FAILED
+# Shows: state=FAILED, failureCode=HEALTHCHECK_FAILED
 ```
 
 2. **Get full diagnostics:**
 ```bash
 payram-updater inspect
-# Shows: overall_state=BROKEN, issues, recommendations
+# Shows: overallState=BROKEN, issues, recommendations
 ```
 
 3. **Review playbook:**
@@ -690,7 +690,7 @@ go run cmd/payram-updater/main.go serve
 # Trigger upgrade (will actually replace container)
 curl -X POST http://127.0.0.1:2359/upgrade \
   -H "Content-Type: application/json" \
-  -d '{"mode":"MANUAL","requested_target":"1.9.0"}'
+  -d '{"mode":"MANUAL","requestedTarget":"1.9.0"}'
 
 # Monitor execution
 curl http://127.0.0.1:2359/upgrade/logs
@@ -754,7 +754,7 @@ go run cmd/payram-updater/main.go serve
 ```bash
 curl -X POST http://127.0.0.1:2359/upgrade \
   -H "Content-Type: application/json" \
-  -d '{"mode":"MANUAL","requested_target":"local"}'
+  -d '{"mode":"MANUAL","requestedTarget":"local"}'
 ```
 
 6. **Verify the container is running**:

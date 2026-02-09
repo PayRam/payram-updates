@@ -27,7 +27,7 @@ type HealthResponse struct {
 // UpgradeStatusResponse extends Job with recovery playbook for FAILED states.
 type UpgradeStatusResponse struct {
 	*jobs.Job
-	RecoveryPlaybook *recovery.Playbook `json:"recovery_playbook,omitempty"`
+	RecoveryPlaybook *recovery.Playbook `json:"recoveryPlaybook,omitempty"`
 }
 
 // HistoryResponse represents the response for history queries.
@@ -39,7 +39,7 @@ type HistoryResponse struct {
 // PlanRequest represents the request body for POST /upgrade/plan.
 type PlanRequest struct {
 	Mode            string `json:"mode"`
-	RequestedTarget string `json:"requested_target"`
+	RequestedTarget string `json:"requestedTarget"`
 	Source          string `json:"source"`
 }
 
@@ -47,18 +47,18 @@ type PlanRequest struct {
 type PlanResponse struct {
 	State           string `json:"state"`
 	Mode            string `json:"mode"`
-	RequestedTarget string `json:"requested_target"`
-	ResolvedTarget  string `json:"resolved_target,omitempty"`
-	FailureCode     string `json:"failure_code,omitempty"`
+	RequestedTarget string `json:"requestedTarget"`
+	ResolvedTarget  string `json:"resolvedTarget,omitempty"`
+	FailureCode     string `json:"failureCode,omitempty"`
 	Message         string `json:"message"`
-	ImageRepo       string `json:"image_repo,omitempty"`
-	ContainerName   string `json:"container_name,omitempty"`
+	ImageRepo       string `json:"imageRepo,omitempty"`
+	ContainerName   string `json:"containerName,omitempty"`
 }
 
 // RunRequest represents the request body for POST /upgrade/run.
 type RunRequest struct {
 	Mode            string `json:"mode"`
-	RequestedTarget string `json:"requested_target"`
+	RequestedTarget string `json:"requestedTarget"`
 	Source          string `json:"source"` // Origin of request, defaults to "UNKNOWN"
 }
 
@@ -88,12 +88,12 @@ func resolveMode(requestedMode, source string) (jobs.JobMode, error) {
 
 // RunResponse represents the response for POST /upgrade/run.
 type RunResponse struct {
-	JobID           string `json:"job_id,omitempty"`
+	JobID           string `json:"jobId,omitempty"`
 	State           string `json:"state"`
 	Mode            string `json:"mode"`
-	RequestedTarget string `json:"requested_target"`
-	ResolvedTarget  string `json:"resolved_target,omitempty"`
-	FailureCode     string `json:"failure_code,omitempty"`
+	RequestedTarget string `json:"requestedTarget"`
+	ResolvedTarget  string `json:"resolvedTarget,omitempty"`
+	FailureCode     string `json:"failureCode,omitempty"`
 	Message         string `json:"message"`
 }
 
@@ -209,7 +209,7 @@ func (s *Server) HandleHistory() http.HandlerFunc {
 
 // UpgradeRequest represents the request body for POST /upgrade.
 type UpgradeRequest struct {
-	RequestedTarget string `json:"requested_target"`
+	RequestedTarget string `json:"requestedTarget"`
 }
 
 // HandleUpgrade returns a handler for the POST /upgrade endpoint.
@@ -230,9 +230,9 @@ func (s *Server) HandleUpgrade() http.HandlerFunc {
 		// Legacy endpoint always uses DASHBOARD mode
 		mode := jobs.JobModeDashboard
 
-		// Validate requested_target
+		// Validate requestedTarget
 		if req.RequestedTarget == "" {
-			http.Error(w, "requested_target is required", http.StatusBadRequest)
+			http.Error(w, "requestedTarget is required", http.StatusBadRequest)
 			return
 		}
 
@@ -444,9 +444,9 @@ func (s *Server) HandleUpgradePlaybook() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"playbook":     &playbook,
-			"failure_code": job.FailureCode,
-			"backup_path":  job.BackupPath,
+			"playbook":    &playbook,
+			"failureCode": job.FailureCode,
+			"backupPath":  job.BackupPath,
 		})
 	}
 }
@@ -565,9 +565,9 @@ func (s *Server) HandleUpgradePlan() http.HandlerFunc {
 			return
 		}
 
-		// Validate requested_target
+		// Validate requestedTarget
 		if req.RequestedTarget == "" {
-			http.Error(w, "requested_target is required", http.StatusBadRequest)
+			http.Error(w, "requestedTarget is required", http.StatusBadRequest)
 			return
 		}
 
@@ -645,9 +645,9 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 			return
 		}
 
-		// Validate requested_target
+		// Validate requestedTarget
 		if req.RequestedTarget == "" {
-			http.Error(w, "requested_target is required", http.StatusBadRequest)
+			http.Error(w, "requestedTarget is required", http.StatusBadRequest)
 			return
 		}
 
@@ -670,7 +670,7 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]string{
 				"error":   "An active job already exists",
-				"job_id":  existingJob.JobID,
+				"jobId":   existingJob.JobID,
 				"state":   string(existingJob.State),
 				"message": "Wait for the current job to complete or check its status",
 			})

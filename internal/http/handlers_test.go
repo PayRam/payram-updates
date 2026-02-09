@@ -327,7 +327,7 @@ func TestHandleUpgrade_Success_Dashboard(t *testing.T) {
 					"repo": "ghcr.io/payram/runtime",
 				},
 				"defaults": map[string]interface{}{
-					"container_name": "payram",
+					"containerName":  "payram",
 					"restart_policy": "always",
 				},
 			})
@@ -339,7 +339,7 @@ func TestHandleUpgrade_Success_Dashboard(t *testing.T) {
 	cfg.PolicyURL = testServer.URL + "/policy.json"
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
-	requestBody := `{"requested_target": "v1.7.0"}`
+	requestBody := `{"requestedTarget": "v1.7.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -367,11 +367,11 @@ func TestHandleUpgrade_Success_Dashboard(t *testing.T) {
 	}
 
 	if job.RequestedTarget != "v1.7.0" {
-		t.Errorf("expected requested_target v1.7.0, got %s", job.RequestedTarget)
+		t.Errorf("expected requestedTarget v1.7.0, got %s", job.RequestedTarget)
 	}
 
 	if job.ResolvedTarget != "v1.7.0" {
-		t.Errorf("expected resolved_target v1.7.0, got %s", job.ResolvedTarget)
+		t.Errorf("expected resolvedTarget v1.7.0, got %s", job.ResolvedTarget)
 	}
 
 	// Allow goroutine to complete before test cleanup
@@ -399,7 +399,7 @@ func TestHandleUpgrade_Success_Manual(t *testing.T) {
 					"repo": "ghcr.io/payram/runtime",
 				},
 				"defaults": map[string]interface{}{
-					"container_name": "payram",
+					"containerName":  "payram",
 					"restart_policy": "always",
 				},
 			})
@@ -415,7 +415,7 @@ func TestHandleUpgrade_Success_Manual(t *testing.T) {
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
 	// Note: API always uses DASHBOARD mode, MANUAL mode not available via API
-	requestBody := `{"requested_target": "v1.5.0"}`
+	requestBody := `{"requestedTarget": "v1.5.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -467,7 +467,7 @@ func TestHandleUpgrade_PolicyFetchFailed_Dashboard(t *testing.T) {
 	cfg.PolicyURL = testServer.URL + "/policy.json"
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
-	requestBody := `{"requested_target": "v1.7.0"}`
+	requestBody := `{"requestedTarget": "v1.7.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -525,7 +525,7 @@ func TestHandleUpgrade_ManifestFetchFailed(t *testing.T) {
 	cfg.PolicyURL = testServer.URL + "/policy.json"
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
-	requestBody := `{"requested_target": "v1.7.0"}`
+	requestBody := `{"requestedTarget": "v1.7.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -572,7 +572,7 @@ func TestHandleUpgrade_Conflict(t *testing.T) {
 		t.Fatalf("failed to save existing job: %v", err)
 	}
 
-	requestBody := `{"requested_target": "v1.7.0"}`
+	requestBody := `{"requestedTarget": "v1.7.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -683,7 +683,7 @@ func TestHandleUpgrade_BreakpointBlocked_Dashboard(t *testing.T) {
 					"repo": "ghcr.io/payram/runtime",
 				},
 				"defaults": map[string]interface{}{
-					"container_name": "payram",
+					"containerName":  "payram",
 					"restart_policy": "always",
 				},
 			})
@@ -694,7 +694,7 @@ func TestHandleUpgrade_BreakpointBlocked_Dashboard(t *testing.T) {
 	cfg.PolicyURL = testServer.URL + "/policy.json"
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
-	requestBody := `{"requested_target": "v2.0.0"}`
+	requestBody := `{"requestedTarget": "v2.0.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -761,7 +761,7 @@ func TestHandleUpgrade_BreakpointNotBlocked_Manual(t *testing.T) {
 					"repo": "ghcr.io/payram/runtime",
 				},
 				"defaults": map[string]interface{}{
-					"container_name": "payram",
+					"containerName":  "payram",
 					"restart_policy": "always",
 				},
 			})
@@ -773,7 +773,7 @@ func TestHandleUpgrade_BreakpointNotBlocked_Manual(t *testing.T) {
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
 	// API always uses DASHBOARD mode which enforces breakpoint checks
-	requestBody := `{"requested_target": "v2.0.0"}`
+	requestBody := `{"requestedTarget": "v2.0.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -836,7 +836,7 @@ func TestHandleUpgrade_NoBreakpointMatch(t *testing.T) {
 					"repo": "ghcr.io/payram/runtime",
 				},
 				"defaults": map[string]interface{}{
-					"container_name": "payram",
+					"containerName":  "payram",
 					"restart_policy": "always",
 				},
 			})
@@ -848,7 +848,7 @@ func TestHandleUpgrade_NoBreakpointMatch(t *testing.T) {
 	cfg.RuntimeManifestURL = testServer.URL + "/manifest.json"
 
 	// Target a version that's not a breakpoint
-	requestBody := `{"requested_target": "v1.7.0"}`
+	requestBody := `{"requestedTarget": "v1.7.0"}`
 	req := httptest.NewRequest(http.MethodPost, "/upgrade", strings.NewReader(requestBody))
 	w := httptest.NewRecorder()
 
@@ -1013,8 +1013,8 @@ func TestHandleUpgradePlaybook_FailedJob(t *testing.T) {
 		t.Error("expected playbook for failed job")
 	}
 
-	if result["failure_code"] != "HEALTHCHECK_FAILED" {
-		t.Errorf("expected failure_code HEALTHCHECK_FAILED, got %v", result["failure_code"])
+	if result["failureCode"] != "HEALTHCHECK_FAILED" {
+		t.Errorf("expected failureCode HEALTHCHECK_FAILED, got %v", result["failureCode"])
 	}
 }
 
@@ -1048,9 +1048,9 @@ func TestHandleUpgradeInspect(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	// Should have overall_state
-	if result["overall_state"] == nil {
-		t.Error("expected overall_state in response")
+	// Should have overallState
+	if result["overallState"] == nil {
+		t.Error("expected overallState in response")
 	}
 
 	// Should have checks map
@@ -1115,7 +1115,7 @@ func TestHandleUpgradePlan_Success(t *testing.T) {
 	jobStore := jobs.NewStore(tmpDir)
 	server := New(cfg, jobStore)
 
-	body := strings.NewReader(`{"requested_target":"v1.7.0"}`)
+	body := strings.NewReader(`{"requestedTarget":"v1.7.0"}`)
 	req := httptest.NewRequest(http.MethodPost, "/upgrade/plan", body)
 	w := httptest.NewRecorder()
 
@@ -1141,13 +1141,13 @@ func TestHandleUpgradePlan_Success(t *testing.T) {
 		t.Errorf("expected mode DASHBOARD, got %s", planResp.Mode)
 	}
 	if planResp.RequestedTarget != "v1.7.0" {
-		t.Errorf("expected requested_target v1.7.0, got %s", planResp.RequestedTarget)
+		t.Errorf("expected requestedTarget v1.7.0, got %s", planResp.RequestedTarget)
 	}
 	if planResp.ImageRepo != "ghcr.io/payram/runtime" {
-		t.Errorf("expected image_repo ghcr.io/payram/runtime, got %s", planResp.ImageRepo)
+		t.Errorf("expected imageRepo ghcr.io/payram/runtime, got %s", planResp.ImageRepo)
 	}
 	if planResp.ContainerName != "payram-core" {
-		t.Errorf("expected container_name payram-core, got %s", planResp.ContainerName)
+		t.Errorf("expected containerName payram-core, got %s", planResp.ContainerName)
 	}
 
 	// Verify no job was created (dry-run is read-only)
@@ -1178,7 +1178,7 @@ func TestHandleUpgradePlan_PolicyFetchFailed_Dashboard(t *testing.T) {
 	jobStore := jobs.NewStore(tmpDir)
 	server := New(cfg, jobStore)
 
-	body := strings.NewReader(`{"requested_target":"v1.7.0"}`)
+	body := strings.NewReader(`{"requestedTarget":"v1.7.0"}`)
 	req := httptest.NewRequest(http.MethodPost, "/upgrade/plan", body)
 	w := httptest.NewRecorder()
 
@@ -1201,7 +1201,7 @@ func TestHandleUpgradePlan_PolicyFetchFailed_Dashboard(t *testing.T) {
 		t.Errorf("expected state FAILED, got %s", planResp.State)
 	}
 	if planResp.FailureCode != "POLICY_FETCH_FAILED" {
-		t.Errorf("expected failure_code POLICY_FETCH_FAILED, got %s", planResp.FailureCode)
+		t.Errorf("expected failureCode POLICY_FETCH_FAILED, got %s", planResp.FailureCode)
 	}
 }
 
@@ -1246,7 +1246,7 @@ func TestHandleUpgradeRun_Success(t *testing.T) {
 				"repo": "ghcr.io/payram/runtime",
 			},
 			"defaults": map[string]interface{}{
-				"container_name": "payram-core",
+				"containerName": "payram-core",
 			},
 		})
 	}))
@@ -1262,7 +1262,7 @@ func TestHandleUpgradeRun_Success(t *testing.T) {
 	jobStore := jobs.NewStore(tmpDir)
 	server := New(cfg, jobStore)
 
-	body := strings.NewReader(`{"requested_target":"v1.7.0","source":"CLI"}`)
+	body := strings.NewReader(`{"requestedTarget":"v1.7.0","source":"CLI"}`)
 	req := httptest.NewRequest(http.MethodPost, "/upgrade/run", body)
 	w := httptest.NewRecorder()
 
@@ -1282,13 +1282,13 @@ func TestHandleUpgradeRun_Success(t *testing.T) {
 	}
 
 	if runResp.JobID == "" {
-		t.Error("expected job_id to be set")
+		t.Error("expected jobId to be set")
 	}
 	if runResp.Mode != "DASHBOARD" {
 		t.Errorf("expected mode DASHBOARD, got %s", runResp.Mode)
 	}
 	if runResp.RequestedTarget != "v1.7.0" {
-		t.Errorf("expected requested_target v1.7.0, got %s", runResp.RequestedTarget)
+		t.Errorf("expected requestedTarget v1.7.0, got %s", runResp.RequestedTarget)
 	}
 
 	// Wait a bit for background execution
@@ -1326,7 +1326,7 @@ func TestHandleUpgradeRun_Conflict(t *testing.T) {
 
 	server := New(cfg, jobStore)
 
-	body := strings.NewReader(`{"requested_target":"v1.7.0","source":"CLI"}`)
+	body := strings.NewReader(`{"requestedTarget":"v1.7.0","source":"CLI"}`)
 	req := httptest.NewRequest(http.MethodPost, "/upgrade/run", body)
 	w := httptest.NewRecorder()
 
@@ -1348,8 +1348,8 @@ func TestHandleUpgradeRun_Conflict(t *testing.T) {
 	if errResp["error"] != "An active job already exists" {
 		t.Errorf("expected error message about active job, got %s", errResp["error"])
 	}
-	if errResp["job_id"] != "existing-job" {
-		t.Errorf("expected job_id existing-job, got %s", errResp["job_id"])
+	if errResp["jobId"] != "existing-job" {
+		t.Errorf("expected jobId existing-job, got %s", errResp["jobId"])
 	}
 }
 

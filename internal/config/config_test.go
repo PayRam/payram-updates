@@ -78,8 +78,8 @@ func TestLoad_Defaults(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.Port != 2359 {
-		t.Errorf("expected default port 2359, got %d", cfg.Port)
+	if cfg.Port != 2567 {
+		t.Errorf("expected default port 2567, got %d", cfg.Port)
 	}
 	if cfg.ExecutionMode != "dry-run" {
 		t.Errorf("expected default execution mode 'dry-run', got %s", cfg.ExecutionMode)

@@ -41,12 +41,12 @@ type Recommendation struct {
 
 // UpdateInfo contains information about available updates.
 type UpdateInfo struct {
-	CurrentVersion        string          `json:"current_version"`
-	LatestVersion         string          `json:"latest_version"`
-	UpdateAvailable       bool            `json:"update_available"`
-	CanUpdateViaDashboard bool            `json:"can_update_via_dashboard"`
-	MaxDashboardVersion   string          `json:"max_dashboard_version,omitempty"`
-	NextBreakpoint        *BreakpointInfo `json:"next_breakpoint,omitempty"`
+	CurrentVersion        string          `json:"currentVersion"`
+	LatestVersion         string          `json:"latestVersion"`
+	UpdateAvailable       bool            `json:"updateAvailable"`
+	CanUpdateViaDashboard bool            `json:"canUpdateViaDashboard"`
+	MaxDashboardVersion   string          `json:"maxDashboardVersion,omitempty"`
+	NextBreakpoint        *BreakpointInfo `json:"nextBreakpoint,omitempty"`
 	Message               string          `json:"message"`
 }
 
@@ -59,12 +59,12 @@ type BreakpointInfo struct {
 
 // InspectResult contains the full inspection output.
 type InspectResult struct {
-	OverallState     OverallState           `json:"overall_state"`
+	OverallState     OverallState           `json:"overallState"`
 	Issues           []Issue                `json:"issues"`
 	Recommendations  []Recommendation       `json:"recommendations"`
-	LastJob          *jobs.Job              `json:"last_job,omitempty"`
-	RecoveryPlaybook *recovery.Playbook     `json:"recovery_playbook,omitempty"`
-	UpdateInfo       *UpdateInfo            `json:"update_info,omitempty"`
+	LastJob          *jobs.Job              `json:"lastJob,omitempty"`
+	RecoveryPlaybook *recovery.Playbook     `json:"recoveryPlaybook,omitempty"`
+	UpdateInfo       *UpdateInfo            `json:"updateInfo,omitempty"`
 	Checks           map[string]CheckResult `json:"checks"`
 }
 
@@ -151,7 +151,7 @@ func (i *Inspector) Run(ctx context.Context) *InspectResult {
 func (i *Inspector) checkLastJob(result *InspectResult) {
 	job, err := i.jobStore.LoadLatest()
 	if err != nil {
-		result.Checks["last_job"] = CheckResult{
+		result.Checks["lastJob"] = CheckResult{
 			Status:  "UNKNOWN",
 			Message: fmt.Sprintf("Failed to load job: %v", err),
 		}
@@ -159,7 +159,7 @@ func (i *Inspector) checkLastJob(result *InspectResult) {
 	}
 
 	if job == nil {
-		result.Checks["last_job"] = CheckResult{
+		result.Checks["lastJob"] = CheckResult{
 			Status:  "OK",
 			Message: "No previous upgrade job",
 		}
@@ -170,12 +170,12 @@ func (i *Inspector) checkLastJob(result *InspectResult) {
 
 	switch job.State {
 	case jobs.JobStateReady:
-		result.Checks["last_job"] = CheckResult{
+		result.Checks["lastJob"] = CheckResult{
 			Status:  "OK",
 			Message: fmt.Sprintf("Last upgrade completed successfully (target: %s)", job.ResolvedTarget),
 		}
 	case jobs.JobStateFailed:
-		result.Checks["last_job"] = CheckResult{
+		result.Checks["lastJob"] = CheckResult{
 			Status:  "FAILED",
 			Message: fmt.Sprintf("Last upgrade failed: %s - %s", job.FailureCode, job.Message),
 		}
@@ -191,7 +191,7 @@ func (i *Inspector) checkLastJob(result *InspectResult) {
 		playbook := recovery.RenderPlaybook(job.FailureCode, ctx)
 		result.RecoveryPlaybook = &playbook
 	case jobs.JobStateBackingUp, jobs.JobStateExecuting, jobs.JobStateVerifying:
-		result.Checks["last_job"] = CheckResult{
+		result.Checks["lastJob"] = CheckResult{
 			Status:  "WARNING",
 			Message: fmt.Sprintf("Upgrade in progress: %s", job.State),
 		}
@@ -204,7 +204,7 @@ func (i *Inspector) checkLastJob(result *InspectResult) {
 			result.OverallState = StateDegraded
 		}
 	default:
-		result.Checks["last_job"] = CheckResult{
+		result.Checks["lastJob"] = CheckResult{
 			Status:  "OK",
 			Message: fmt.Sprintf("Job state: %s", job.State),
 		}
@@ -215,7 +215,7 @@ func (i *Inspector) checkDockerDaemon(ctx context.Context, result *InspectResult
 	cmd := exec.CommandContext(ctx, i.dockerBin, "info", "--format", "{{.ServerVersion}}")
 	output, err := cmd.Output()
 	if err != nil {
-		result.Checks["docker_daemon"] = CheckResult{
+		result.Checks["dockerDaemon"] = CheckResult{
 			Status:  "FAILED",
 			Message: fmt.Sprintf("Docker daemon not accessible: %v", err),
 		}
@@ -228,7 +228,7 @@ func (i *Inspector) checkDockerDaemon(ctx context.Context, result *InspectResult
 		return
 	}
 
-	result.Checks["docker_daemon"] = CheckResult{
+	result.Checks["dockerDaemon"] = CheckResult{
 		Status:  "OK",
 		Message: fmt.Sprintf("Docker daemon running (version: %s)", strings.TrimSpace(string(output))),
 	}
@@ -575,7 +575,7 @@ func (i *Inspector) resolveCoreVersion(ctx context.Context, initVersion string) 
 
 func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *InspectResult) {
 	if i.policyURL == "" {
-		result.Checks["update_check"] = CheckResult{
+		result.Checks["updateCheck"] = CheckResult{
 			Status:  "UNKNOWN",
 			Message: "Policy URL not configured",
 		}
@@ -585,7 +585,7 @@ func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *Inspect
 	// Get current version from version check
 	versionCheck, versionExists := result.Checks["version"]
 	if !versionExists || versionCheck.Status != "OK" {
-		result.Checks["update_check"] = CheckResult{
+		result.Checks["updateCheck"] = CheckResult{
 			Status:  "UNKNOWN",
 			Message: "Cannot check updates - current version unknown",
 		}
@@ -598,7 +598,7 @@ func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *Inspect
 		currentVersion = strings.TrimSpace(strings.TrimPrefix(versionCheck.Message, "Running version: "))
 	}
 	if currentVersion == "" {
-		result.Checks["update_check"] = CheckResult{
+		result.Checks["updateCheck"] = CheckResult{
 			Status:  "UNKNOWN",
 			Message: "Cannot parse current version",
 		}
@@ -609,7 +609,7 @@ func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *Inspect
 	policyClient := policy.NewClient(5 * time.Second)
 	policyData, err := policyClient.Fetch(ctx, i.policyURL)
 	if err != nil {
-		result.Checks["update_check"] = CheckResult{
+		result.Checks["updateCheck"] = CheckResult{
 			Status:  "WARNING",
 			Message: fmt.Sprintf("Failed to fetch policy: %v", err),
 		}
@@ -618,7 +618,7 @@ func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *Inspect
 
 	latestVersion := strings.TrimSpace(policyData.Latest)
 	if latestVersion == "" {
-		result.Checks["update_check"] = CheckResult{
+		result.Checks["updateCheck"] = CheckResult{
 			Status:  "WARNING",
 			Message: "Policy does not specify latest version",
 		}
@@ -645,7 +645,7 @@ func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *Inspect
 		// Already on latest
 		updateInfo.CanUpdateViaDashboard = false
 		updateInfo.Message = "Already on latest version"
-		result.Checks["update_check"] = CheckResult{
+		result.Checks["updateCheck"] = CheckResult{
 			Status:  "OK",
 			Message: fmt.Sprintf("Running latest version %s", currentVersion),
 		}
@@ -653,7 +653,7 @@ func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *Inspect
 		// Running version is ahead of policy latest (unusual)
 		updateInfo.CanUpdateViaDashboard = false
 		updateInfo.Message = "Running version is ahead of policy latest"
-		result.Checks["update_check"] = CheckResult{
+		result.Checks["updateCheck"] = CheckResult{
 			Status:  "WARNING",
 			Message: fmt.Sprintf("Running version %s is ahead of latest %s", currentVersion, latestVersion),
 		}
@@ -706,13 +706,13 @@ func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *Inspect
 			if maxDashboardVer != "" {
 				updateInfo.CanUpdateViaDashboard = true
 				updateInfo.Message = fmt.Sprintf("Update to %s available via dashboard; latest %s requires manual CLI upgrade (breakpoint at %s)", maxDashboardVer, latestVersion, nextBreakpoint.Version)
-				result.Checks["update_check"] = CheckResult{
+				result.Checks["updateCheck"] = CheckResult{
 					Status:  "WARNING",
 					Message: fmt.Sprintf("Update available up to %s via dashboard; latest %s blocked by breakpoint at %s.", maxDashboardVer, latestVersion, nextBreakpoint.Version),
 				}
 			} else {
 				updateInfo.Message = fmt.Sprintf("Update to %s available, but requires manual CLI upgrade (breakpoint at %s)", latestVersion, nextBreakpoint.Version)
-				result.Checks["update_check"] = CheckResult{
+				result.Checks["updateCheck"] = CheckResult{
 					Status:  "WARNING",
 					Message: fmt.Sprintf("Update available but blocked by breakpoint at %s. Manual upgrade required.", nextBreakpoint.Version),
 				}
@@ -722,7 +722,7 @@ func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *Inspect
 			updateInfo.CanUpdateViaDashboard = true
 			updateInfo.MaxDashboardVersion = latestVersion
 			updateInfo.Message = fmt.Sprintf("Update to %s available via dashboard", latestVersion)
-			result.Checks["update_check"] = CheckResult{
+			result.Checks["updateCheck"] = CheckResult{
 				Status:  "OK",
 				Message: fmt.Sprintf("Update available: %s → %s (dashboard upgrade)", currentVersion, latestVersion),
 			}
@@ -880,7 +880,7 @@ func (i *Inspector) generateRecommendations(result *InspectResult) {
 	}
 
 	// If docker daemon is down
-	dockerCheck, ok := result.Checks["docker_daemon"]
+	dockerCheck, ok := result.Checks["dockerDaemon"]
 	if ok && dockerCheck.Status == "FAILED" {
 		result.Recommendations = append(result.Recommendations, Recommendation{
 			Action:      "reinstall",

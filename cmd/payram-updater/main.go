@@ -346,9 +346,9 @@ func runStatus() {
 	// Parse response to check for recovery playbook
 	var statusResp struct {
 		State            string             `json:"state"`
-		FailureCode      string             `json:"failure_code"`
+		FailureCode      string             `json:"failureCode"`
 		Message          string             `json:"message"`
-		RecoveryPlaybook *recovery.Playbook `json:"recovery_playbook,omitempty"`
+		RecoveryPlaybook *recovery.Playbook `json:"recoveryPlaybook,omitempty"`
 	}
 
 	if err := json.Unmarshal(body, &statusResp); err == nil && statusResp.RecoveryPlaybook != nil {
@@ -900,9 +900,9 @@ func runDryRun() {
 
 	// Create request payload
 	payload := map[string]string{
-		"mode":             string(req.Mode),
-		"requested_target": req.RequestedTarget,
-		"source":           "CLI",
+		"mode":            string(req.Mode),
+		"requestedTarget": req.RequestedTarget,
+		"source":          "CLI",
 	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -941,7 +941,7 @@ func runDryRun() {
 	// Check if plan failed
 	var planResp struct {
 		State       string `json:"state"`
-		FailureCode string `json:"failure_code"`
+		FailureCode string `json:"failureCode"`
 	}
 	if err := json.Unmarshal(body, &planResp); err == nil {
 		if planResp.State == "FAILED" {
@@ -976,9 +976,9 @@ func runRun() {
 	// Step 1: Call /upgrade/plan to validate and get resolved values
 	planURL := fmt.Sprintf("http://127.0.0.1:%d/upgrade/plan", port)
 	planPayload := map[string]string{
-		"mode":             string(req.Mode),
-		"requested_target": req.RequestedTarget,
-		"source":           "CLI",
+		"mode":            string(req.Mode),
+		"requestedTarget": req.RequestedTarget,
+		"source":          "CLI",
 	}
 	planPayloadBytes, err := json.Marshal(planPayload)
 	if err != nil {
@@ -1004,12 +1004,12 @@ func runRun() {
 	var plan struct {
 		State           string `json:"state"`
 		Mode            string `json:"mode"`
-		RequestedTarget string `json:"requested_target"`
-		ResolvedTarget  string `json:"resolved_target"`
-		FailureCode     string `json:"failure_code"`
+		RequestedTarget string `json:"requestedTarget"`
+		ResolvedTarget  string `json:"resolvedTarget"`
+		FailureCode     string `json:"failureCode"`
 		Message         string `json:"message"`
-		ImageRepo       string `json:"image_repo"`
-		ContainerName   string `json:"container_name"`
+		ImageRepo       string `json:"imageRepo"`
+		ContainerName   string `json:"containerName"`
 	}
 	if err := json.Unmarshal(planBody, &plan); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to parse plan response: %v\n", err)
@@ -1039,9 +1039,9 @@ func runRun() {
 	// Step 4: User confirmed - call /upgrade/run to start the job
 	runURL := fmt.Sprintf("http://127.0.0.1:%d/upgrade/run", port)
 	runPayload := map[string]string{
-		"mode":             string(req.Mode),
-		"requested_target": req.RequestedTarget,
-		"source":           "CLI",
+		"mode":            string(req.Mode),
+		"requestedTarget": req.RequestedTarget,
+		"source":          "CLI",
 	}
 	runPayloadBytes, err := json.Marshal(runPayload)
 	if err != nil {
@@ -1066,7 +1066,7 @@ func runRun() {
 	if runResp.StatusCode == http.StatusConflict {
 		var conflictResp struct {
 			Error string `json:"error"`
-			JobID string `json:"job_id"`
+			JobID string `json:"jobId"`
 			State string `json:"state"`
 		}
 		if err := json.Unmarshal(runBody, &conflictResp); err == nil {
@@ -1081,12 +1081,12 @@ func runRun() {
 
 	// Parse run response
 	var runResult struct {
-		JobID           string `json:"job_id"`
+		JobID           string `json:"jobId"`
 		State           string `json:"state"`
 		Mode            string `json:"mode"`
-		RequestedTarget string `json:"requested_target"`
-		ResolvedTarget  string `json:"resolved_target"`
-		FailureCode     string `json:"failure_code"`
+		RequestedTarget string `json:"requestedTarget"`
+		ResolvedTarget  string `json:"resolvedTarget"`
+		FailureCode     string `json:"failureCode"`
 		Message         string `json:"message"`
 	}
 	if err := json.Unmarshal(runBody, &runResult); err != nil {
@@ -1204,8 +1204,8 @@ func runBackupCreate(mgr *backup.Manager) {
 				Status:  "failed",
 				Message: err.Error(),
 				Data: map[string]string{
-					"from_version":   "manual",
-					"target_version": "manual",
+					"fromVersion":   "manual",
+					"targetVersion": "manual",
 				},
 			})
 		}
@@ -1220,10 +1220,10 @@ func runBackupCreate(mgr *backup.Manager) {
 
 	if historyStore != nil {
 		data := map[string]string{
-			"from_version":   "manual",
-			"target_version": "manual",
-			"backup_path":    info.Path,
-			"size_bytes":     fmt.Sprintf("%d", info.Size),
+			"fromVersion":   "manual",
+			"targetVersion": "manual",
+			"backupPath":    info.Path,
+			"sizeBytes":     fmt.Sprintf("%d", info.Size),
 		}
 		_ = historyStore.Append(history.Event{
 			Type:    "backup",
@@ -1570,10 +1570,10 @@ func runBackupRestore(mgr *backup.Manager) {
 				Status:  "failed",
 				Message: err.Error(),
 				Data: map[string]string{
-					"backup_file":   *filePath,
-					"from_version":  metadata.FromVersion,
-					"to_version":    metadata.ToVersion,
-					"full_recovery": fmt.Sprintf("%t", doFullRecovery),
+					"backupFile":   *filePath,
+					"fromVersion":  metadata.FromVersion,
+					"toVersion":    metadata.ToVersion,
+					"fullRecovery": fmt.Sprintf("%t", doFullRecovery),
 				},
 			})
 		}
@@ -1592,10 +1592,10 @@ func runBackupRestore(mgr *backup.Manager) {
 			Status:  "succeeded",
 			Message: "Database restored",
 			Data: map[string]string{
-				"backup_file":   *filePath,
-				"from_version":  result.FromVersion,
-				"to_version":    result.ToVersion,
-				"full_recovery": fmt.Sprintf("%t", doFullRecovery),
+				"backupFile":   *filePath,
+				"fromVersion":  result.FromVersion,
+				"toVersion":    result.ToVersion,
+				"fullRecovery": fmt.Sprintf("%t", doFullRecovery),
 			},
 		})
 	}
@@ -1608,12 +1608,12 @@ func runBackupRestore(mgr *backup.Manager) {
 	}
 
 	response := map[string]interface{}{
-		"success":       true,
-		"message":       "Database restored successfully",
-		"backup_file":   *filePath,
-		"from_version":  result.FromVersion,
-		"to_version":    result.ToVersion,
-		"full_recovery": doFullRecovery,
+		"success":      true,
+		"message":      "Database restored successfully",
+		"backupFile":   *filePath,
+		"fromVersion":  result.FromVersion,
+		"toVersion":    result.ToVersion,
+		"fullRecovery": doFullRecovery,
 	}
 	jsonOut, _ := json.MarshalIndent(response, "", "  ")
 	fmt.Println(string(jsonOut))

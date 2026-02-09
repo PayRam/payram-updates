@@ -28,16 +28,16 @@ const (
 
 // Job represents an update job with its current state.
 type Job struct {
-	JobID           string    `json:"job_id"`
+	JobID           string    `json:"jobId"`
 	Mode            JobMode   `json:"mode"`
-	RequestedTarget string    `json:"requested_target"`
-	ResolvedTarget  string    `json:"resolved_target"`
+	RequestedTarget string    `json:"requestedTarget"`
+	ResolvedTarget  string    `json:"resolvedTarget"`
 	State           JobState  `json:"state"`
-	FailureCode     string    `json:"failure_code"`
+	FailureCode     string    `json:"failureCode"`
 	Message         string    `json:"message"`
-	BackupPath      string    `json:"backup_path,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	BackupPath      string    `json:"backupPath,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
 }
 
 // NewJob creates a new job with the given mode and requested target.

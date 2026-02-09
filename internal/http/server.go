@@ -411,14 +411,14 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 	policyInitVersion := s.fetchPolicyInitVersion(ctx)
 
 	upgradeData := map[string]string{
-		"job_id":           job.JobID,
-		"mode":             string(job.Mode),
-		"requested_target": job.RequestedTarget,
-		"resolved_target":  job.ResolvedTarget,
-		"execution_mode":   s.config.ExecutionMode,
+		"jobId":           job.JobID,
+		"mode":            string(job.Mode),
+		"requestedTarget": job.RequestedTarget,
+		"resolvedTarget":  job.ResolvedTarget,
+		"executionMode":   s.config.ExecutionMode,
 	}
 	if isDryRun {
-		upgradeData["dry_run"] = "true"
+		upgradeData["dryRun"] = "true"
 	}
 	s.recordHistory(history.Event{
 		Type:    "upgrade",
@@ -431,16 +431,16 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 		status := ""
 		message := job.Message
 		data := map[string]string{
-			"job_id":           job.JobID,
-			"mode":             string(job.Mode),
-			"requested_target": job.RequestedTarget,
-			"resolved_target":  job.ResolvedTarget,
-			"execution_mode":   s.config.ExecutionMode,
+			"jobId":           job.JobID,
+			"mode":            string(job.Mode),
+			"requestedTarget": job.RequestedTarget,
+			"resolvedTarget":  job.ResolvedTarget,
+			"executionMode":   s.config.ExecutionMode,
 		}
 		if job.State == jobs.JobStateFailed {
 			status = "failed"
 			if job.FailureCode != "" {
-				data["failure_code"] = job.FailureCode
+				data["failureCode"] = job.FailureCode
 			}
 		} else if job.State == jobs.JobStateReady {
 			if isDryRun {
@@ -593,10 +593,10 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 		Status:  "started",
 		Message: "Backup started",
 		Data: map[string]string{
-			"job_id":         job.JobID,
-			"from_version":   currentVersion,
-			"target_version": imageTag,
-			"container":      containerName,
+			"jobId":         job.JobID,
+			"fromVersion":   currentVersion,
+			"targetVersion": imageTag,
+			"container":     containerName,
 		},
 	})
 
@@ -619,10 +619,10 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 			Status:  "failed",
 			Message: backupResult.ErrorMessage,
 			Data: map[string]string{
-				"job_id":         job.JobID,
-				"from_version":   currentVersion,
-				"target_version": imageTag,
-				"failure_code":   backupResult.FailureCode,
+				"jobId":         job.JobID,
+				"fromVersion":   currentVersion,
+				"targetVersion": imageTag,
+				"failureCode":   backupResult.FailureCode,
 			},
 		})
 
@@ -652,16 +652,16 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 		s.jobStore.AppendLog(fmt.Sprintf("Database: %s@%s:%s (%s)", backupResult.DBConfig.Database, backupResult.DBConfig.Host, backupResult.DBConfig.Port, dbType))
 	}
 	backupData := map[string]string{
-		"job_id":         job.JobID,
-		"from_version":   currentVersion,
-		"target_version": imageTag,
-		"backup_path":    backupResult.Path,
-		"size_bytes":     fmt.Sprintf("%d", backupResult.Size),
+		"jobId":         job.JobID,
+		"fromVersion":   currentVersion,
+		"targetVersion": imageTag,
+		"backupPath":    backupResult.Path,
+		"sizeBytes":     fmt.Sprintf("%d", backupResult.Size),
 	}
 	if backupResult.DBConfig != nil {
-		backupData["db_host"] = backupResult.DBConfig.Host
-		backupData["db_port"] = backupResult.DBConfig.Port
-		backupData["db_name"] = backupResult.DBConfig.Database
+		backupData["dbHost"] = backupResult.DBConfig.Host
+		backupData["dbPort"] = backupResult.DBConfig.Port
+		backupData["dbName"] = backupResult.DBConfig.Database
 	}
 	s.recordHistory(history.Event{
 		Type:    "backup",
