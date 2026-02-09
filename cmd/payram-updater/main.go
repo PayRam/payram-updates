@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -53,6 +54,8 @@ func main() {
 		runInit()
 	case "serve":
 		runServe()
+	case "restart":
+		runRestart()
 	case "status":
 		runStatus()
 	case "logs":
@@ -87,6 +90,7 @@ USAGE:
 COMMANDS:
 	init             Initialize updater configuration
   serve            Start the upgrade daemon (default)
+  restart          Restart the payram-updater systemd service
   status           Get current upgrade status
   logs             Get upgrade logs
   dry-run          Validate upgrade (read-only, no changes)
@@ -101,6 +105,14 @@ COMMANDS:
 DRY-RUN FLAGS:
   --mode string    Upgrade mode: 'dashboard' or 'manual' (required)
   --to string      Target version (required)
+
+RESTART:
+  Restarts the payram-updater systemd service. Useful when:
+  - The service started before Docker and couldn't discover the container
+  - Configuration changes require a service reload
+  - The service needs to re-scan for Payram containers
+  
+  Requires: sudo access and systemd
 
 RUN FLAGS:
   --mode string    Upgrade mode: 'dashboard' or 'manual' (default: manual)
@@ -130,6 +142,7 @@ CLEANUP FLAGS:
 EXAMPLES:
 	payram-updater init
   payram-updater serve
+  payram-updater restart
   payram-updater status
 	payram-updater logs
 	payram-updater logs -f
@@ -283,6 +296,44 @@ func runInit() {
 	}
 
 	fmt.Printf("Initialization complete. Updated %s\n", settingsPath)
+}
+
+func runRestart() {
+	fmt.Println("Restarting payram-updater service...")
+	
+	// Check if systemctl is available
+	systemctlPath := "/usr/bin/systemctl"
+	if _, err := os.Stat(systemctlPath); os.IsNotExist(err) {
+		systemctlPath = "/bin/systemctl"
+		if _, err := os.Stat(systemctlPath); os.IsNotExist(err) {
+			fmt.Fprintln(os.Stderr, "Error: systemctl not found. This command requires systemd.")
+			os.Exit(1)
+		}
+	}
+	
+	// Execute systemctl restart
+	cmd := exec.Command("sudo", systemctlPath, "restart", "payram-updater")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to restart service: %v\n", err)
+		if len(output) > 0 {
+			fmt.Fprintf(os.Stderr, "Output: %s\n", string(output))
+		}
+		os.Exit(1)
+	}
+	
+	fmt.Println("Service restarted successfully.")
+	
+	// Wait a moment for the service to start
+	time.Sleep(2 * time.Second)
+	
+	// Show status
+	fmt.Println("\nService status:")
+	statusCmd := exec.Command("sudo", systemctlPath, "status", "payram-updater", "--no-pager", "-l")
+	statusOutput, _ := statusCmd.CombinedOutput()
+	if len(statusOutput) > 0 {
+		fmt.Println(string(statusOutput))
+	}
 }
 
 func promptYesNo(reader *bufio.Reader, prompt string, defaultValue bool) bool {
