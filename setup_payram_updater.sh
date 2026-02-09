@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_OWNER="PayRam"
-REPO_NAME="payram-updater"
+REPO_NAME="payram-updates"
 BIN_NAME="payram-updater"
 INSTALL_DIR="/usr/local/bin"
 SERVICE_PATH="/etc/systemd/system/payram-updater.service"
