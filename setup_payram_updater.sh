@@ -100,8 +100,7 @@ SyslogIdentifier=payram-updater
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/payram-updater /var/log/payram-updater /var/lib/payram
+ReadWritePaths=/var/lib/payram-updater /var/log/payram-updater /var/lib/payram /root
 
 [Install]
 WantedBy=multi-user.target
