@@ -46,3 +46,6 @@ temp/
 !.env.example
 data*/
 API.md
+
+updater-configs/
+docs/
