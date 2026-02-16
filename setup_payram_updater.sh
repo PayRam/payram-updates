@@ -29,7 +29,6 @@ INSTALL_DIR="/usr/local/bin"
 SERVICE_PATH="/etc/systemd/system/payram-updater.service"
 ENV_PATH="/etc/payram/updater.env"
 STATE_DIR="/var/lib/payram-updater"
-LOG_DIR="/var/log/payram-updater"
 BACKUP_DIR="/var/lib/payram/backups"
 ROOT_CONFIG="/root/.payram-updates.config"
 
@@ -126,9 +125,7 @@ fi
 
 log "Creating required directories..."
 sudo mkdir -p /etc/payram
-sudo mkdir -p "$STATE_DIR" "$LOG_DIR" "$BACKUP_DIR"
-log "Directories created"
-
+sudo mkdir -p "$STATE_DIR" "$BACKUP_DIR"
 log "Directories created"
 
 if [[ -f "$ENV_PATH" ]]; then
@@ -152,7 +149,6 @@ POLICY_URL=${POLICY_URL:-https://raw.githubusercontent.com/PayRam/payram-policie
 RUNTIME_MANIFEST_URL=${RUNTIME_MANIFEST_URL:-https://raw.githubusercontent.com/PayRam/payram-updates/main/runtime-manifest.json}
 FETCH_TIMEOUT_SECONDS=${FETCH_TIMEOUT_SECONDS:-10}
 STATE_DIR=${STATE_DIR}
-LOG_DIR=${LOG_DIR}
 BACKUP_DIR=${BACKUP_DIR}
 EXECUTION_MODE=${EXECUTION_MODE:-execute}
 DOCKER_BIN=${DOCKER_BIN:-docker}
@@ -171,7 +167,6 @@ POLICY_URL=${POLICY_URL:-https://raw.githubusercontent.com/PayRam/payram-policie
 RUNTIME_MANIFEST_URL=${RUNTIME_MANIFEST_URL:-https://raw.githubusercontent.com/PayRam/payram-updates/main/runtime-manifest.json}
 FETCH_TIMEOUT_SECONDS=${FETCH_TIMEOUT_SECONDS:-10}
 STATE_DIR=${STATE_DIR}
-LOG_DIR=${LOG_DIR}
 BACKUP_DIR=${BACKUP_DIR}
 EXECUTION_MODE=${EXECUTION_MODE:-execute}
 DOCKER_BIN=${DOCKER_BIN:-docker}
@@ -219,7 +214,7 @@ SyslogIdentifier=payram-updater
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/payram-updater /var/log/payram-updater /var/lib/payram /root
+ReadWritePaths=/var/lib/payram-updater /var/lib/payram /root
 
 [Install]
 WantedBy=multi-user.target

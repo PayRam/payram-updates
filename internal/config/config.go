@@ -37,7 +37,6 @@ type Config struct {
 	RuntimeManifestURL  string
 	FetchTimeoutSeconds int
 	StateDir            string // For job state persistence only
-	LogDir              string // For log persistence only
 	CoreBaseURL         string
 	ExecutionMode       string
 	DockerBin           string
@@ -83,7 +82,6 @@ func Load() (*Config, error) {
 		RuntimeManifestURL:  os.Getenv("RUNTIME_MANIFEST_URL"),
 		FetchTimeoutSeconds: getEnvInt("FETCH_TIMEOUT_SECONDS", 10),
 		StateDir:            getEnvString("STATE_DIR", "/var/lib/payram-updater"),
-		LogDir:              getEnvString("LOG_DIR", "/var/log/payram-updater"),
 		CoreBaseURL:         os.Getenv("CORE_BASE_URL"), // Optional: will be discovered if not provided
 		ExecutionMode:       getEnvString("EXECUTION_MODE", "dry-run"),
 		DockerBin:           getEnvString("DOCKER_BIN", "docker"),
@@ -142,54 +140,4 @@ func getEnvInt(key string, defaultValue int) int {
 		return defaultValue
 	}
 	return value
-}
-
-// getEnvBool returns the environment variable as a boolean or a default.
-// Accepts "true", "1", "yes" (case-insensitive) as true; everything else is false.
-func getEnvBool(key string, defaultValue bool) bool {
-	valueStr := os.Getenv(key)
-	if valueStr == "" {
-		return defaultValue
-	}
-	switch valueStr {
-	case "true", "TRUE", "True", "1", "yes", "YES", "Yes":
-		return true
-	case "false", "FALSE", "False", "0", "no", "NO", "No":
-		return false
-	default:
-		return defaultValue
-	}
-}
-
-// ValidateBackupConfig validates backup configuration.
-// Backups are always enabled, so all fields must be valid.
-func (c *Config) ValidateBackupConfig() error {
-	// Backups are always enabled, validate all fields
-	if c.Backup.Dir == "" {
-		return fmt.Errorf("BACKUP_DIR is required when backup is enabled")
-	}
-
-	if c.Backup.Retention < 1 {
-		return fmt.Errorf("BACKUP_RETENTION must be at least 1, got %d", c.Backup.Retention)
-	}
-
-	if c.Backup.PGHost == "" {
-		return fmt.Errorf("PG_HOST is required when backup is enabled")
-	}
-
-	if c.Backup.PGPort < 1 || c.Backup.PGPort > 65535 {
-		return fmt.Errorf("PG_PORT must be between 1 and 65535, got %d", c.Backup.PGPort)
-	}
-
-	if c.Backup.PGDB == "" {
-		return fmt.Errorf("PG_DB is required when backup is enabled")
-	}
-
-	if c.Backup.PGUser == "" {
-		return fmt.Errorf("PG_USER is required when backup is enabled")
-	}
-
-	// Note: PG_PASSWORD can be empty if using .pgpass or trust auth
-
-	return nil
 }

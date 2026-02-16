@@ -49,7 +49,6 @@ func runServe() {
 	log.Printf("  RuntimeManifestURL: %s", cfg.RuntimeManifestURL)
 	log.Printf("  FetchTimeout: %d seconds", cfg.FetchTimeoutSeconds)
 	log.Printf("  StateDir: %s", cfg.StateDir)
-	log.Printf("  LogDir: %s", cfg.LogDir)
 	log.Printf("  CoreBaseURL: %s", cfg.CoreBaseURL)
 	log.Printf("  ExecutionMode: %s", cfg.ExecutionMode)
 	log.Printf("  DockerBin: %s", cfg.DockerBin)
