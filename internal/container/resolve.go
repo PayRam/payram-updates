@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/payram/payram-updater/internal/logger"
 	"github.com/payram/payram-updater/internal/manifest"
 )
 
@@ -35,14 +36,14 @@ type Resolver struct {
 
 // NewResolver creates a new container resolver.
 // envContainerName is the value from TARGET_CONTAINER_NAME environment variable.
-func NewResolver(envContainerName string, dockerBin string, logger *log.Logger) *Resolver {
-	if logger == nil {
-		logger = log.Default()
+func NewResolver(envContainerName string, dockerBin string, logSink *log.Logger) *Resolver {
+	if logSink == nil {
+		logSink = logger.StdLogger()
 	}
 	return &Resolver{
 		envContainerName: envContainerName,
 		dockerBin:        dockerBin,
-		logger:           logger,
+		logger:           logSink,
 	}
 }
 

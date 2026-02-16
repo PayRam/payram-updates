@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"github.com/payram/payram-updater/internal/history"
 	"github.com/payram/payram-updater/internal/inspect"
 	"github.com/payram/payram-updater/internal/jobs"
+	"github.com/payram/payram-updater/internal/logger"
 	"github.com/payram/payram-updater/internal/manifest"
 	"github.com/payram/payram-updater/internal/policy"
 	"github.com/payram/payram-updater/internal/recovery"
@@ -124,7 +124,7 @@ func (s *Server) HandleUpgradeStatus() http.HandlerFunc {
 		// Load the latest job
 		job, err := s.jobStore.LoadLatest()
 		if err != nil {
-			// Log the error but don't crash - return IDLE state
+			logger.Error("Server", "HandleUpgradeStatus", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -161,7 +161,7 @@ func (s *Server) HandleUpgradeLogs() http.HandlerFunc {
 		// Read logs
 		logs, err := s.jobStore.ReadLogs()
 		if err != nil {
-			// Log the error but don't crash - return empty logs
+			logger.Error("Server", "HandleUpgradeLogs", err)
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusOK)
 			return
@@ -197,6 +197,7 @@ func (s *Server) HandleHistory() http.HandlerFunc {
 
 		events, err := s.historyStore.List(limit, typeFilter, statusFilter)
 		if err != nil {
+			logger.Error("Server", "HandleHistory", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -239,7 +240,7 @@ func (s *Server) HandleUpgrade() http.HandlerFunc {
 		// Check for active job (concurrency check)
 		existingJob, err := s.jobStore.LoadLatest()
 		if err != nil {
-			log.Printf("Failed to load existing job: %v", err)
+			logger.Error("Server", "HandleUpgrade", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -256,7 +257,7 @@ func (s *Server) HandleUpgrade() http.HandlerFunc {
 
 		// Save job in POLICY_FETCHING state
 		if err := s.jobStore.Save(job); err != nil {
-			log.Printf("Failed to save job: %v", err)
+			logger.Error("Server", "HandleUpgrade", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -357,7 +358,7 @@ func (s *Server) HandleUpgrade() http.HandlerFunc {
 		job.UpdatedAt = time.Now().UTC()
 
 		if err := s.jobStore.Save(job); err != nil {
-			log.Printf("Failed to save job: %v", err)
+			logger.Error("Server", "HandleUpgrade", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -394,6 +395,7 @@ func (s *Server) HandleUpgradeLast() http.HandlerFunc {
 		// Load the latest job
 		job, err := s.jobStore.LoadLatest()
 		if err != nil {
+			logger.Error("Server", "HandleUpgradeLast", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -425,6 +427,7 @@ func (s *Server) HandleUpgradePlaybook() http.HandlerFunc {
 		// Load the latest job
 		job, err := s.jobStore.LoadLatest()
 		if err != nil {
+			logger.Error("Server", "HandleUpgradePlaybook", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -470,7 +473,7 @@ func (s *Server) HandleUpgradeInspect() http.HandlerFunc {
 		manifestData, _ := manifestClient.Fetch(ctx, s.config.RuntimeManifestURL)
 
 		// Resolve container name
-		resolver := container.NewResolver(s.config.TargetContainerName, s.config.DockerBin, log.Default())
+		resolver := container.NewResolver(s.config.TargetContainerName, s.config.DockerBin, logger.StdLogger())
 		resolved, err := resolver.Resolve(manifestData)
 		if err != nil {
 			if resErr, ok := err.(*container.ResolutionError); ok && resErr.GetFailureCode() == "CONTAINER_NAME_UNRESOLVED" {
@@ -478,7 +481,7 @@ func (s *Server) HandleUpgradeInspect() http.HandlerFunc {
 				if s.config.ImageRepoOverride != "" {
 					imagePattern = s.config.ImageRepoOverride + ":"
 				}
-				discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, log.Default())
+				discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, logger.StdLogger())
 				discovered, discoverErr := discoverer.DiscoverPayramContainer(ctx)
 				if discoverErr != nil {
 					// For inspect, return error in JSON instead of failing
@@ -522,7 +525,7 @@ func (s *Server) HandleUpgradeInspect() http.HandlerFunc {
 		}
 
 		containerName := resolved.Name
-		log.Printf("Target container resolved as: %s", containerName)
+		logger.Infof("Server", "HandleUpgradeInspect", "Target container resolved as: %s", containerName)
 
 		inspector := inspect.NewInspector(
 			s.jobStore,
@@ -600,7 +603,7 @@ func (s *Server) HandleUpgradePlan() http.HandlerFunc {
 					if s.config.ImageRepoOverride != "" {
 						imagePattern = s.config.ImageRepoOverride + ":"
 					}
-					discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, log.Default())
+					discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, logger.StdLogger())
 					if discovered, discoverErr := discoverer.DiscoverPayramContainer(ctx); discoverErr == nil {
 						response.ContainerName = discovered.Name
 					} else {
@@ -660,7 +663,7 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 		// Check for active job (concurrency check)
 		existingJob, err := s.jobStore.LoadLatest()
 		if err != nil {
-			log.Printf("Failed to load existing job: %v", err)
+			logger.Error("Server", "HandleUpgradeRun", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -706,7 +709,7 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 
 		// Save job
 		if err := s.jobStore.Save(job); err != nil {
-			log.Printf("Failed to save job: %v", err)
+			logger.Error("Server", "HandleUpgradeRun", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -749,7 +752,7 @@ func (s *Server) buildPlaybookContext(backupPath string) recovery.PlaybookContex
 	}
 
 	// Try to discover running container
-	discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, log.Default())
+	discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, logger.StdLogger())
 	discovered, err := discoverer.DiscoverPayramContainer(context.Background())
 	if err != nil {
 		// Container not found or discovery failed - return partial context

@@ -2,8 +2,8 @@ package container
 
 import (
 	"fmt"
-	"log"
 
+	"github.com/payram/payram-updater/internal/logger"
 	"github.com/payram/payram-updater/internal/manifest"
 )
 
@@ -47,11 +47,11 @@ type DockerRunBuilder struct {
 }
 
 // NewDockerRunBuilder creates a new builder.
-func NewDockerRunBuilder(logger Logger) *DockerRunBuilder {
-	if logger == nil {
-		logger = log.Default()
+func NewDockerRunBuilder(logSink Logger) *DockerRunBuilder {
+	if logSink == nil {
+		logSink = logger.StdLogger()
 	}
-	return &DockerRunBuilder{logger: logger}
+	return &DockerRunBuilder{logger: logSink}
 }
 
 // BuildUpgradeArgs constructs docker run arguments for an upgrade.

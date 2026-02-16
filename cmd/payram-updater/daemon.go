@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"time"
@@ -12,48 +11,51 @@ import (
 	"github.com/payram/payram-updater/internal/config"
 	internalhttp "github.com/payram/payram-updater/internal/http"
 	"github.com/payram/payram-updater/internal/jobs"
+	"github.com/payram/payram-updater/internal/logger"
 )
 
 func runServe() {
+	logger.Init()
+
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		logger.Error("Daemon", "runServe", err)
 		os.Exit(1)
 	}
 
 	settingsPath, err := autoupdate.DefaultPath()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to resolve auto update config path: %v\n", err)
+		logger.Error("Daemon", "runServe", err)
 		os.Exit(1)
 	}
 	settings, err := autoupdate.Load(settingsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			fmt.Fprintln(os.Stderr, "Updater is not initialized. Run 'payram-updater init' first.")
+			logger.ErrorMsg("Daemon", "runServe", "Updater is not initialized. Run 'payram-updater init' first.")
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "Failed to load auto update config: %v\n", err)
+		logger.Error("Daemon", "runServe", err)
 		os.Exit(1)
 	}
 	if !settings.Initialized {
-		fmt.Fprintln(os.Stderr, "Updater is not initialized. Run 'payram-updater init' first.")
+		logger.ErrorMsg("Daemon", "runServe", "Updater is not initialized. Run 'payram-updater init' first.")
 		os.Exit(1)
 	}
 
 	cfg.AutoUpdateEnabled = settings.AutoUpdateEnabled
 	cfg.AutoUpdateInterval = settings.AutoUpdateIntervalHours
 
-	log.Printf("payram-updater starting with config:")
-	log.Printf("  Port: %d", cfg.Port)
-	log.Printf("  PolicyURL: %s", cfg.PolicyURL)
-	log.Printf("  RuntimeManifestURL: %s", cfg.RuntimeManifestURL)
-	log.Printf("  FetchTimeout: %d seconds", cfg.FetchTimeoutSeconds)
-	log.Printf("  StateDir: %s", cfg.StateDir)
-	log.Printf("  CoreBaseURL: %s", cfg.CoreBaseURL)
-	log.Printf("  ExecutionMode: %s", cfg.ExecutionMode)
-	log.Printf("  DockerBin: %s", cfg.DockerBin)
-	log.Printf("  AutoUpdateEnabled: %v", cfg.AutoUpdateEnabled)
-	log.Printf("  AutoUpdateIntervalHours: %d", cfg.AutoUpdateInterval)
+	logger.Infof("Daemon", "runServe", "payram-updater starting with config:")
+	logger.Infof("Daemon", "runServe", "Port: %d", cfg.Port)
+	logger.Infof("Daemon", "runServe", "PolicyURL: %s", cfg.PolicyURL)
+	logger.Infof("Daemon", "runServe", "RuntimeManifestURL: %s", cfg.RuntimeManifestURL)
+	logger.Infof("Daemon", "runServe", "FetchTimeout: %d seconds", cfg.FetchTimeoutSeconds)
+	logger.Infof("Daemon", "runServe", "StateDir: %s", cfg.StateDir)
+	logger.Infof("Daemon", "runServe", "CoreBaseURL: %s", cfg.CoreBaseURL)
+	logger.Infof("Daemon", "runServe", "ExecutionMode: %s", cfg.ExecutionMode)
+	logger.Infof("Daemon", "runServe", "DockerBin: %s", cfg.DockerBin)
+	logger.Infof("Daemon", "runServe", "AutoUpdateEnabled: %v", cfg.AutoUpdateEnabled)
+	logger.Infof("Daemon", "runServe", "AutoUpdateIntervalHours: %d", cfg.AutoUpdateInterval)
 
 	// Create job store
 	jobStore := jobs.NewStore(cfg.StateDir)
@@ -61,7 +63,7 @@ func runServe() {
 	// Create and start the HTTP server
 	server := internalhttp.New(cfg, jobStore)
 	if err := server.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+		logger.Error("Daemon", "runServe", err)
 		os.Exit(1)
 	}
 }

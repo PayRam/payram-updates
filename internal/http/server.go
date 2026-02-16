@@ -3,7 +3,6 @@ package http
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -20,6 +19,7 @@ import (
 	"github.com/payram/payram-updater/internal/dockerexec"
 	"github.com/payram/payram-updater/internal/history"
 	"github.com/payram/payram-updater/internal/jobs"
+	"github.com/payram/payram-updater/internal/logger"
 	"github.com/payram/payram-updater/internal/manifest"
 	"github.com/payram/payram-updater/internal/network"
 	"github.com/payram/payram-updater/internal/policy"
@@ -34,21 +34,21 @@ func discoverCoreBaseURL(dockerBin string, imagePattern string) (string, error) 
 	ctx := context.Background()
 
 	// Step 1: Discover the Payram container
-	discoverer := container.NewDiscoverer(dockerBin, imagePattern, log.Default())
+	discoverer := container.NewDiscoverer(dockerBin, imagePattern, logger.StdLogger())
 	discovered, err := discoverer.DiscoverPayramContainer(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to discover Payram container: %w", err)
 	}
 
 	// Step 2: Extract runtime state to get ports
-	inspector := container.NewInspector(dockerBin, log.Default())
+	inspector := container.NewInspector(dockerBin, logger.StdLogger())
 	runtimeState, err := inspector.ExtractRuntimeState(ctx, discovered.Name)
 	if err != nil {
 		return "", fmt.Errorf("failed to extract runtime state: %w", err)
 	}
 
 	// Step 3: Identify which port serves Payram Core
-	identifier := container.NewPortIdentifier(log.Default())
+	identifier := container.NewPortIdentifier(logger.StdLogger())
 	identifiedPort, err := identifier.IdentifyPayramCorePort(ctx, runtimeState)
 	if err != nil {
 		return "", fmt.Errorf("failed to identify Payram Core port: %w", err)
@@ -77,11 +77,11 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 	// Create docker runner
 	dockerRunner := &dockerexec.Runner{
 		DockerBin: cfg.DockerBin,
-		Logger:    log.Default(),
+		Logger:    logger.StdLogger(),
 	}
 
 	// Always discover CoreBaseURL dynamically via docker inspect
-	log.Println("Discovering Payram Core port via docker inspect...")
+	logger.Infof("Server", "New", "Discovering Payram Core port via docker inspect...")
 	// Use imagePattern for discovery (default to payramapp/payram if not overridden)
 	imagePattern := "payramapp/payram:"
 	if cfg.ImageRepoOverride != "" {
@@ -89,22 +89,22 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 	}
 	coreBaseURL, err := discoverCoreBaseURL(cfg.DockerBin, imagePattern)
 	if err != nil {
-		log.Printf("WARNING: Failed to discover Payram Core URL: %v", err)
-		log.Println("Falling back to http://127.0.0.1:8080 (this may not work if Payram Core is on a different port)")
+		logger.Error("Server", "New", err)
+		logger.Warnf("Server", "New", "Falling back to http://127.0.0.1:8080 (this may not work if Payram Core is on a different port)")
 		coreBaseURL = "http://127.0.0.1:8080"
 	} else {
-		log.Printf("Discovered Payram Core at: %s", coreBaseURL)
+		logger.Infof("Server", "New", "Discovered Payram Core at: %s", coreBaseURL)
 	}
 
 	// Discover Payram container IP for access control
-	log.Println("Discovering Payram container IP for access control...")
+	logger.Infof("Server", "New", "Discovering Payram container IP for access control...")
 	payramContainerIP, err := network.GetPayramContainerIP(cfg.DockerBin, imagePattern)
 	if err != nil {
-		log.Printf("WARNING: Failed to discover Payram container IP: %v", err)
-		log.Println("API access will be restricted to localhost only")
+		logger.Error("Server", "New", err)
+		logger.Warnf("Server", "New", "API access will be restricted to localhost only")
 		payramContainerIP = ""
 	} else {
-		log.Printf("Payram container IP: %s (API access restricted to localhost and this container)", payramContainerIP)
+		logger.Infof("Server", "New", "Payram container IP: %s (API access restricted to localhost and this container)", payramContainerIP)
 	}
 
 	// Create core API client
@@ -122,14 +122,14 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 		PGPassword:   cfg.Backup.PGPassword,
 		ImagePattern: imagePattern,
 	}
-	backupMgr := backup.NewManager(backupCfg, &backup.RealExecutor{}, log.Default())
+	backupMgr := backup.NewManager(backupCfg, &backup.RealExecutor{}, logger.StdLogger())
 
 	// Create container-aware backup executor
 	containerBackupExec := backup.NewContainerBackupExecutor(
 		cfg.DockerBin,
 		"pg_dump",
 		cfg.Backup.Dir,
-		log.Default(),
+		logger.StdLogger(),
 	)
 
 	s := &Server{
@@ -164,8 +164,8 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 	if payramContainerIP != "" {
 		allowedIPs = append(allowedIPs, payramContainerIP)
 	}
-	handler := network.AllowedIPsMiddleware(allowedIPs, log.Default())(mux)
-	log.Printf("API access restricted to: %v", allowedIPs)
+	handler := network.AllowedIPsMiddleware(allowedIPs, logger.StdLogger())(mux)
+	logger.Infof("Server", "New", "API access restricted to: %v", allowedIPs)
 
 	// Bind only to localhost and docker bridge (local machine only)
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
@@ -195,12 +195,12 @@ func (s *Server) Start() error {
 		// Get Docker bridge IP for logging and optional listener
 		dockerIP, err := network.GetDockerBridgeIP()
 		if err != nil {
-			log.Printf("WARNING: Could not detect Docker bridge IP: %v", err)
-			log.Printf("Starting HTTP server on localhost only: http://127.0.0.1:%d", s.port)
+			logger.Error("Server", "Start", err)
+			logger.Warnf("Server", "Start", "Starting HTTP server on localhost only: http://127.0.0.1:%d", s.port)
 		} else {
-			log.Printf("Starting HTTP server on local interfaces")
-			log.Printf("  - Localhost: http://127.0.0.1:%d", s.port)
-			log.Printf("  - Docker bridge: http://%s:%d", dockerIP, s.port)
+			logger.Infof("Server", "Start", "Starting HTTP server on local interfaces")
+			logger.Infof("Server", "Start", "Localhost: http://127.0.0.1:%d", s.port)
+			logger.Infof("Server", "Start", "Docker bridge: http://%s:%d", dockerIP, s.port)
 		}
 
 		// Always listen on localhost
@@ -215,7 +215,8 @@ func (s *Server) Start() error {
 			bridgeAddr := fmt.Sprintf("%s:%d", dockerIP, s.port)
 			bridgeListener, bridgeErr := net.Listen("tcp", bridgeAddr)
 			if bridgeErr != nil {
-				log.Printf("WARNING: Failed to bind docker bridge listener (%s): %v", bridgeAddr, bridgeErr)
+				logger.Error("Server", "Start", bridgeErr)
+				logger.Warnf("Server", "Start", "Failed to bind docker bridge listener (%s)", bridgeAddr)
 			} else {
 				go func() {
 					if err := s.httpServer.Serve(bridgeListener); err != nil && err != http.ErrServerClosed {
@@ -240,7 +241,7 @@ func (s *Server) Start() error {
 		autoUpdateCancel()
 		return err
 	case sig := <-stop:
-		log.Printf("Received signal %v, initiating graceful shutdown", sig)
+		logger.Warnf("Server", "Start", "Received signal %v, initiating graceful shutdown", sig)
 	}
 
 	// Graceful shutdown with timeout
@@ -251,18 +252,18 @@ func (s *Server) Start() error {
 		return fmt.Errorf("server shutdown error: %w", err)
 	}
 
-	log.Println("Server stopped gracefully")
+	logger.Infof("Server", "Start", "Server stopped gracefully")
 	return nil
 }
 
 func (s *Server) startAutoUpdateLoop(ctx context.Context) {
 	interval := time.Duration(s.config.AutoUpdateInterval) * time.Hour
 	if interval <= 0 {
-		log.Printf("Auto update disabled due to invalid interval: %d hours", s.config.AutoUpdateInterval)
+		logger.Warnf("Server", "startAutoUpdateLoop", "Auto update disabled due to invalid interval: %d hours", s.config.AutoUpdateInterval)
 		return
 	}
 
-	log.Printf("Auto update enabled. Checking every %d hours", s.config.AutoUpdateInterval)
+	logger.Infof("Server", "startAutoUpdateLoop", "Auto update enabled. Checking every %d hours", s.config.AutoUpdateInterval)
 
 	// Run once at startup
 	s.runAutoUpdateOnce(ctx)
@@ -273,7 +274,7 @@ func (s *Server) startAutoUpdateLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Auto update loop stopped")
+			logger.Infof("Server", "startAutoUpdateLoop", "Auto update loop stopped")
 			return
 		case <-ticker.C:
 			s.runAutoUpdateOnce(ctx)
@@ -286,6 +287,7 @@ func (s *Server) recordHistory(event history.Event) {
 		return
 	}
 	if err := s.historyStore.Append(event); err != nil {
+		logger.Error("Server", "recordHistory", err)
 		if s.jobStore != nil {
 			s.jobStore.AppendLog(fmt.Sprintf("Warning: failed to record history: %v", err))
 		}
@@ -300,16 +302,16 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	// Skip if an active job exists
 	existingJob, err := s.jobStore.LoadLatest()
 	if err != nil {
-		log.Printf("Auto update: failed to load latest job: %v", err)
+		logger.Error("Server", "runAutoUpdateOnce", err)
 		return
 	}
 	if existingJob != nil {
 		if isJobActive(existingJob) {
-			log.Printf("Auto update: active job %s in state %s, skipping", existingJob.JobID, existingJob.State)
+			logger.Infof("Server", "runAutoUpdateOnce", "Auto update: active job %s in state %s, skipping", existingJob.JobID, existingJob.State)
 			return
 		}
 		if existingJob.State == jobs.JobStateFailed {
-			log.Printf("Auto update: last job failed (%s), skipping", existingJob.FailureCode)
+			logger.Warnf("Server", "runAutoUpdateOnce", "Auto update: last job failed (%s), skipping", existingJob.FailureCode)
 			return
 		}
 	}
@@ -320,19 +322,19 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	defer cancel2()
 	policyData, err := policyClient.Fetch(policyCtx, s.config.PolicyURL)
 	if err != nil {
-		log.Printf("Auto update: failed to fetch policy: %v", err)
+		logger.Error("Server", "runAutoUpdateOnce", err)
 		return
 	}
 	latest := strings.TrimSpace(policyData.Latest)
 	if latest == "" {
-		log.Printf("Auto update: policy latest is empty, skipping")
+		logger.Warnf("Server", "runAutoUpdateOnce", "Auto update: policy latest is empty, skipping")
 		return
 	}
 	initVersion := strings.TrimSpace(policyData.UpdaterAPIInitVersion)
 
 	containerName, err := s.discoverContainerName(ctx)
 	if err != nil {
-		log.Printf("Auto update: failed to discover container: %v", err)
+		logger.Error("Server", "runAutoUpdateOnce", err)
 		return
 	}
 
@@ -341,12 +343,12 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	defer cancel()
 	currentVersion, _, err := s.resolveCoreVersion(versionCtx, containerName, initVersion)
 	if err != nil {
-		log.Printf("Auto update: failed to resolve current version: %v", err)
+		logger.Error("Server", "runAutoUpdateOnce", err)
 		return
 	}
 
 	if currentVersion == latest {
-		log.Printf("Auto update: already on latest version %s", latest)
+		logger.Infof("Server", "runAutoUpdateOnce", "Auto update: already on latest version %s", latest)
 		return
 	}
 
@@ -355,14 +357,14 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	defer cancel3()
 	plan := s.PlanUpgrade(planCtx, jobs.JobModeDashboard, latest)
 	if plan.State == jobs.JobStateFailed {
-		log.Printf("Auto update: planning failed (%s): %s", plan.FailureCode, plan.Message)
+		logger.Warnf("Server", "runAutoUpdateOnce", "Auto update: planning failed (%s): %s", plan.FailureCode, plan.Message)
 		return
 	}
 
 	// Re-check for active job to avoid race
 	existingJob, err = s.jobStore.LoadLatest()
 	if err == nil && existingJob != nil && isJobActive(existingJob) {
-		log.Printf("Auto update: active job %s in state %s, skipping", existingJob.JobID, existingJob.State)
+		logger.Infof("Server", "runAutoUpdateOnce", "Auto update: active job %s in state %s, skipping", existingJob.JobID, existingJob.State)
 		return
 	}
 
@@ -374,7 +376,7 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	job.UpdatedAt = time.Now().UTC()
 
 	if err := s.jobStore.Save(job); err != nil {
-		log.Printf("Auto update: failed to save job: %v", err)
+		logger.Error("Server", "runAutoUpdateOnce", err)
 		return
 	}
 
@@ -464,7 +466,7 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 	imageRepo := manifestData.Image.Repo
 
 	// Resolve target container name (env > manifest, fallback to discovery)
-	resolver := container.NewResolver(s.config.TargetContainerName, s.config.DockerBin, log.Default())
+	resolver := container.NewResolver(s.config.TargetContainerName, s.config.DockerBin, logger.StdLogger())
 	resolved, err := resolver.Resolve(manifestData)
 	if err != nil {
 		if resErr, ok := err.(*container.ResolutionError); ok && resErr.GetFailureCode() == "CONTAINER_NAME_UNRESOLVED" {
@@ -472,7 +474,7 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 			if s.config.ImageRepoOverride != "" {
 				imagePattern = s.config.ImageRepoOverride + ":"
 			}
-			discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, log.Default())
+			discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, logger.StdLogger())
 			discovered, discoverErr := discoverer.DiscoverPayramContainer(ctx)
 			if discoverErr != nil {
 				job.State = jobs.JobStateFailed
@@ -510,7 +512,7 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 	// and build docker run args that preserve ALL existing configuration.
 	// This ensures upgrades are truly non-destructive operations.
 	s.jobStore.AppendLog("Extracting runtime state from container...")
-	inspector := container.NewInspector(s.config.DockerBin, log.Default())
+	inspector := container.NewInspector(s.config.DockerBin, logger.StdLogger())
 	runtimeState, err := inspector.ExtractRuntimeState(ctx, containerName)
 	if err != nil {
 		job.State = jobs.JobStateFailed
@@ -525,7 +527,7 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 		len(runtimeState.Ports), len(runtimeState.Mounts), len(runtimeState.Env)))
 
 	// Build docker run arguments from runtime state + manifest overlays
-	builder := container.NewDockerRunBuilder(log.Default())
+	builder := container.NewDockerRunBuilder(logger.StdLogger())
 	dockerArgs, err := builder.BuildUpgradeArgs(runtimeState, manifestData, imageTag)
 	if err != nil {
 		job.State = jobs.JobStateFailed
@@ -911,7 +913,7 @@ func (s *Server) fetchPolicyInitVersion(ctx context.Context) string {
 	defer cancel()
 	policyData, err := policyClient.Fetch(policyCtx, s.config.PolicyURL)
 	if err != nil {
-		log.Printf("Warning: failed to fetch policy for init version: %v", err)
+		logger.Error("Server", "fetchPolicyInitVersion", err)
 		return ""
 	}
 	return strings.TrimSpace(policyData.UpdaterAPIInitVersion)
@@ -922,7 +924,7 @@ func (s *Server) resolveCoreVersion(ctx context.Context, containerName, initVers
 	if err == nil && versionResp != nil && versionResp.Version != "" {
 		legacy, legacyErr := corecompat.IsBeforeInit(versionResp.Version, initVersion)
 		if legacyErr != nil {
-			log.Printf("Warning: failed to compare versions: %v", legacyErr)
+			logger.Error("Server", "resolveCoreVersion", legacyErr)
 			return versionResp.Version, false, nil
 		}
 		return versionResp.Version, legacy, nil
@@ -935,7 +937,7 @@ func (s *Server) resolveCoreVersion(ctx context.Context, containerName, initVers
 
 	legacy, legacyErr := corecompat.IsBeforeInit(labelVersion, initVersion)
 	if legacyErr != nil {
-		log.Printf("Warning: failed to compare versions: %v", legacyErr)
+		logger.Error("Server", "resolveCoreVersion", legacyErr)
 		return labelVersion, false, nil
 	}
 
@@ -945,7 +947,7 @@ func (s *Server) resolveCoreVersion(ctx context.Context, containerName, initVers
 func (s *Server) shouldUseLegacyForTarget(initVersion, targetVersion string) bool {
 	legacy, err := corecompat.IsBeforeInit(targetVersion, initVersion)
 	if err != nil {
-		log.Printf("Warning: failed to compare target version: %v", err)
+		logger.Error("Server", "shouldUseLegacyForTarget", err)
 		return false
 	}
 	return legacy
@@ -957,7 +959,7 @@ func (s *Server) discoverContainerName(ctx context.Context) (string, error) {
 		imagePattern = s.config.ImageRepoOverride + ":"
 	}
 
-	discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, log.Default())
+	discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, logger.StdLogger())
 	discovered, err := discoverer.DiscoverPayramContainer(ctx)
 	if err != nil {
 		return "", err

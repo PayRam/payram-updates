@@ -3,13 +3,13 @@ package network
 import (
 	"context"
 	"fmt"
-	"log"
 	"os/exec"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/payram/payram-updater/internal/container"
+	"github.com/payram/payram-updater/internal/logger"
 )
 
 // GetDockerBridgeIP retrieves the IPv4 address of the docker0 bridge interface.
@@ -41,14 +41,14 @@ func GetPayramContainerIP(dockerBin string, imagePattern string) (string, error)
 	defer cancel()
 
 	// Step 1: Discover the Payram container using the same selection logic as the updater
-	discoverer := container.NewDiscoverer(dockerBin, imagePattern, log.Default())
+	discoverer := container.NewDiscoverer(dockerBin, imagePattern, logger.StdLogger())
 	discovered, err := discoverer.DiscoverPayramContainer(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to discover Payram container: %w", err)
 	}
 
 	// Step 2: Inspect the container to read network IPs
-	inspector := container.NewInspector(dockerBin, log.Default())
+	inspector := container.NewInspector(dockerBin, logger.StdLogger())
 	runtimeState, err := inspector.ExtractRuntimeState(ctx, discovered.Name)
 	if err != nil {
 		return "", fmt.Errorf("failed to inspect Payram container %s: %w", discovered.Name, err)
