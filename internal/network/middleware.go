@@ -4,7 +4,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strings"
 )
 
 // AllowedIPsMiddleware creates middleware that restricts access to specific IP addresses.
@@ -36,25 +35,12 @@ func AllowedIPsMiddleware(allowedIPs []string, logger *log.Logger) func(http.Han
 }
 
 // getClientIP extracts the client's IP address from the request.
-// It handles X-Forwarded-For and X-Real-IP headers, but prioritizes RemoteAddr.
+// Only RemoteAddr is trusted to avoid spoofed proxy headers.
 func getClientIP(r *http.Request) string {
 	// First try RemoteAddr (most reliable for local connections)
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil && ip != "" {
 		return ip
-	}
-
-	// Fallback to X-Real-IP header
-	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-		return realIP
-	}
-
-	// Fallback to X-Forwarded-For header (take the first IP)
-	if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
-		ips := strings.Split(forwardedFor, ",")
-		if len(ips) > 0 {
-			return strings.TrimSpace(ips[0])
-		}
 	}
 
 	return ""
