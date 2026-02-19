@@ -38,6 +38,11 @@ payram-updater status
 payram-updater health
 ```
 
+Returns:
+```json
+{"status":"ok"}
+```
+
 ### View upgrade logs
 ```bash
 payram-updater logs
@@ -52,6 +57,13 @@ payram-updater logs -f
 ```bash
 payram-updater restart
 ```
+
+Restarts the `payram-updater` systemd service. Use this when:
+- The service started before Docker (container not discovered)
+- Configuration changes require a reload
+- Service needs to re-scan for containers
+
+Requires `sudo` access and systemd.
 
 ## Performing Upgrades
 
@@ -166,18 +178,44 @@ payram-updater backup restore --file /path/to/backup.dump
 
 The service is configured via environment variables in `/etc/payram/updater.env`.
 
-Common settings:
+### Core Settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `UPDATER_PORT` | `2567` | HTTP API port |
-| `DEBUG_VERSION_MODE` | `false` | Enable debug logging |
+| `POLICY_URL` | Required | Upgrade policy JSON URL |
+| `RUNTIME_MANIFEST_URL` | Required | Container manifest JSON URL |
+| `STATE_DIR` | `/var/lib/payram-updater` | Job state persistence directory |
+| `FETCH_TIMEOUT_SECONDS` | `10` | HTTP request timeout |
+| `DOCKER_BIN` | `docker` | Docker binary path |
+
+### Database Backup Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `BACKUP_DIR` | `data/backups` | Backup storage directory |
+| `BACKUP_RETENTION` | `10` | Number of backups to keep |
+| `PG_HOST` | `127.0.0.1` | PostgreSQL host |
+| `PG_PORT` | `5432` | PostgreSQL port |
+| `PG_DB` | `payram` | Database name |
+| `PG_USER` | `payram` | Database user |
+| `PG_PASSWORD` | (empty) | Database password |
+
+### Advanced Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `DEBUG_VERSION_MODE` | `false` | Allow arbitrary version strings (testing) |
+| `IMAGE_REPO_OVERRIDE` | (none) | Override image repository for testing |
+| `TARGET_CONTAINER_NAME` | (auto-detect) | Override target container name |
 
 To reconfigure:
 ```bash
 sudo nano /etc/payram/updater.env
 sudo systemctl restart payram-updater
 ```
+
+See `packaging/examples/updater.env.example` for a complete configuration template.
 
 ## View Service Logs
 
@@ -187,13 +225,20 @@ sudo journalctl -u payram-updater -f
 
 ## HTTP API
 
-The service provides an HTTP API on port `2567` (default). The API is primarily used by the PayRam dashboard.
+The service provides an HTTP API on port `2567` (default, configurable via `UPDATER_PORT`). 
 
-### Endpoints
+**Security:** API access is restricted to:
+- Localhost (`127.0.0.1`, `::1`)
+- PayRam container IP (auto-discovered)
+
+Other Docker containers are blocked. The API is primarily used by the PayRam dashboard for orchestrating upgrades.
+
+### Key Endpoints
 
 **Health check**
 ```bash
 curl http://127.0.0.1:2567/health
+# Returns: {"status":"ok"}
 ```
 
 **Get upgrade status**
@@ -211,17 +256,36 @@ curl http://127.0.0.1:2567/upgrade/logs
 curl http://127.0.0.1:2567/history
 ```
 
-**Initiate an upgrade**
-```bash
-curl -X POST http://127.0.0.1:2567/upgrade \
-  -H "Content-Type: application/json" \
-  -d '{"requestedTarget":"1.7.8"}'
-```
-
 **System diagnostics**
 ```bash
 curl http://127.0.0.1:2567/upgrade/inspect
 ```
+
+### Two-Phase Upgrade Flow (API)
+
+The dashboard uses a two-phase approach:
+
+**1. Plan (validation)**
+```bash
+curl -X POST http://127.0.0.1:2567/upgrade/plan \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"dashboard","requestedTarget":"1.7.8"}'
+```
+
+Validates the upgrade without executing. Returns resolved version and any blocking issues.
+
+**2. Run (execution)**
+```bash
+curl -X POST http://127.0.0.1:2567/upgrade/run \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"dashboard","requestedTarget":"1.7.8"}'
+```
+
+Executes the upgrade. Returns job ID for status tracking.
+
+**Note:** API endpoints always use `DASHBOARD` mode (strict policy enforcement). Use CLI for `MANUAL` mode upgrades.
+
+For complete API documentation, see [API.md](API.md).
 
 ## Uninstall
 
@@ -230,7 +294,7 @@ sudo systemctl stop payram-updater
 sudo systemctl disable payram-updater
 sudo rm /etc/systemd/system/payram-updater.service
 sudo rm /usr/local/bin/payram-updater
-sudo rm -rf /etc/payram /var/lib/payram /var/log/payram
+sudo rm -rf /etc/payram /var/lib/payram-updater /var/lib/payram /var/log/payram-updater
 sudo systemctl daemon-reload
 ```
 
