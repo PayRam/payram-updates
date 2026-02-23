@@ -78,6 +78,18 @@ func TestGetPlaybook_KnownCodes(t *testing.T) {
 			wantDataRisk: DataRiskNone,
 			wantTitle:    "Database Backup Failed",
 		},
+		{
+			code:         "BACKUP_FAILED_AFTER_QUIESCE",
+			wantSeverity: SeverityRetryable,
+			wantDataRisk: DataRiskNone,
+			wantTitle:    "Database Backup Failed After Quiesce",
+		},
+		{
+			code:         "SUPERVISORCTL_FAILED",
+			wantSeverity: SeverityManual,
+			wantDataRisk: DataRiskNone,
+			wantTitle:    "Supervisor Control Failed",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -565,8 +577,10 @@ func TestContainerSafetyZones(t *testing.T) {
 		{"CONTAINER_NOT_FOUND", true, DataRiskNone, SeverityManual},
 		{"INVALID_DB_CONFIG", true, DataRiskNone, SeverityManual},
 		{"BACKUP_TIMEOUT", true, DataRiskNone, SeverityRetryable},
+		{"SUPERVISORCTL_FAILED", true, DataRiskNone, SeverityManual},
 
 		// Post-modification failures (container may be affected)
+		{"BACKUP_FAILED_AFTER_QUIESCE", false, DataRiskNone, SeverityRetryable},
 		{"DOCKER_ERROR", false, DataRiskPossible, SeverityManual},
 		{"HEALTHCHECK_FAILED", false, DataRiskPossible, SeverityManual},
 		{"VERSION_MISMATCH", false, DataRiskPossible, SeverityManual},
@@ -624,7 +638,7 @@ func TestDataRiskClassification(t *testing.T) {
 		dataRisk DataRisk
 	}{
 		{
-			codes:    []string{"POLICY_FETCH_FAILED", "MANIFEST_FETCH_FAILED", "DOCKER_PULL_FAILED", "BACKUP_FAILED"},
+			codes:    []string{"POLICY_FETCH_FAILED", "MANIFEST_FETCH_FAILED", "DOCKER_PULL_FAILED", "BACKUP_FAILED", "BACKUP_FAILED_AFTER_QUIESCE", "SUPERVISORCTL_FAILED"},
 			dataRisk: DataRiskNone,
 		},
 		{

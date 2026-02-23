@@ -134,6 +134,7 @@ var playbooks = map[string]Playbook{
 		Severity:    SeverityManual,
 		Title:       "Health Check Failed",
 		UserMessage: "The new container started but failed health checks. Restore from backup and rollback to previous version.",
+		//TODO: check the steps
 		SSHSteps: []string{
 			"1. Check if container is running: docker ps | grep <image_repo>",
 			"2. Check container logs: docker logs <container_name> --tail 100",
@@ -232,6 +233,37 @@ var playbooks = map[string]Playbook{
 			"4. Check backup directory permissions: ls -la /var/lib/payram/backups",
 			"5. Check PostgreSQL logs for errors",
 			"6. Retry the upgrade once resolved (no manual recovery needed)",
+		},
+		DocsURL:  "https://docs.payram.com/troubleshooting/backup",
+		DataRisk: DataRiskNone,
+	},
+
+	"BACKUP_FAILED_AFTER_QUIESCE": {
+		Code:        "BACKUP_FAILED_AFTER_QUIESCE",
+		Severity:    SeverityRetryable,
+		Title:       "Database Backup Failed After Quiesce",
+		UserMessage: "Backup failed after stopping non-DB programs. Services were restarted. Resolve backup issues and retry.",
+		SSHSteps: []string{
+			"1. Confirm container is running: docker ps | grep <container_name>",
+			"2. Verify PostgreSQL is reachable: pg_isready -h localhost",
+			"3. Test pg_dump manually: pg_dump -Fc -h localhost -U payram -d payram -f /tmp/test.dump",
+			"4. Check backup directory permissions: ls -la /var/lib/payram/backups",
+			"5. Retry the upgrade once backup succeeds",
+		},
+		DocsURL:  "https://docs.payram.com/troubleshooting/backup",
+		DataRisk: DataRiskNone,
+	},
+
+	"SUPERVISORCTL_FAILED": {
+		Code:        "SUPERVISORCTL_FAILED",
+		Severity:    SeverityManual,
+		Title:       "Supervisor Control Failed",
+		UserMessage: "Failed to control supervisor programs inside the container. Check supervisor status and retry.",
+		SSHSteps: []string{
+			"1. Check supervisor status: docker exec <container_name> supervisorctl status",
+			"2. Verify supervisor is running inside the container",
+			"3. Check container logs: docker logs <container_name> --tail 200",
+			"4. Resolve supervisor errors, then retry upgrade",
 		},
 		DocsURL:  "https://docs.payram.com/troubleshooting/backup",
 		DataRisk: DataRiskNone,
@@ -353,7 +385,7 @@ var playbooks = map[string]Playbook{
 		Code:        "MIGRATION_TIMEOUT",
 		Severity:    SeverityManual,
 		Title:       "Database Migration Timeout",
-		UserMessage: "Database migrations are still running after 30 seconds. Check migration status and database performance.",
+		UserMessage: "Database migrations are still running after 15 minutes. Check migration status and database performance.",
 		SSHSteps: []string{
 			"1. Check container logs for migration progress: docker logs <container_name> | tail -50",
 			"2. Check migration status: curl <base_url>/admin/migrations/status",
