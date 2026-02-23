@@ -2,7 +2,10 @@ package http
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -103,14 +106,15 @@ func (s *Server) prepareUpgradeArgs(ctx context.Context, job *jobs.Job, containe
 // executeDryRun logs planned upgrade steps and completes the job in dry-run mode.
 func (s *Server) executeDryRun(job *jobs.Job, imageRepo, imageTag, containerName string, dockerArgs []string) {
 	s.jobStore.AppendLog("DRY-RUN mode: would execute the following steps:")
-	s.jobStore.AppendLog("  0. Create database backup")
-	s.jobStore.AppendLog(fmt.Sprintf("  1. Pull image: %s:%s", imageRepo, imageTag))
-	s.jobStore.AppendLog(fmt.Sprintf("  2. Stop container: %s", containerName))
-	s.jobStore.AppendLog(fmt.Sprintf("  3. Remove container: %s", containerName))
-	s.jobStore.AppendLog(fmt.Sprintf("  4. Run new container: docker %s", strings.Join(dockerArgs, " ")))
-	s.jobStore.AppendLog("  5. Verify: container running")
-	s.jobStore.AppendLog("  6. Verify: /api/v1/health endpoint")
-	s.jobStore.AppendLog("  7. Verify: /api/v1/version matches target")
+	s.jobStore.AppendLog(fmt.Sprintf("  0. Pull image: %s:%s", imageRepo, imageTag))
+	s.jobStore.AppendLog("  1. Quiesce supervisor programs (stop non-DB processes)")
+	s.jobStore.AppendLog("  2. Create database backup")
+	s.jobStore.AppendLog(fmt.Sprintf("  3. Stop container: %s", containerName))
+	s.jobStore.AppendLog(fmt.Sprintf("  4. Remove container: %s", containerName))
+	s.jobStore.AppendLog(fmt.Sprintf("  5. Run new container: docker %s", strings.Join(dockerArgs, " ")))
+	s.jobStore.AppendLog("  6. Verify: container running")
+	s.jobStore.AppendLog("  7. Verify: /api/v1/health endpoint")
+	s.jobStore.AppendLog("  8. Verify: /api/v1/version matches target")
 
 	job.State = jobs.JobStateReady
 	job.Message = "Dry-run validation complete"
@@ -215,19 +219,147 @@ func (s *Server) preflightChecks(ctx context.Context, job *jobs.Job, containerNa
 	return true
 }
 
-// createPreUpgradeBackup creates database backup before destructive operations.
-// Returns backup path or fails the job with appropriate error code.
-func (s *Server) createPreUpgradeBackup(ctx context.Context, job *jobs.Job, containerName, imageTag, policyInitVersion string) (string, bool) {
-	job.State = jobs.JobStateBackingUp
-	job.Message = "Creating database backup"
-	job.UpdatedAt = time.Now().UTC()
-	s.jobStore.Save(job)
+var errSupervisorUnavailable = errors.New("supervisorctl not available")
 
+func (s *Server) supervisorctlStatus(ctx context.Context, containerName string) (string, error) {
+	cmd := exec.CommandContext(ctx, s.config.DockerBin, "exec", containerName, "supervisorctl", "status")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return string(output), nil
+	}
+
+	outputStr := string(output)
+	if strings.Contains(outputStr, "supervisorctl: not found") ||
+		strings.Contains(outputStr, "command not found") ||
+		strings.Contains(outputStr, "executable file not found") ||
+		strings.Contains(outputStr, "No such file or directory") {
+		return "", errSupervisorUnavailable
+	}
+
+	return "", fmt.Errorf("supervisorctl status failed: %w: %s", err, outputStr)
+}
+
+func parseSupervisorStatus(output string) map[string]string {
+	status := make(map[string]string)
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		status[fields[0]] = fields[1]
+	}
+	return status
+}
+
+func (s *Server) supervisorctlStop(ctx context.Context, containerName string, programs []string) error {
+	if len(programs) == 0 {
+		return nil
+	}
+	args := append([]string{"exec", containerName, "supervisorctl", "stop"}, programs...)
+	cmd := exec.CommandContext(ctx, s.config.DockerBin, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("supervisorctl stop failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (s *Server) supervisorctlStart(ctx context.Context, containerName string, programs []string) error {
+	if len(programs) == 0 {
+		return nil
+	}
+	args := append([]string{"exec", containerName, "supervisorctl", "start"}, programs...)
+	cmd := exec.CommandContext(ctx, s.config.DockerBin, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("supervisorctl start failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (s *Server) quiesceSupervisorPrograms(ctx context.Context, job *jobs.Job, containerName string) ([]string, bool, bool) {
+	statusOutput, err := s.supervisorctlStatus(ctx, containerName)
+	if err != nil {
+		if errors.Is(err, errSupervisorUnavailable) {
+			s.jobStore.AppendLog("Supervisor not available; falling back to backup-before-stop flow")
+			return nil, false, true
+		}
+		job.State = jobs.JobStateFailed
+		job.FailureCode = "SUPERVISORCTL_FAILED"
+		job.Message = err.Error()
+		job.UpdatedAt = time.Now().UTC()
+		s.jobStore.Save(job)
+		s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s", job.FailureCode, job.Message))
+		return nil, false, false
+	}
+
+	status := parseSupervisorStatus(statusOutput)
+	excludeSet := make(map[string]struct{}, len(s.config.SupervisorExclude))
+	for _, name := range s.config.SupervisorExclude {
+		excludeSet[name] = struct{}{}
+	}
+	includeSet := make(map[string]struct{}, len(s.config.SupervisorInclude))
+	for _, name := range s.config.SupervisorInclude {
+		includeSet[name] = struct{}{}
+	}
+
+	var programsToStop []string
+	var programsStopped []string
+	for name, state := range status {
+		if len(includeSet) > 0 {
+			if _, ok := includeSet[name]; !ok {
+				continue
+			}
+		} else {
+			if _, ok := excludeSet[name]; ok {
+				continue
+			}
+		}
+
+		programsToStop = append(programsToStop, name)
+		if state == "RUNNING" || state == "STARTING" {
+			programsStopped = append(programsStopped, name)
+		}
+	}
+
+	if len(programsToStop) == 0 {
+		s.jobStore.AppendLog("No supervisor programs to stop (after filters)")
+		return nil, true, true
+	}
+
+	sort.Strings(programsToStop)
+	sort.Strings(programsStopped)
+	s.jobStore.AppendLog(fmt.Sprintf("Stopping supervisor programs: %s", strings.Join(programsToStop, ", ")))
+	if err := s.supervisorctlStop(ctx, containerName, programsToStop); err != nil {
+		job.State = jobs.JobStateFailed
+		job.FailureCode = "SUPERVISORCTL_FAILED"
+		job.Message = err.Error()
+		job.UpdatedAt = time.Now().UTC()
+		s.jobStore.Save(job)
+		s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s", job.FailureCode, job.Message))
+		return nil, false, false
+	}
+
+	if len(programsStopped) > 0 {
+		s.jobStore.AppendLog(fmt.Sprintf("Supervisor programs stopped: %s", strings.Join(programsStopped, ", ")))
+	} else {
+		s.jobStore.AppendLog("No running supervisor programs needed stopping")
+	}
+
+	return programsStopped, true, true
+}
+
+func (s *Server) createPreUpgradeBackupBeforeStop(ctx context.Context, job *jobs.Job, containerName, imageTag, policyInitVersion string) (string, bool) {
 	// Get current version for backup metadata
 	currentVersion := "unknown"
 	if versionInfo, _, err := s.resolveCoreVersion(ctx, containerName, policyInitVersion); err == nil && versionInfo != "" {
 		currentVersion = versionInfo
 	}
+
+	job.State = jobs.JobStateBackingUp
+	job.Message = "Creating database backup"
+	job.UpdatedAt = time.Now().UTC()
+	s.jobStore.Save(job)
 
 	s.jobStore.AppendLog(fmt.Sprintf("Creating pre-upgrade backup (from %s to %s)...", currentVersion, imageTag))
 	s.recordHistory(history.Event{
@@ -242,7 +374,6 @@ func (s *Server) createPreUpgradeBackup(ctx context.Context, job *jobs.Job, cont
 		},
 	})
 
-	// Use container-aware backup: extracts DB credentials from running container
 	backupResult := s.containerBackupExec.ExecuteBackup(ctx, containerName, backup.BackupMeta{
 		FromVersion:   currentVersion,
 		TargetVersion: imageTag,
@@ -320,13 +451,142 @@ func (s *Server) createPreUpgradeBackup(ctx context.Context, job *jobs.Job, cont
 	return backupResult.Path, true
 }
 
-// pullAndReplaceContainer pulls image, stops/removes old container, runs new one.
-// Returns false if any step fails (job is already marked failed).
-func (s *Server) pullAndReplaceContainer(ctx context.Context, job *jobs.Job, imageRepo, imageTag, containerName string, dockerArgs []string) bool {
+func (s *Server) createPreUpgradeBackupAfterQuiesce(ctx context.Context, job *jobs.Job, containerName, imageTag, policyInitVersion string, maxAttempts int, stoppedPrograms []string) (string, bool) {
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	// Get current version for backup metadata
+	currentVersion := "unknown"
+	if versionInfo, _, err := s.resolveCoreVersion(ctx, containerName, policyInitVersion); err == nil && versionInfo != "" {
+		currentVersion = versionInfo
+	}
+
+	var lastResult *backup.BackupResult
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		job.State = jobs.JobStateBackingUp
+		job.Message = fmt.Sprintf("Creating database backup (attempt %d/%d)", attempt, maxAttempts)
+		job.UpdatedAt = time.Now().UTC()
+		s.jobStore.Save(job)
+
+		s.jobStore.AppendLog(fmt.Sprintf("Creating pre-upgrade backup (from %s to %s)...", currentVersion, imageTag))
+		s.recordHistory(history.Event{
+			Type:    "backup",
+			Status:  "started",
+			Message: "Backup started",
+			Data: map[string]string{
+				"jobId":         job.JobID,
+				"fromVersion":   currentVersion,
+				"targetVersion": imageTag,
+				"container":     containerName,
+				"attempt":       fmt.Sprintf("%d", attempt),
+			},
+		})
+
+		backupResult := s.containerBackupExec.ExecuteBackup(ctx, containerName, backup.BackupMeta{
+			FromVersion:   currentVersion,
+			TargetVersion: imageTag,
+			JobID:         job.JobID,
+		})
+		lastResult = backupResult
+
+		if backupResult.Success {
+			job.BackupPath = backupResult.Path
+			s.jobStore.AppendLog(fmt.Sprintf("Backup created successfully: %s (%.2f MB)", backupResult.Filename, float64(backupResult.Size)/(1024*1024)))
+			if backupResult.DBConfig != nil {
+				dbType := "external"
+				if backupResult.DBConfig.IsLocalDB() {
+					dbType = "local (in-container)"
+				}
+				s.jobStore.AppendLog(fmt.Sprintf("Database: %s@%s:%s (%s)", backupResult.DBConfig.Database, backupResult.DBConfig.Host, backupResult.DBConfig.Port, dbType))
+			}
+			backupData := map[string]string{
+				"jobId":         job.JobID,
+				"fromVersion":   currentVersion,
+				"targetVersion": imageTag,
+				"backupPath":    backupResult.Path,
+				"sizeBytes":     fmt.Sprintf("%d", backupResult.Size),
+			}
+			if backupResult.DBConfig != nil {
+				backupData["dbHost"] = backupResult.DBConfig.Host
+				backupData["dbPort"] = backupResult.DBConfig.Port
+				backupData["dbName"] = backupResult.DBConfig.Database
+			}
+			s.recordHistory(history.Event{
+				Type:    "backup",
+				Status:  "succeeded",
+				Message: "Backup completed",
+				Data:    backupData,
+			})
+
+			// Prune old backups (using legacy manager for retention logic)
+			if _, err := s.backupManager.PruneBackups(s.backupManager.Config.Retention); err != nil {
+				s.jobStore.AppendLog(fmt.Sprintf("Warning: failed to prune old backups: %v", err))
+			}
+
+			return backupResult.Path, true
+		}
+
+		s.jobStore.AppendLog(fmt.Sprintf("Backup attempt %d/%d failed: %s - %s", attempt, maxAttempts, backupResult.FailureCode, backupResult.ErrorMessage))
+		if attempt < maxAttempts {
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	job.State = jobs.JobStateFailed
+	job.FailureCode = "BACKUP_FAILED_AFTER_QUIESCE"
+	job.Message = fmt.Sprintf("Backup failed after %d attempts: %s", maxAttempts, lastResult.ErrorMessage)
+	job.UpdatedAt = time.Now().UTC()
+	s.jobStore.Save(job)
+	s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s (attempting to restart supervisor programs)", job.FailureCode, job.Message))
+	s.recordHistory(history.Event{
+		Type:    "backup",
+		Status:  "failed",
+		Message: lastResult.ErrorMessage,
+		Data: map[string]string{
+			"jobId":         job.JobID,
+			"fromVersion":   currentVersion,
+			"targetVersion": imageTag,
+			"failureCode":   job.FailureCode,
+			"causeCode":     lastResult.FailureCode,
+		},
+	})
+
+	// Provide context-specific recovery guidance
+	switch lastResult.FailureCode {
+	case "DOCKER_DAEMON_DOWN":
+		s.jobStore.AppendLog("Next steps: Start Docker daemon with 'sudo systemctl start docker' and retry.")
+	case "CONTAINER_NOT_FOUND":
+		s.jobStore.AppendLog(fmt.Sprintf("Next steps: Ensure container '%s' exists and retry.", containerName))
+	case "INVALID_DB_CONFIG":
+		s.jobStore.AppendLog("Next steps: Verify container has POSTGRES_* environment variables set.")
+	case "BACKUP_TIMEOUT":
+		s.jobStore.AppendLog("Next steps: Check database connectivity and size. Increase timeout if needed.")
+	default:
+		s.jobStore.AppendLog("Next steps: Check logs and database connectivity, then retry.")
+	}
+
+	if err := s.supervisorctlStart(ctx, containerName, stoppedPrograms); err != nil {
+		s.jobStore.AppendLog(fmt.Sprintf("Warning: failed to restart supervisor programs: %v", err))
+		s.jobStore.AppendLog("Attempting to restart container as last resort...")
+		if restartErr := s.dockerRunner.Restart(ctx, containerName); restartErr != nil {
+			s.jobStore.AppendLog(fmt.Sprintf("Warning: failed to restart container: %v", restartErr))
+		}
+		return "", false
+	}
+
+	if len(stoppedPrograms) > 0 {
+		s.jobStore.AppendLog(fmt.Sprintf("Supervisor programs restarted: %s", strings.Join(stoppedPrograms, ", ")))
+	}
+	return "", false
+}
+
+// pullUpgradeImage pulls the target image before stopping the container.
+// Returns false if the pull fails.
+func (s *Server) pullUpgradeImage(ctx context.Context, job *jobs.Job, imageRepo, imageTag string) bool {
 	job.State = jobs.JobStateExecuting
 	job.UpdatedAt = time.Now().UTC()
 
-	// Step 1: Pull image (always pull from Docker Hub)
 	imageWithTag := fmt.Sprintf("%s:%s", imageRepo, imageTag)
 	job.Message = "Pulling image"
 	s.jobStore.Save(job)
@@ -342,8 +602,13 @@ func (s *Server) pullAndReplaceContainer(ctx context.Context, job *jobs.Job, ima
 		return false
 	}
 	s.jobStore.AppendLog("Image pulled successfully")
+	return true
+}
 
-	// Step 2: Stop container
+// stopContainerForUpgrade stops the container before replacing it.
+// Returns false if stopping fails.
+func (s *Server) stopContainerForUpgrade(ctx context.Context, job *jobs.Job, containerName string) bool {
+	job.State = jobs.JobStateExecuting
 	job.Message = "Stopping container"
 	job.UpdatedAt = time.Now().UTC()
 	s.jobStore.Save(job)
@@ -359,8 +624,13 @@ func (s *Server) pullAndReplaceContainer(ctx context.Context, job *jobs.Job, ima
 		return false
 	}
 	s.jobStore.AppendLog("Container stopped successfully")
+	return true
+}
 
-	// Step 3: Remove container
+// replaceContainer removes the old container, runs the new one, and verifies it's running.
+// Returns false if any step fails (job is already marked failed).
+func (s *Server) replaceContainer(ctx context.Context, job *jobs.Job, containerName string, dockerArgs []string) bool {
+	// Step 1: Remove container
 	job.Message = "Removing container"
 	job.UpdatedAt = time.Now().UTC()
 	s.jobStore.Save(job)
@@ -377,7 +647,7 @@ func (s *Server) pullAndReplaceContainer(ctx context.Context, job *jobs.Job, ima
 	}
 	s.jobStore.AppendLog("Container removed successfully")
 
-	// Step 4: Run new container
+	// Step 2: Run new container
 	job.Message = "Running new container"
 	job.UpdatedAt = time.Now().UTC()
 	s.jobStore.Save(job)
@@ -394,7 +664,7 @@ func (s *Server) pullAndReplaceContainer(ctx context.Context, job *jobs.Job, ima
 	}
 	s.jobStore.AppendLog("Container started successfully")
 
-	// Step 5: Verify container is running
+	// Step 3: Verify container is running
 	job.State = jobs.JobStateVerifying
 	job.Message = "Verifying container status"
 	job.UpdatedAt = time.Now().UTC()

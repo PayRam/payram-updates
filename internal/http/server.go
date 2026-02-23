@@ -489,22 +489,44 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 		return
 	}
 
-	// Phase 5: Create backup before destructive operations
-	if _, ok := s.createPreUpgradeBackup(ctx, job, containerName, imageTag, policyInitVersion); !ok {
+	// Phase 5: Pull image before stopping container
+	if !s.pullUpgradeImage(ctx, job, imageRepo, imageTag) {
 		return
 	}
 
-	// Phase 6: Pull image and replace container
-	if !s.pullAndReplaceContainer(ctx, job, imageRepo, imageTag, containerName, dockerArgs) {
+	// Phase 6: Quiesce supervisor programs (if available)
+	stoppedPrograms, usedSupervisor, ok := s.quiesceSupervisorPrograms(ctx, job, containerName)
+	if !ok {
 		return
 	}
 
-	// Phase 7: Verify upgrade (health and version checks)
+	// Phase 7: Create backup (supervisor quiesce or fallback)
+	if usedSupervisor {
+		if _, ok := s.createPreUpgradeBackupAfterQuiesce(ctx, job, containerName, imageTag, policyInitVersion, 3, stoppedPrograms); !ok {
+			return
+		}
+	} else {
+		if _, ok := s.createPreUpgradeBackupBeforeStop(ctx, job, containerName, imageTag, policyInitVersion); !ok {
+			return
+		}
+	}
+
+	// Phase 8: Stop container before replacement
+	if !s.stopContainerForUpgrade(ctx, job, containerName) {
+		return
+	}
+
+	// Phase 9: Replace container with new version
+	if !s.replaceContainer(ctx, job, containerName, dockerArgs) {
+		return
+	}
+
+	// Phase 10: Verify upgrade (health and version checks)
 	if !s.verifyUpgrade(ctx, job, containerName, imageTag, policyInitVersion) {
 		return
 	}
 
-	// Phase 8: Finalize upgrade (mark complete and prune old images)
+	// Phase 11: Finalize upgrade (mark complete and prune old images)
 	s.finalizeUpgrade(ctx, job, imageRepo, imageTag)
 }
 
