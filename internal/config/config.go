@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // BackupConfig holds configuration for database backups.
@@ -45,6 +46,8 @@ type Config struct {
 	DebugVersionMode    bool   // When true, allows arbitrary version names and uses release list ordering
 	AutoUpdateEnabled   bool
 	AutoUpdateInterval  int // Hours
+	SupervisorExclude   []string
+	SupervisorInclude   []string
 	Backup              BackupConfig
 }
 
@@ -90,6 +93,8 @@ func Load() (*Config, error) {
 		DebugVersionMode:    getEnvString("DEBUG_VERSION_MODE", "") == "true",
 		AutoUpdateEnabled:   DefaultAutoUpdateEnabled,
 		AutoUpdateInterval:  DefaultAutoUpdateIntervalHours,
+		SupervisorExclude:   parseCSV(getEnvString("SUPERVISOR_EXCLUDE", "postgres,postgresql")),
+		SupervisorInclude:   parseCSV(os.Getenv("SUPERVISOR_INCLUDE")),
 		Backup: BackupConfig{
 			Dir:        getEnvString("BACKUP_DIR", "data/backups"),
 			Retention:  getEnvInt("BACKUP_RETENTION", 10),
@@ -140,4 +145,19 @@ func getEnvInt(key string, defaultValue int) int {
 		return defaultValue
 	}
 	return value
+}
+
+func parseCSV(value string) []string {
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
 }
