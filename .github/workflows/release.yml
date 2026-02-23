@@ -1,0 +1,38 @@
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build release binaries
+        run: make build-release
+
+      - name: Generate checksums
+        run: |
+          cd bin/release
+          sha256sum payram-updater-linux-amd64 > payram-updater-linux-amd64.sha256
+          sha256sum payram-updater-linux-arm64 > payram-updater-linux-arm64.sha256
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bin/release/payram-updater-linux-amd64
+            bin/release/payram-updater-linux-arm64
+            bin/release/payram-updater-linux-amd64.sha256
+            bin/release/payram-updater-linux-arm64.sha256
