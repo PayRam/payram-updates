@@ -18,6 +18,8 @@
 #   EXECUTION_MODE            - Execution mode: dry-run or execute (default: execute)
 #   DOCKER_BIN                - Docker binary path (default: docker)
 #   PAYRAM_UPDATER_VERSION    - Specific version to install (default: latest)
+#   PAYRAM_UPDATER_CHECKSUM_URL - Override checksum URL for the binary (default: ${DOWNLOAD_URL}.sha256)
+#   PAYRAM_UPDATER_SHA256      - Provide checksum directly (skips checksum download)
 #   FORCE_REINSTALL           - Skip all prompts and reinstall (default: false)
 #
 set -euo pipefail
@@ -87,14 +89,46 @@ log "Latest version: $VERSION"
 
 ASSET="${BIN_NAME}-${OS}-${ARCH}"
 DOWNLOAD_URL="${PAYRAM_UPDATER_DOWNLOAD_URL:-https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${VERSION}/${ASSET}}"
+CHECKSUM_URL="${PAYRAM_UPDATER_CHECKSUM_URL:-${DOWNLOAD_URL}.sha256}"
 
 TMP_BIN="/tmp/${BIN_NAME}"
+TMP_SUM="/tmp/${BIN_NAME}.sha256"
 
 log "Downloading ${DOWNLOAD_URL}..."
 rm -f "$TMP_BIN"
 curl -fsSL "$DOWNLOAD_URL" -o "$TMP_BIN"
 chmod +x "$TMP_BIN"
 log "Download complete"
+
+verify_checksum() {
+  local checksum=""
+  if [[ -n "${PAYRAM_UPDATER_SHA256:-}" ]]; then
+    checksum="$PAYRAM_UPDATER_SHA256"
+  elif curl -fsSL "$CHECKSUM_URL" -o "$TMP_SUM"; then
+    checksum="$(awk '{print $1}' "$TMP_SUM" | head -n1)"
+  else
+    log "ERROR: Checksum not available at ${CHECKSUM_URL}"
+    exit 1
+  fi
+
+  if [[ -z "$checksum" ]]; then
+    log "ERROR: Empty checksum from ${CHECKSUM_URL}"
+    exit 1
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "${checksum}  ${TMP_BIN}" | sha256sum -c -
+  elif command -v shasum >/dev/null 2>&1; then
+    echo "${checksum}  ${TMP_BIN}" | shasum -a 256 -c -
+  else
+    log "ERROR: sha256sum or shasum is required for checksum verification"
+    exit 1
+  fi
+}
+
+log "Verifying checksum (if available)..."
+verify_checksum
+log "Checksum verification complete"
 
 if [[ -f "${INSTALL_DIR}/${BIN_NAME}" ]]; then
   CURRENT_VERSION=$("${INSTALL_DIR}/${BIN_NAME}" version 2>/dev/null || echo "unknown")
@@ -152,6 +186,8 @@ STATE_DIR=${STATE_DIR}
 BACKUP_DIR=${BACKUP_DIR}
 EXECUTION_MODE=${EXECUTION_MODE:-execute}
 DOCKER_BIN=${DOCKER_BIN:-docker}
+SUPERVISOR_EXCLUDE=${SUPERVISOR_EXCLUDE:-postgres,postgresql}
+SUPERVISOR_INCLUDE=${SUPERVISOR_INCLUDE:-}
 UPDATER_PORT=${UPDATER_PORT:-2567}
 DEBUG_VERSION_MODE=${DEBUG_VERSION_MODE:-false}
 EOF
@@ -170,6 +206,8 @@ STATE_DIR=${STATE_DIR}
 BACKUP_DIR=${BACKUP_DIR}
 EXECUTION_MODE=${EXECUTION_MODE:-execute}
 DOCKER_BIN=${DOCKER_BIN:-docker}
+SUPERVISOR_EXCLUDE=${SUPERVISOR_EXCLUDE:-postgres,postgresql}
+SUPERVISOR_INCLUDE=${SUPERVISOR_INCLUDE:-}
 UPDATER_PORT=${UPDATER_PORT:-2567}
 DEBUG_VERSION_MODE=${DEBUG_VERSION_MODE:-false}
 EOF
