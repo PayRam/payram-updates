@@ -10,6 +10,12 @@ Download and run the installation script:
 curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | sudo bash
 ```
 
+Checksum verification (required): the installer verifies the downloaded binary using a published checksum. You can also pass a checksum explicitly:
+
+```bash
+PAYRAM_UPDATER_SHA256="<sha256>" curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | sudo -E bash
+```
+
 Verify the service is running:
 
 ```bash
