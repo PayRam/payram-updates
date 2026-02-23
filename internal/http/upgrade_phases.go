@@ -229,6 +229,11 @@ func (s *Server) supervisorctlStatus(ctx context.Context, containerName string) 
 	}
 
 	outputStr := string(output)
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ProcessState != nil && exitErr.ProcessState.ExitCode() == 3 {
+			return outputStr, nil
+		}
+	}
 	if strings.Contains(outputStr, "supervisorctl: not found") ||
 		strings.Contains(outputStr, "command not found") ||
 		strings.Contains(outputStr, "executable file not found") ||
