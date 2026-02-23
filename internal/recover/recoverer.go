@@ -121,6 +121,20 @@ func (r *Recoverer) performRecovery(ctx context.Context, failureCode string, job
 			Code:     failureCode,
 			Refusals: "Requires manual cleanup of disk space",
 		}
+	case "BACKUP_FAILED_AFTER_QUIESCE":
+		return &RecoveryResult{
+			Success:  false,
+			Message:  "Backup failed after quiesce. Services should have been restarted; resolve backup issues and retry.",
+			Code:     failureCode,
+			Refusals: "No automated recovery action defined",
+		}
+	case "SUPERVISORCTL_FAILED":
+		return &RecoveryResult{
+			Success:  false,
+			Message:  "Supervisor control failed. Check supervisor status inside the container and retry.",
+			Code:     failureCode,
+			Refusals: "No automated recovery action defined",
+		}
 	default:
 		return &RecoveryResult{
 			Success:  false,
