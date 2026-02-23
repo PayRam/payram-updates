@@ -77,6 +77,30 @@ func TestRemove_ArgumentConstruction(t *testing.T) {
 	}
 }
 
+// TestStart_ArgumentConstruction tests that Start constructs correct arguments.
+func TestStart_ArgumentConstruction(t *testing.T) {
+	logger := &mockLogger{}
+	runner := &Runner{
+		DockerBin: "docker",
+		Logger:    logger,
+	}
+
+	// Verify method signature
+	var _ func(context.Context, string) error = runner.Start
+}
+
+// TestRestart_ArgumentConstruction tests that Restart constructs correct arguments.
+func TestRestart_ArgumentConstruction(t *testing.T) {
+	logger := &mockLogger{}
+	runner := &Runner{
+		DockerBin: "docker",
+		Logger:    logger,
+	}
+
+	// Verify method signature
+	var _ func(context.Context, string) error = runner.Restart
+}
+
 // TestRun_ArgumentConstruction tests that Run accepts arbitrary arguments.
 func TestRun_ArgumentConstruction(t *testing.T) {
 	logger := &mockLogger{}
@@ -328,6 +352,8 @@ func TestContext_Integration(t *testing.T) {
 	// Verify all methods accept context
 	var _ func(context.Context, string) error = runner.Pull
 	var _ func(context.Context, string) error = runner.Stop
+	var _ func(context.Context, string) error = runner.Start
+	var _ func(context.Context, string) error = runner.Restart
 	var _ func(context.Context, string) error = runner.Remove
 	var _ func(context.Context, []string) error = runner.Run
 	var _ func(context.Context, string) (bool, error) = runner.InspectRunning

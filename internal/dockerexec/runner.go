@@ -57,6 +57,42 @@ func (r *Runner) Stop(ctx context.Context, container string) error {
 	return nil
 }
 
+// Start starts a stopped Docker container.
+// Idempotent: returns no error if the container is already running.
+func (r *Runner) Start(ctx context.Context, container string) error {
+	args := []string{"start", container}
+	r.logCommand(args)
+
+	cmd := exec.CommandContext(ctx, r.DockerBin, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		outputStr := string(output)
+		if strings.Contains(outputStr, "is already running") {
+			r.Logger.Printf("Container %s already running (idempotent operation)", container)
+			return nil
+		}
+		return fmt.Errorf("docker start failed: %w: %s", err, outputStr)
+	}
+
+	r.Logger.Printf("Successfully started container: %s", container)
+	return nil
+}
+
+// Restart restarts a Docker container.
+func (r *Runner) Restart(ctx context.Context, container string) error {
+	args := []string{"restart", container}
+	r.logCommand(args)
+
+	cmd := exec.CommandContext(ctx, r.DockerBin, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker restart failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+
+	r.Logger.Printf("Successfully restarted container: %s", container)
+	return nil
+}
+
 // Remove removes a Docker container.
 // Idempotent: returns no error if the container does not exist.
 func (r *Runner) Remove(ctx context.Context, container string) error {
