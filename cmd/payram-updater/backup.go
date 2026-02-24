@@ -16,6 +16,7 @@ import (
 	"github.com/payram/payram-updater/internal/container"
 	"github.com/payram/payram-updater/internal/dockerexec"
 	"github.com/payram/payram-updater/internal/history"
+	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/manifest"
 )
 
@@ -333,8 +334,12 @@ func runBackupRestore(mgr *backup.Manager) {
 	needsRecovery := metadata.FromVersion != "unknown" && metadata.ToVersion != "unknown"
 
 	var historyStore *history.Store
+	var latestJob *jobs.Job
 	if cfg, err := config.Load(); err == nil {
 		historyStore = history.NewStore(cfg.StateDir)
+		if job, loadErr := jobs.NewStore(cfg.StateDir).LoadLatest(); loadErr == nil {
+			latestJob = job
+		}
 	}
 
 	// Determine if full recovery will be performed
@@ -373,6 +378,16 @@ func runBackupRestore(mgr *backup.Manager) {
 	// CRITICAL SEQUENCING FIX: If full recovery is requested, roll back container FIRST
 	// This ensures database restore happens inside the rollback container, not the failed one
 	if doFullRecovery && needsRecovery {
+		if isSuccessfulUpgradeJob(latestJob) {
+			errResp := map[string]interface{}{
+				"success": false,
+				"error":   "Rollback is blocked because the latest upgrade completed successfully. Re-run restore in database-only mode.",
+			}
+			jsonOut, _ := json.MarshalIndent(errResp, "", "  ")
+			fmt.Println(string(jsonOut))
+			os.Exit(1)
+		}
+
 		fmt.Fprintln(os.Stderr, "\n⚠️  Full recovery mode: Rolling back container BEFORE database restore...")
 		fmt.Fprintf(os.Stderr, "This ensures database restore happens inside the rollback container (version %s)\n\n", metadata.FromVersion)
 
@@ -512,4 +527,11 @@ func runBackupRestore(mgr *backup.Manager) {
 	}
 	jsonOut, _ := json.MarshalIndent(response, "", "  ")
 	fmt.Println(string(jsonOut))
+}
+
+func isSuccessfulUpgradeJob(job *jobs.Job) bool {
+	if job == nil {
+		return false
+	}
+	return job.State == jobs.JobStateReady && strings.TrimSpace(job.Message) == "Upgrade completed successfully"
 }
