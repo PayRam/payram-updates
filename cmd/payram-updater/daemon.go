@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -75,6 +76,10 @@ func runServe() {
 }
 
 func runInit() {
+	initCmd := flag.NewFlagSet("init", flag.ExitOnError)
+	noAutoUpdate := initCmd.Bool("no-autoupdate", false, "Disable auto-updates without prompting")
+	initCmd.Parse(os.Args[2:])
+
 	reader := bufio.NewReader(os.Stdin)
 
 	cfg, err := config.Load()
@@ -93,13 +98,20 @@ func runInit() {
 		os.Exit(1)
 	}
 
-	defaultEnabled := config.DefaultAutoUpdateEnabled
-	autoUpdateEnabled := promptYesNo(reader, "Enable auto updates?", defaultEnabled)
+	var autoUpdateEnabled bool
+	var autoUpdateInterval int
+	if *noAutoUpdate {
+		autoUpdateEnabled = false
+		autoUpdateInterval = config.DefaultAutoUpdateIntervalHours
+	} else {
+		defaultEnabled := config.DefaultAutoUpdateEnabled
+		autoUpdateEnabled = promptYesNo(reader, "Enable auto updates?", defaultEnabled)
 
-	defaultInterval := config.DefaultAutoUpdateIntervalHours
-	autoUpdateInterval := defaultInterval
-	if autoUpdateEnabled {
-		autoUpdateInterval = promptInt(reader, "Auto update interval (hours)", defaultInterval)
+		defaultInterval := config.DefaultAutoUpdateIntervalHours
+		autoUpdateInterval = defaultInterval
+		if autoUpdateEnabled {
+			autoUpdateInterval = promptInt(reader, "Auto update interval (hours)", defaultInterval)
+		}
 	}
 
 	settings := &autoupdate.Settings{

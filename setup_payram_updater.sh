@@ -8,6 +8,8 @@
 #   Specific version:     curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | PAYRAM_UPDATER_VERSION=v0.1.0 bash
 #   Custom port:          curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | UPDATER_PORT=3000 bash
 #   Debug mode:           curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | DEBUG_VERSION_MODE=true bash
+#   Quiet mode:           curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | QUIET=true bash
+#   With auto-start:      curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | ENABLE_SERVICE=true bash
 #
 # Environment Variables (optional):
 #   UPDATER_PORT              - API port (default: 2567)
@@ -21,6 +23,8 @@
 #   PAYRAM_UPDATER_CHECKSUM_URL - Override checksum URL for the binary (default: ${DOWNLOAD_URL}.sha256)
 #   PAYRAM_UPDATER_SHA256      - Provide checksum directly (skips checksum download)
 #   FORCE_REINSTALL           - Skip all prompts and reinstall (default: false)
+#   QUIET                     - Suppress all log output (default: false)
+#   ENABLE_SERVICE            - Enable and start the systemd service after install (default: false)
 #
 set -euo pipefail
 
@@ -43,9 +47,13 @@ fi
 
 # Force reinstall mode (set FORCE_REINSTALL=true to skip prompts)
 FORCE_REINSTALL="${FORCE_REINSTALL:-false}"
+QUIET="${QUIET:-false}"
+ENABLE_SERVICE="${ENABLE_SERVICE:-false}"
 
 log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+  if [[ "$QUIET" != "true" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+  fi
 }
 
 require() {
@@ -117,9 +125,17 @@ verify_checksum() {
   fi
 
   if command -v sha256sum >/dev/null 2>&1; then
-    echo "${checksum}  ${TMP_BIN}" | sha256sum -c -
+    if [[ "$QUIET" == "true" ]]; then
+      echo "${checksum}  ${TMP_BIN}" | sha256sum -c - >/dev/null
+    else
+      echo "${checksum}  ${TMP_BIN}" | sha256sum -c -
+    fi
   elif command -v shasum >/dev/null 2>&1; then
-    echo "${checksum}  ${TMP_BIN}" | shasum -a 256 -c -
+    if [[ "$QUIET" == "true" ]]; then
+      echo "${checksum}  ${TMP_BIN}" | shasum -a 256 -c - >/dev/null
+    else
+      echo "${checksum}  ${TMP_BIN}" | shasum -a 256 -c -
+    fi
   else
     log "ERROR: sha256sum or shasum is required for checksum verification"
     exit 1
@@ -250,9 +266,6 @@ SyslogIdentifier=payram-updater
 
 # Security hardening
 NoNewPrivileges=false
-PrivateTmp=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/payram-updater /var/lib/payram /root
 
 [Install]
 WantedBy=multi-user.target
@@ -284,9 +297,6 @@ SyslogIdentifier=payram-updater
 
 # Security hardening
 NoNewPrivileges=false
-PrivateTmp=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/payram-updater /var/log/payram-updater /var/lib/payram /root
 
 [Install]
 WantedBy=multi-user.target
@@ -309,28 +319,44 @@ if sudo test -f "$ROOT_CONFIG" && sudo grep -q '"initialized": true' "$ROOT_CONF
   fi
   
   if [[ "$REINIT" =~ ^[Yy] ]]; then
-    log "Running updater init (interactive)..."
-    sudo "${INSTALL_DIR}/${BIN_NAME}" init
+    log "Running updater init..."
+    if ! init_out=$(sudo "${INSTALL_DIR}/${BIN_NAME}" init --no-autoupdate 2>&1); then
+      echo "$init_out" >&2
+      echo "ERROR: Initialization failed" >&2
+      exit 1
+    fi
     log "Initialization complete"
   else
     log "Skipping initialization"
   fi
 else
-  log "Running updater init (interactive)..."
-  sudo "${INSTALL_DIR}/${BIN_NAME}" init
+  log "Running updater init..."
+  if ! init_out=$(sudo "${INSTALL_DIR}/${BIN_NAME}" init --no-autoupdate 2>&1); then
+    echo "$init_out" >&2
+    echo "ERROR: Initialization failed" >&2
+    exit 1
+  fi
   log "Initialization complete"
 fi
 
 log "Reloading systemd daemon..."
 sudo systemctl daemon-reload
 
-log "Enabling payram-updater service..."
-sudo systemctl enable payram-updater
+if [[ "$ENABLE_SERVICE" == "true" ]]; then
+  log "Enabling payram-updater service..."
+  if [[ "$QUIET" == "true" ]]; then
+    sudo systemctl enable payram-updater >/dev/null 2>&1
+  else
+    sudo systemctl enable payram-updater
+  fi
 
-log "Restarting payram-updater service..."
-sudo systemctl restart payram-updater
-
-log "Checking service status..."
-sudo systemctl status payram-updater --no-pager
+  log "Restarting payram-updater service..."
+  sudo systemctl restart payram-updater
+else
+  log "Service installed but NOT started (ENABLE_SERVICE is not set)."
+  log "To enable and start the service, run:"
+  log "  sudo systemctl enable payram-updater"
+  log "  sudo systemctl start payram-updater"
+fi
 
 log "Setup complete!"
