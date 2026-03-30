@@ -29,7 +29,7 @@ func (r *Runner) Pull(ctx context.Context, image string) error {
 		return fmt.Errorf("docker pull failed: %w: %s", err, string(output))
 	}
 
-	r.Logger.Printf("Successfully pulled image: %s", image)
+	r.logf("Successfully pulled image: %s", image)
 	return nil
 }
 
@@ -47,13 +47,13 @@ func (r *Runner) Stop(ctx context.Context, container string) error {
 		if strings.Contains(outputStr, "No such container") ||
 			strings.Contains(outputStr, "is not running") ||
 			strings.Contains(outputStr, "already stopped") {
-			r.Logger.Printf("Container %s not running (idempotent operation)", container)
+			r.logf("Container %s not running (idempotent operation)", container)
 			return nil
 		}
 		return fmt.Errorf("docker stop failed: %w: %s", err, outputStr)
 	}
 
-	r.Logger.Printf("Successfully stopped container: %s", container)
+	r.logf("Successfully stopped container: %s", container)
 	return nil
 }
 
@@ -68,13 +68,13 @@ func (r *Runner) Start(ctx context.Context, container string) error {
 	if err != nil {
 		outputStr := string(output)
 		if strings.Contains(outputStr, "is already running") {
-			r.Logger.Printf("Container %s already running (idempotent operation)", container)
+			r.logf("Container %s already running (idempotent operation)", container)
 			return nil
 		}
 		return fmt.Errorf("docker start failed: %w: %s", err, outputStr)
 	}
 
-	r.Logger.Printf("Successfully started container: %s", container)
+	r.logf("Successfully started container: %s", container)
 	return nil
 }
 
@@ -89,7 +89,7 @@ func (r *Runner) Restart(ctx context.Context, container string) error {
 		return fmt.Errorf("docker restart failed: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 
-	r.Logger.Printf("Successfully restarted container: %s", container)
+	r.logf("Successfully restarted container: %s", container)
 	return nil
 }
 
@@ -105,13 +105,13 @@ func (r *Runner) Remove(ctx context.Context, container string) error {
 		// Check if error is because container doesn't exist
 		outputStr := string(output)
 		if strings.Contains(outputStr, "No such container") {
-			r.Logger.Printf("Container %s does not exist (idempotent operation)", container)
+			r.logf("Container %s does not exist (idempotent operation)", container)
 			return nil
 		}
 		return fmt.Errorf("docker rm failed: %w: %s", err, outputStr)
 	}
 
-	r.Logger.Printf("Successfully removed container: %s", container)
+	r.logf("Successfully removed container: %s", container)
 	return nil
 }
 
@@ -125,7 +125,7 @@ func (r *Runner) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("docker run failed: %w: %s", err, string(output))
 	}
 
-	r.Logger.Printf("Successfully executed docker command")
+	r.logf("Successfully executed docker command")
 	return nil
 }
 
@@ -142,7 +142,7 @@ func (r *Runner) InspectRunning(ctx context.Context, container string) (bool, er
 		outputStr := string(output)
 		if strings.Contains(outputStr, "No such object") ||
 			strings.Contains(outputStr, "No such container") {
-			r.Logger.Printf("Container %s does not exist", container)
+			r.logf("Container %s does not exist", container)
 			return false, nil
 		}
 		return false, fmt.Errorf("docker inspect failed: %w: %s", err, outputStr)
@@ -151,7 +151,7 @@ func (r *Runner) InspectRunning(ctx context.Context, container string) (bool, er
 	outputStr := strings.TrimSpace(string(output))
 	isRunning := outputStr == "true"
 
-	r.Logger.Printf("Container %s running status: %v", container, isRunning)
+	r.logf("Container %s running status: %v", container, isRunning)
 	return isRunning, nil
 }
 
@@ -211,13 +211,20 @@ func (r *Runner) PrunePayramImages(ctx context.Context, imageRepo string, keepTa
 		rmiCmd := exec.CommandContext(ctx, r.DockerBin, rmiArgs...)
 		rmiOutput, rmiErr := rmiCmd.CombinedOutput()
 		if rmiErr != nil {
-			r.Logger.Printf("Warning: failed to remove image %s: %v: %s", ref, rmiErr, strings.TrimSpace(string(rmiOutput)))
+			r.logf("Warning: failed to remove image %s: %v: %s", ref, rmiErr, strings.TrimSpace(string(rmiOutput)))
 			continue
 		}
-		r.Logger.Printf("Removed old image: %s", ref)
+		r.logf("Removed old image: %s", ref)
 	}
 
 	return nil
+}
+
+// logf logs a formatted message if a logger is available.
+func (r *Runner) logf(format string, args ...interface{}) {
+	if r.Logger != nil {
+		r.Logger.Printf(format, args...)
+	}
 }
 
 // logCommand logs the docker command being executed.

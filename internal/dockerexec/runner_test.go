@@ -318,6 +318,26 @@ func TestLogger(t *testing.T) {
 	}
 }
 
+// TestNilLogger verifies Runner methods do not panic when Logger is nil.
+// This is critical because some call sites (e.g., daemon.go init check)
+// create Runner without a Logger.
+func TestNilLogger(t *testing.T) {
+	runner := &Runner{
+		DockerBin: "docker",
+		Logger:    nil, // explicitly nil
+	}
+
+	// These should not panic - they just skip logging
+	runner.logCommand([]string{"test", "args"})
+	runner.logf("test format %s", "value")
+
+	// The runner should still work for inspection (will fail if docker not available,
+	// but should not panic due to nil Logger)
+	if runner.Logger != nil {
+		t.Error("Logger should be nil for this test")
+	}
+}
+
 // TestRunner_Structure tests the Runner struct structure.
 func TestRunner_Structure(t *testing.T) {
 	logger := &mockLogger{}
