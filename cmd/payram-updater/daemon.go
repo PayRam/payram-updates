@@ -15,6 +15,7 @@ import (
 	"github.com/payram/payram-updater/internal/autoupdate"
 	"github.com/payram/payram-updater/internal/config"
 	"github.com/payram/payram-updater/internal/container"
+	"github.com/payram/payram-updater/internal/dockerexec"
 	internalhttp "github.com/payram/payram-updater/internal/http"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/logger"
@@ -181,6 +182,26 @@ func checkPayramContainer(cfg *config.Config) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	runner := &dockerexec.Runner{DockerBin: cfg.DockerBin}
+
+	// Resolution order matches the upgrade flow:
+	// 1. TARGET_CONTAINER_NAME env var (explicitly configured)
+	// 2. Default container name "payram" (matches manifest container_name)
+	// 3. Semver-based discovery (fallback for edge cases)
+	candidateNames := []string{}
+	if cfg.TargetContainerName != "" {
+		candidateNames = append(candidateNames, cfg.TargetContainerName)
+	}
+	candidateNames = append(candidateNames, "payram") // manifest default
+
+	for _, name := range candidateNames {
+		running, err := runner.InspectRunning(ctx, name)
+		if err == nil && running {
+			return nil // Found a running container
+		}
+	}
+
+	// Fallback: semver-based discovery for non-standard setups
 	imagePattern := "payramapp/payram:"
 	if cfg.ImageRepoOverride != "" {
 		imagePattern = cfg.ImageRepoOverride + ":"
