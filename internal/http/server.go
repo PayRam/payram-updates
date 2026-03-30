@@ -40,14 +40,19 @@ func discoverCoreBaseURL(dockerBin string, imagePattern string) (string, error) 
 		return "", fmt.Errorf("failed to discover Payram container: %w", err)
 	}
 
-	// Step 2: Extract runtime state to get ports
+	return discoverCoreBaseURLByName(ctx, dockerBin, discovered.Name)
+}
+
+// discoverCoreBaseURLByName discovers the Payram Core base URL for a specific container.
+func discoverCoreBaseURLByName(ctx context.Context, dockerBin string, containerName string) (string, error) {
+	// Extract runtime state to get ports
 	inspector := container.NewInspector(dockerBin, logger.StdLogger())
-	runtimeState, err := inspector.ExtractRuntimeState(ctx, discovered.Name)
+	runtimeState, err := inspector.ExtractRuntimeState(ctx, containerName)
 	if err != nil {
 		return "", fmt.Errorf("failed to extract runtime state: %w", err)
 	}
 
-	// Step 3: Identify which port serves Payram Core
+	// Identify which port serves Payram Core
 	identifier := container.NewPortIdentifier(logger.StdLogger())
 	identifiedPort, err := identifier.IdentifyPayramCorePort(ctx, runtimeState)
 	if err != nil {
@@ -87,24 +92,54 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 	if cfg.ImageRepoOverride != "" {
 		imagePattern = cfg.ImageRepoOverride + ":"
 	}
-	coreBaseURL, err := discoverCoreBaseURL(cfg.DockerBin, imagePattern)
-	if err != nil {
-		logger.Error("Server", "New", err)
-		logger.Warnf("Server", "New", "Falling back to http://127.0.0.1:8080 (this may not work if Payram Core is on a different port)")
-		coreBaseURL = "http://127.0.0.1:8080"
+
+	var coreBaseURL string
+	var err error
+	if cfg.TargetContainerName != "" {
+		// Use explicit container name if set
+		coreBaseURL, err = discoverCoreBaseURLByName(context.Background(), cfg.DockerBin, cfg.TargetContainerName)
+		if err != nil {
+			logger.Error("Server", "New", err)
+			logger.Warnf("Server", "New", "Falling back to http://127.0.0.1:8080 (this may not work if Payram Core is on a different port)")
+			coreBaseURL = "http://127.0.0.1:8080"
+		} else {
+			logger.Infof("Server", "New", "Discovered Payram Core at: %s (from TARGET_CONTAINER_NAME=%s)", coreBaseURL, cfg.TargetContainerName)
+		}
 	} else {
-		logger.Infof("Server", "New", "Discovered Payram Core at: %s", coreBaseURL)
+		// Fall back to semver-based discovery
+		coreBaseURL, err = discoverCoreBaseURL(cfg.DockerBin, imagePattern)
+		if err != nil {
+			logger.Error("Server", "New", err)
+			logger.Warnf("Server", "New", "Falling back to http://127.0.0.1:8080 (this may not work if Payram Core is on a different port)")
+			coreBaseURL = "http://127.0.0.1:8080"
+		} else {
+			logger.Infof("Server", "New", "Discovered Payram Core at: %s", coreBaseURL)
+		}
 	}
 
 	// Discover Payram container IP for access control
 	logger.Infof("Server", "New", "Discovering Payram container IP for access control...")
-	payramContainerIP, err := network.GetPayramContainerIP(cfg.DockerBin, imagePattern)
-	if err != nil {
-		logger.Error("Server", "New", err)
-		logger.Warnf("Server", "New", "API access will be restricted to localhost only")
-		payramContainerIP = ""
+	var payramContainerIP string
+	if cfg.TargetContainerName != "" {
+		// Use explicit container name if set
+		payramContainerIP, err = network.GetContainerIPByName(cfg.DockerBin, cfg.TargetContainerName)
+		if err != nil {
+			logger.Error("Server", "New", err)
+			logger.Warnf("Server", "New", "API access will be restricted to localhost only")
+			payramContainerIP = ""
+		} else {
+			logger.Infof("Server", "New", "Payram container IP: %s (from TARGET_CONTAINER_NAME=%s)", payramContainerIP, cfg.TargetContainerName)
+		}
 	} else {
-		logger.Infof("Server", "New", "Payram container IP: %s (API access restricted to localhost and this container)", payramContainerIP)
+		// Fall back to semver-based discovery
+		payramContainerIP, err = network.GetPayramContainerIP(cfg.DockerBin, imagePattern)
+		if err != nil {
+			logger.Error("Server", "New", err)
+			logger.Warnf("Server", "New", "API access will be restricted to localhost only")
+			payramContainerIP = ""
+		} else {
+			logger.Infof("Server", "New", "Payram container IP: %s (API access restricted to localhost and this container)", payramContainerIP)
+		}
 	}
 
 	// Create core API client

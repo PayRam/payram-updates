@@ -47,19 +47,32 @@ func GetPayramContainerIP(dockerBin string, imagePattern string) (string, error)
 		return "", fmt.Errorf("failed to discover Payram container: %w", err)
 	}
 
-	// Step 2: Inspect the container to read network IPs
+	return getContainerIP(ctx, dockerBin, discovered.Name)
+}
+
+// GetContainerIPByName retrieves the IP address of a container by name.
+// This is used when TARGET_CONTAINER_NAME is set.
+func GetContainerIPByName(dockerBin string, containerName string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	return getContainerIP(ctx, dockerBin, containerName)
+}
+
+// getContainerIP inspects a container and returns its IP address.
+func getContainerIP(ctx context.Context, dockerBin string, containerName string) (string, error) {
 	inspector := container.NewInspector(dockerBin, logger.StdLogger())
-	runtimeState, err := inspector.ExtractRuntimeState(ctx, discovered.Name)
+	runtimeState, err := inspector.ExtractRuntimeState(ctx, containerName)
 	if err != nil {
-		return "", fmt.Errorf("failed to inspect Payram container %s: %w", discovered.Name, err)
+		return "", fmt.Errorf("failed to inspect container %s: %w", containerName, err)
 	}
 
-	// Step 3: Choose the first non-empty IP from the container networks
+	// Choose the first non-empty IP from the container networks
 	for _, network := range runtimeState.Networks {
 		if strings.TrimSpace(network.IPAddress) != "" {
 			return strings.TrimSpace(network.IPAddress), nil
 		}
 	}
 
-	return "", fmt.Errorf("Payram container %s has no IP address in any network", discovered.Name)
+	return "", fmt.Errorf("container %s has no IP address in any network", containerName)
 }
