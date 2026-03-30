@@ -222,5 +222,7 @@ func (r *Runner) PrunePayramImages(ctx context.Context, imageRepo string, keepTa
 
 // logCommand logs the docker command being executed.
 func (r *Runner) logCommand(args []string) {
-	r.Logger.Printf("Executing: %s %s", r.DockerBin, strings.Join(args, " "))
+	if r.Logger != nil {
+		r.Logger.Printf("Executing: %s %s", r.DockerBin, strings.Join(args, " "))
+	}
 }
