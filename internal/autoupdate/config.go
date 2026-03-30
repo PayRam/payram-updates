@@ -15,7 +15,7 @@ type Settings struct {
 }
 
 // DefaultStateDir is the default location for updater state.
-const DefaultStateDir = "/var/lib/payram"
+const DefaultStateDir = "/var/lib/payram-updater"
 
 // DefaultPath returns the default path for auto update configuration.
 // Uses STATE_DIR env var if set, otherwise falls back to /var/lib/payram.

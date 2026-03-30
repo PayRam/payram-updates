@@ -36,7 +36,7 @@ SERVICE_PATH="/etc/systemd/system/payram-updater.service"
 ENV_PATH="/etc/payram/updater.env"
 STATE_DIR="/var/lib/payram-updater"
 BACKUP_DIR="/var/lib/payram/backups"
-ROOT_CONFIG="/root/.payram-updates.config"
+INIT_CONFIG="$STATE_DIR/updater-config.json"
 
 # Check if running interactively
 if [[ -t 0 ]]; then
@@ -305,7 +305,7 @@ EOF
 fi
 
 log "Checking initialization status..."
-if sudo test -f "$ROOT_CONFIG" && sudo grep -q '"initialized": true' "$ROOT_CONFIG"; then
+if sudo test -f "$INIT_CONFIG" && sudo grep -q '"initialized": true' "$INIT_CONFIG"; then
   log "Updater already initialized"
   
   if [[ "$FORCE_REINSTALL" == "true" ]]; then
