@@ -380,7 +380,7 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	}
 
 	s.jobStore.AppendLog(fmt.Sprintf("Starting auto update job %s: mode=%s target=%s source=AUTO", jobID, "DASHBOARD", plan.RequestedTarget))
-	go s.executeUpgrade(job, plan.Manifest)
+	go s.executeUpgrade(job, plan.Manifest, plan.ArchSupport)
 }
 
 // executeUpgrade runs the upgrade execution in the background.
@@ -405,7 +405,7 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 // ALL FAILURE CODES HAVE RECOVERY PLAYBOOKS:
 // See internal/recovery/playbook.go for complete recovery instructions.
 // Every failure includes next steps for manual recovery.
-func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) {
+func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest, archSupport map[string]string) {
 	ctx := context.Background()
 	isDryRun := s.config.ExecutionMode == "dry-run"
 	imageTag := job.ResolvedTarget
@@ -470,8 +470,9 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest) 
 		return
 	}
 
-	// Phase 2: Prepare upgrade arguments (extract runtime state & build docker args)
-	dockerArgs, ok := s.prepareUpgradeArgs(ctx, job, containerName, manifestData, imageTag)
+	// Phase 2: Prepare upgrade arguments (extract runtime state & build docker args).
+	// Also applies arch suffix from current container tag (e.g. 1.9.3 → 1.9.3-arm64).
+	dockerArgs, imageTag, ok := s.prepareUpgradeArgs(ctx, job, containerName, manifestData, imageTag, archSupport)
 	if !ok {
 		return
 	}

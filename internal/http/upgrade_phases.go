@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/go-version"
 	"github.com/payram/payram-updater/internal/backup"
 	"github.com/payram/payram-updater/internal/container"
 	"github.com/payram/payram-updater/internal/coreclient"
@@ -71,7 +72,32 @@ func (s *Server) resolveTargetContainer(ctx context.Context, job *jobs.Job, mani
 
 // prepareUpgradeArgs extracts runtime state and builds docker run arguments.
 // Returns docker args or fails the job with appropriate error code.
-func (s *Server) prepareUpgradeArgs(ctx context.Context, job *jobs.Job, containerName string, manifestData *manifest.Manifest, imageTag string) ([]string, bool) {
+// knownArchSuffixes are the only tag suffixes treated as architecture variants.
+var knownArchSuffixes = []string{"-arm64"}
+
+// archSuffixFromTag returns the architecture suffix from a container image tag
+// if it matches a known arch variant, otherwise returns "".
+// e.g. "1.9.1-arm64" → "-arm64", "1.9.1" → "", "1.9.1-beta" → ""
+func archSuffixFromTag(tag string) string {
+	for _, suffix := range knownArchSuffixes {
+		if strings.HasSuffix(tag, suffix) {
+			return suffix
+		}
+	}
+	return ""
+}
+
+// baseVersionTag strips any architecture suffix from an image tag, returning
+// only the semver portion used for version comparisons.
+// e.g. "1.9.3-arm64" → "1.9.3", "1.9.3" → "1.9.3"
+func baseVersionTag(tag string) string {
+	if idx := strings.Index(tag, "-"); idx != -1 {
+		return tag[:idx]
+	}
+	return tag
+}
+
+func (s *Server) prepareUpgradeArgs(ctx context.Context, job *jobs.Job, containerName string, manifestData *manifest.Manifest, imageTag string, archSupport map[string]string) ([]string, string, bool) {
 	s.jobStore.AppendLog("Extracting runtime state from container...")
 	inspector := container.NewInspector(s.config.DockerBin, logger.StdLogger())
 	runtimeState, err := inspector.ExtractRuntimeState(ctx, containerName)
@@ -82,10 +108,32 @@ func (s *Server) prepareUpgradeArgs(ctx context.Context, job *jobs.Job, containe
 		job.UpdatedAt = time.Now().UTC()
 		s.jobStore.Save(job)
 		s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s (container not modified)", job.FailureCode, job.Message))
-		return nil, false
+		return nil, "", false
 	}
 	s.jobStore.AppendLog(fmt.Sprintf("Runtime state extracted: %d ports, %d mounts, %d env vars",
 		len(runtimeState.Ports), len(runtimeState.Mounts), len(runtimeState.Env)))
+
+	// Detect architecture suffix from the currently running container and apply
+	// it to the target tag — but only if the target version meets the minimum
+	// version for that arch variant as declared in the policy arch_support field.
+	// e.g. current=1.9.1-arm64 + target=1.9.3 → 1.9.3-arm64 (if arm64 min is 1.9.1)
+	if suffix := archSuffixFromTag(runtimeState.ImageTag); suffix != "" {
+		archKey := strings.TrimPrefix(suffix, "-") // "-arm64" → "arm64"
+		minVersion, hasMin := archSupport[archKey]
+		applySuffix := true
+		if hasMin && minVersion != "" {
+			targetV, err1 := version.NewVersion(baseVersionTag(imageTag))
+			minV, err2 := version.NewVersion(minVersion)
+			if err1 != nil || err2 != nil || targetV.LessThan(minV) {
+				applySuffix = false
+				s.jobStore.AppendLog(fmt.Sprintf("Arch suffix %s not applied: target %s is below minimum %s for this variant", suffix, imageTag, minVersion))
+			}
+		}
+		if applySuffix {
+			imageTag = imageTag + suffix
+			s.jobStore.AppendLog(fmt.Sprintf("Arch suffix detected from running container: target image tag adjusted to %s", imageTag))
+		}
+	}
 
 	// Build docker run arguments from runtime state + manifest overlays
 	builder := container.NewDockerRunBuilder(logger.StdLogger())
@@ -97,10 +145,10 @@ func (s *Server) prepareUpgradeArgs(ctx context.Context, job *jobs.Job, containe
 		job.UpdatedAt = time.Now().UTC()
 		s.jobStore.Save(job)
 		s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s (container not modified)", job.FailureCode, job.Message))
-		return nil, false
+		return nil, "", false
 	}
 	s.jobStore.AppendLog("Docker run arguments built successfully (runtime parity preserved)")
-	return dockerArgs, true
+	return dockerArgs, imageTag, true
 }
 
 // executeDryRun logs planned upgrade steps and completes the job in dry-run mode.
@@ -707,7 +755,7 @@ func (s *Server) verifyUpgrade(ctx context.Context, job *jobs.Job, containerName
 	job.UpdatedAt = time.Now().UTC()
 	s.jobStore.Save(job)
 
-	useLegacyHealth := s.shouldUseLegacyForTarget(policyInitVersion, imageTag)
+	useLegacyHealth := s.shouldUseLegacyForTarget(policyInitVersion, baseVersionTag(imageTag))
 	if useLegacyHealth {
 		s.jobStore.AppendLog("Verifying legacy health endpoint (6 retries, 2s apart)...")
 	} else {
@@ -805,7 +853,7 @@ func (s *Server) verifyUpgrade(ctx context.Context, job *jobs.Job, containerName
 		return false
 	}
 
-	if versionResp.Version != imageTag {
+	if versionResp.Version != baseVersionTag(imageTag) {
 		job.State = jobs.JobStateFailed
 		job.FailureCode = "VERSION_MISMATCH"
 		job.Message = fmt.Sprintf("Version mismatch: expected %s, got %s", imageTag, versionResp.Version)

@@ -20,6 +20,7 @@ type UpgradePlan struct {
 	FailureCode     string             `json:"failureCode,omitempty"`
 	Message         string             `json:"message"`
 	Manifest        *manifest.Manifest `json:"manifest,omitempty"`
+	ArchSupport     map[string]string  `json:"-"` // arch variant min versions, not serialized
 
 	// Internal fields (not serialized)
 	policyData *policy.Policy
@@ -124,6 +125,11 @@ func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTa
 	plan.ResolvedTarget = resolvedTarget
 	plan.State = jobs.JobStateReady
 	plan.Message = "Upgrade plan validated successfully"
+
+	// Carry arch_support from policy so executeUpgrade can guard arch-specific tags
+	if policyData != nil && len(policyData.ArchSupport) > 0 {
+		plan.ArchSupport = policyData.ArchSupport
+	}
 
 	return plan
 }

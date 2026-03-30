@@ -552,8 +552,7 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 			jobID, mode, req.RequestedTarget, plan.ResolvedTarget, source))
 
 		// Launch background execution goroutine
-		go s.executeUpgrade(job, plan.Manifest)
-
+			go s.executeUpgrade(job, plan.Manifest, plan.ArchSupport)
 		// Return response
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)

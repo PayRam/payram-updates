@@ -195,8 +195,8 @@ if [[ -f "$ENV_PATH" ]]; then
     log "Creating new environment file at $ENV_PATH..."
     sudo tee "$ENV_PATH" >/dev/null <<EOF
 # Payram Updater configuration
-POLICY_URL=${POLICY_URL:-https://raw.githubusercontent.com/PayRam/payram-scripts/refs/heads/feat-updater-configs/updater-configs/upgrade-policy.json}
-RUNTIME_MANIFEST_URL=${RUNTIME_MANIFEST_URL:-https://raw.githubusercontent.com/PayRam/payram-scripts/refs/heads/feat-updater-configs/updater-configs/runtime-manifest.json}
+POLICY_URL=${POLICY_URL:-https://raw.githubusercontent.com/PayRam/payram-scripts/refs/heads/main/updater-configs/upgrade-policy.json}
+RUNTIME_MANIFEST_URL=${RUNTIME_MANIFEST_URL:-https://raw.githubusercontent.com/PayRam/payram-scripts/refs/heads/main/updater-configs/runtime-manifest.json}
 FETCH_TIMEOUT_SECONDS=${FETCH_TIMEOUT_SECONDS:-10}
 STATE_DIR=${STATE_DIR}
 BACKUP_DIR=${BACKUP_DIR}
@@ -215,8 +215,8 @@ else
   log "Creating environment file at $ENV_PATH..."
   sudo tee "$ENV_PATH" >/dev/null <<EOF
 # Payram Updater configuration
-POLICY_URL=${POLICY_URL:-https://raw.githubusercontent.com/PayRam/payram-scripts/refs/heads/feat-updater-configs/updater-configs/upgrade-policy.json}
-RUNTIME_MANIFEST_URL=${RUNTIME_MANIFEST_URL:-https://raw.githubusercontent.com/PayRam/payram-scripts/refs/heads/feat-updater-configs/updater-configs/runtime-manifest.json}
+POLICY_URL=${POLICY_URL:-https://raw.githubusercontent.com/PayRam/payram-scripts/refs/heads/main/updater-configs/upgrade-policy.json}
+RUNTIME_MANIFEST_URL=${RUNTIME_MANIFEST_URL:-https://raw.githubusercontent.com/PayRam/payram-scripts/refs/heads/main/updater-configs/runtime-manifest.json}
 FETCH_TIMEOUT_SECONDS=${FETCH_TIMEOUT_SECONDS:-10}
 STATE_DIR=${STATE_DIR}
 BACKUP_DIR=${BACKUP_DIR}
