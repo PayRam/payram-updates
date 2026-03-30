@@ -352,6 +352,37 @@ if [[ "$ENABLE_SERVICE" == "true" ]]; then
 
   log "Restarting payram-updater service..."
   sudo systemctl restart payram-updater
+
+  # Test container-to-updater connectivity if a target container is configured
+  sleep 2  # Give service time to start
+  TARGET_CONTAINER="${TARGET_CONTAINER_NAME:-}"
+  if [[ -z "$TARGET_CONTAINER" ]] && [[ -f "$ENV_PATH" ]]; then
+    TARGET_CONTAINER=$(grep -E "^TARGET_CONTAINER_NAME=" "$ENV_PATH" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+  fi
+
+  if [[ -n "$TARGET_CONTAINER" ]] && docker ps --format "{{.Names}}" | grep -q "^${TARGET_CONTAINER}$"; then
+    log "Testing container-to-updater connectivity..."
+    # Try wget first, then curl
+    if docker exec "$TARGET_CONTAINER" timeout 3 wget -qO- http://172.17.0.1:${UPDATER_PORT:-2567}/health >/dev/null 2>&1 || \
+       docker exec "$TARGET_CONTAINER" timeout 3 curl -sf http://172.17.0.1:${UPDATER_PORT:-2567}/health >/dev/null 2>&1; then
+      log "Connectivity test passed"
+    else
+      log ""
+      log "WARNING: Container cannot reach the updater API."
+      log "This is usually caused by firewall rules blocking docker0 traffic."
+      log ""
+      log "To fix, run ONE of the following based on your firewall:"
+      if command -v ufw >/dev/null 2>&1; then
+        log "  UFW:       sudo ufw allow in on docker0 to any port ${UPDATER_PORT:-2567}"
+      fi
+      if command -v firewall-cmd >/dev/null 2>&1; then
+        log "  firewalld: sudo firewall-cmd --zone=docker --add-port=${UPDATER_PORT:-2567}/tcp --permanent && sudo firewall-cmd --reload"
+      fi
+      log "  iptables:  sudo iptables -I INPUT -i docker0 -p tcp --dport ${UPDATER_PORT:-2567} -j ACCEPT"
+      log ""
+      log "See troubleshooting docs for more details."
+    fi
+  fi
 else
   log "Service installed but NOT started (ENABLE_SERVICE is not set)."
   log "To enable and start the service, run:"
