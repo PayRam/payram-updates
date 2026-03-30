@@ -9,7 +9,7 @@
 #   Custom port:          curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | UPDATER_PORT=3000 bash
 #   Debug mode:           curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | DEBUG_VERSION_MODE=true bash
 #   Quiet mode:           curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | QUIET=true bash
-#   With auto-start:      curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | ENABLE_SERVICE=true bash
+#   Without auto-start:   curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | ENABLE_SERVICE=false bash
 #
 # Environment Variables (optional):
 #   UPDATER_PORT              - API port (default: 2567)
@@ -24,7 +24,7 @@
 #   PAYRAM_UPDATER_SHA256      - Provide checksum directly (skips checksum download)
 #   FORCE_REINSTALL           - Skip all prompts and reinstall (default: false)
 #   QUIET                     - Suppress all log output (default: false)
-#   ENABLE_SERVICE            - Enable and start the systemd service after install (default: false)
+#   ENABLE_SERVICE            - Enable and start the systemd service after install (default: true)
 #
 set -euo pipefail
 
@@ -48,7 +48,7 @@ fi
 # Force reinstall mode (set FORCE_REINSTALL=true to skip prompts)
 FORCE_REINSTALL="${FORCE_REINSTALL:-false}"
 QUIET="${QUIET:-false}"
-ENABLE_SERVICE="${ENABLE_SERVICE:-false}"
+ENABLE_SERVICE="${ENABLE_SERVICE:-true}"
 
 log() {
   if [[ "$QUIET" != "true" ]]; then
