@@ -27,6 +27,8 @@ jobs:
           cd bin/release
           sha256sum payram-updater-linux-amd64 > payram-updater-linux-amd64.sha256
           sha256sum payram-updater-linux-arm64 > payram-updater-linux-arm64.sha256
+          sha256sum payram-updater-darwin-amd64 > payram-updater-darwin-amd64.sha256
+          sha256sum payram-updater-darwin-arm64 > payram-updater-darwin-arm64.sha256
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
@@ -34,5 +36,9 @@ jobs:
           files: |
             bin/release/payram-updater-linux-amd64
             bin/release/payram-updater-linux-arm64
+            bin/release/payram-updater-darwin-amd64
+            bin/release/payram-updater-darwin-arm64
             bin/release/payram-updater-linux-amd64.sha256
             bin/release/payram-updater-linux-arm64.sha256
+            bin/release/payram-updater-darwin-amd64.sha256
+            bin/release/payram-updater-darwin-arm64.sha256

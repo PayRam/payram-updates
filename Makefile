@@ -88,6 +88,10 @@ build-release: ## Build release binaries for all platforms
 	@GOOS=linux GOARCH=amd64 $(GO) build -o $(BUILD_DIR)/release/$(BINARY_NAME)-linux-amd64 $(MAIN_PATH)
 	@echo "Building for Linux ARM64..."
 	@GOOS=linux GOARCH=arm64 $(GO) build -o $(BUILD_DIR)/release/$(BINARY_NAME)-linux-arm64 $(MAIN_PATH)
+	@echo "Building for macOS AMD64..."
+	@GOOS=darwin GOARCH=amd64 $(GO) build -o $(BUILD_DIR)/release/$(BINARY_NAME)-darwin-amd64 $(MAIN_PATH)
+	@echo "Building for macOS ARM64 (Apple Silicon)..."
+	@GOOS=darwin GOARCH=arm64 $(GO) build -o $(BUILD_DIR)/release/$(BINARY_NAME)-darwin-arm64 $(MAIN_PATH)
 	@echo "Release binaries built in $(BUILD_DIR)/release/"
 	@ls -lh $(BUILD_DIR)/release/
 

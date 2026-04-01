@@ -10,6 +10,8 @@
 #   Debug mode:           curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | DEBUG_VERSION_MODE=true bash
 #   Quiet mode:           curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | QUIET=true bash
 #   Without auto-start:   curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | ENABLE_SERVICE=false bash
+#   Uninstall:            curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | bash -s -- --uninstall
+#   Uninstall (no prompt): curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | bash -s -- --uninstall --yes
 #
 # Environment Variables (optional):
 #   UPDATER_PORT              - API port (default: 2567)
@@ -32,11 +34,29 @@ REPO_OWNER="PayRam"
 REPO_NAME="payram-updates"
 BIN_NAME="payram-updater"
 INSTALL_DIR="/usr/local/bin"
-SERVICE_PATH="/etc/systemd/system/payram-updater.service"
+# SERVICE_PATH set after OS detection
 ENV_PATH="/etc/payram/updater.env"
 STATE_DIR="/var/lib/payram-updater"
 BACKUP_DIR="/var/lib/payram/backups"
 INIT_CONFIG="$STATE_DIR/updater-config.json"
+
+# Detect OS early for path setup
+OS_RAW="$(uname -s)"
+case "$OS_RAW" in
+  Linux)
+    OS="linux"
+    SERVICE_PATH="/etc/systemd/system/payram-updater.service"
+    ;;
+  Darwin)
+    OS="darwin"
+    SERVICE_PATH="/Library/LaunchDaemons/com.payram.updater.plist"
+    ;;
+  *)
+    echo "ERROR: Unsupported operating system: $OS_RAW"
+    echo "PayRam Updater supports Linux and macOS."
+    exit 1
+    ;;
+esac
 
 # Check if running interactively
 if [[ -t 0 ]]; then
@@ -49,6 +69,30 @@ fi
 FORCE_REINSTALL="${FORCE_REINSTALL:-false}"
 QUIET="${QUIET:-false}"
 ENABLE_SERVICE="${ENABLE_SERVICE:-true}"
+
+# Parse command line arguments
+UNINSTALL_MODE=false
+UNINSTALL_YES=false
+REMOVE_BACKUPS=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --uninstall)
+      UNINSTALL_MODE=true
+      shift
+      ;;
+    --yes|-y)
+      UNINSTALL_YES=true
+      shift
+      ;;
+    --remove-backups)
+      REMOVE_BACKUPS=true
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
 
 log() {
   if [[ "$QUIET" != "true" ]]; then
@@ -63,14 +107,147 @@ require() {
   fi
 }
 
+# Uninstall function
+do_uninstall() {
+  log "Starting PayRam Updater uninstall..."
+  
+  # Confirmation prompt
+  if [[ "$UNINSTALL_YES" != "true" ]]; then
+    if [[ "$INTERACTIVE" == "true" ]]; then
+      echo ""
+      echo "This will remove:"
+      echo "  - Binary: ${INSTALL_DIR}/${BIN_NAME}"
+      echo "  - Service: ${SERVICE_PATH}"
+      echo "  - Config: ${ENV_PATH}"
+      echo "  - State: ${STATE_DIR}"
+      if [[ "$REMOVE_BACKUPS" == "true" ]]; then
+        echo "  - Backups: ${BACKUP_DIR}"
+      else
+        echo "  - Backups will be PRESERVED at: ${BACKUP_DIR}"
+      fi
+      echo ""
+      read -p "Are you sure you want to uninstall? [y/N]: " CONFIRM
+      if [[ ! "$CONFIRM" =~ ^[Yy] ]]; then
+        log "Uninstall cancelled"
+        exit 0
+      fi
+    else
+      log "ERROR: Non-interactive uninstall requires --yes flag"
+      log "Usage: ... | bash -s -- --uninstall --yes"
+      exit 1
+    fi
+  fi
+  
+  # Stop and disable service
+  if [[ "$OS" == "linux" ]]; then
+    if systemctl is-active --quiet payram-updater 2>/dev/null; then
+      log "Stopping payram-updater service..."
+      sudo systemctl stop payram-updater
+    fi
+    
+    if systemctl is-enabled --quiet payram-updater 2>/dev/null; then
+      log "Disabling payram-updater service..."
+      sudo systemctl disable payram-updater
+    fi
+    
+    # Remove service file
+    if [[ -f "$SERVICE_PATH" ]]; then
+      log "Removing service file: $SERVICE_PATH"
+      sudo rm -f "$SERVICE_PATH"
+      sudo systemctl daemon-reload
+    fi
+  elif [[ "$OS" == "darwin" ]]; then
+    if sudo launchctl list com.payram.updater >/dev/null 2>&1; then
+      log "Stopping payram-updater service..."
+      sudo launchctl unload "$SERVICE_PATH" 2>/dev/null || true
+    fi
+    
+    # Remove plist file
+    if [[ -f "$SERVICE_PATH" ]]; then
+      log "Removing service file: $SERVICE_PATH"
+      sudo rm -f "$SERVICE_PATH"
+    fi
+    
+    # Remove launcher script
+    if [[ -f "/usr/local/bin/payram-updater-launcher" ]]; then
+      log "Removing launcher script: /usr/local/bin/payram-updater-launcher"
+      sudo rm -f "/usr/local/bin/payram-updater-launcher"
+    fi
+  fi
+  
+  # Remove binary
+  if [[ -f "${INSTALL_DIR}/${BIN_NAME}" ]]; then
+    log "Removing binary: ${INSTALL_DIR}/${BIN_NAME}"
+    sudo rm -f "${INSTALL_DIR}/${BIN_NAME}"
+  fi
+  
+  # Remove config
+  if [[ -f "$ENV_PATH" ]]; then
+    log "Removing config: $ENV_PATH"
+    sudo rm -f "$ENV_PATH"
+  fi
+  
+  # Remove /etc/payram if empty
+  if [[ -d "/etc/payram" ]] && [[ -z "$(ls -A /etc/payram 2>/dev/null)" ]]; then
+    log "Removing empty config directory: /etc/payram"
+    sudo rmdir /etc/payram
+  fi
+  
+  # Remove state directory
+  if [[ -d "$STATE_DIR" ]]; then
+    log "Removing state directory: $STATE_DIR"
+    sudo rm -rf "$STATE_DIR"
+  fi
+  
+  # Remove backups if requested
+  if [[ "$REMOVE_BACKUPS" == "true" ]]; then
+    if [[ -d "$BACKUP_DIR" ]]; then
+      log "Removing backups directory: $BACKUP_DIR"
+      sudo rm -rf "$BACKUP_DIR"
+    fi
+    # Remove /var/lib/payram if empty
+    if [[ -d "/var/lib/payram" ]] && [[ -z "$(ls -A /var/lib/payram 2>/dev/null)" ]]; then
+      log "Removing empty directory: /var/lib/payram"
+      sudo rmdir /var/lib/payram
+    fi
+  else
+    if [[ -d "$BACKUP_DIR" ]]; then
+      log "Backups preserved at: $BACKUP_DIR"
+    fi
+  fi
+  
+  # Remove iptables rule if it exists (Linux only)
+  if [[ "$OS" == "linux" ]] && sudo iptables -C INPUT -i docker0 -p tcp --dport 2567 -j ACCEPT 2>/dev/null; then
+    log "Removing iptables rule for docker0..."
+    sudo iptables -D INPUT -i docker0 -p tcp --dport 2567 -j ACCEPT || true
+  fi
+  
+  log ""
+  log "Uninstall complete!"
+  log ""
+  if [[ "$OS" == "linux" ]]; then
+    log "Note: If you added firewall rules manually (ufw/firewalld), you may want to remove them:"
+    log "  UFW:       sudo ufw delete allow in on docker0 to any port 2567"
+    log "  firewalld: sudo firewall-cmd --zone=docker --remove-port=2567/tcp --permanent"
+  fi
+  exit 0
+}
+
+# Handle uninstall mode
+if [[ "$UNINSTALL_MODE" == "true" ]]; then
+  do_uninstall
+fi
+
 log "Starting PayRam Updater setup..."
 
 log "Checking dependencies..."
 require curl
 require sudo
 
+log "Detecting operating system..."
+log "Detected OS: $OS"
+
 log "Detecting system architecture..."
-OS="linux"
 ARCH_RAW="$(uname -m)"
 case "$ARCH_RAW" in
   x86_64|amd64) ARCH="amd64" ;;
@@ -230,52 +407,8 @@ EOF
   log "Environment file created"
 fi
 
-if [[ -f "$SERVICE_PATH" ]]; then
-  log "Systemd service already exists: $SERVICE_PATH"
-  
-  if [[ "$FORCE_REINSTALL" == "true" ]]; then
-    log "Force reinstall mode - overriding service file"
-    OVERRIDE_SERVICE="y"
-  elif [[ "$INTERACTIVE" == "true" ]]; then
-    read -p "Override existing service file? [y/N]: " OVERRIDE_SERVICE
-  else
-    log "Non-interactive mode - keeping existing service file"
-    OVERRIDE_SERVICE="n"
-  fi
-  
-  if [[ "$OVERRIDE_SERVICE" =~ ^[Yy] ]]; then
-    log "Installing systemd service at $SERVICE_PATH..."
-    sudo tee "$SERVICE_PATH" >/dev/null <<'EOF'
-[Unit]
-Description=Payram Updater Service
-Documentation=https://github.com/payram/payram-updater
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-Group=root
-EnvironmentFile=/etc/payram/updater.env
-ExecStart=/usr/local/bin/payram-updater serve
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=payram-updater
-
-# Security hardening
-NoNewPrivileges=false
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    log "Systemd service installed"
-  else
-    log "Using existing service file"
-  fi
-else
-  log "Installing systemd service at $SERVICE_PATH..."
+# Helper functions for service installation
+install_systemd_service() {
   sudo tee "$SERVICE_PATH" >/dev/null <<'EOF'
 [Unit]
 Description=Payram Updater Service
@@ -301,7 +434,81 @@ NoNewPrivileges=false
 [Install]
 WantedBy=multi-user.target
 EOF
-  log "Systemd service installed"
+}
+
+install_launchd_service() {
+  # Create a simple wrapper script that sources the env file
+  sudo tee /usr/local/bin/payram-updater-launcher >/dev/null <<'WRAPPER'
+#!/bin/bash
+set -a
+source /etc/payram/updater.env
+set +a
+exec /usr/local/bin/payram-updater serve
+WRAPPER
+  sudo chmod +x /usr/local/bin/payram-updater-launcher
+  
+  # Simple plist that just runs the wrapper
+  sudo tee "$SERVICE_PATH" >/dev/null <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.payram.updater</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/payram-updater-launcher</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/payram-updater.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/payram-updater.error.log</string>
+</dict>
+</plist>
+EOF
+}
+
+SERVICE_TYPE_NAME="service"
+if [[ "$OS" == "darwin" ]]; then
+  SERVICE_TYPE_NAME="launchd plist"
+fi
+
+if [[ -f "$SERVICE_PATH" ]]; then
+  log "Service file already exists: $SERVICE_PATH"
+  
+  if [[ "$FORCE_REINSTALL" == "true" ]]; then
+    log "Force reinstall mode - overriding service file"
+    OVERRIDE_SERVICE="y"
+  elif [[ "$INTERACTIVE" == "true" ]]; then
+    read -p "Override existing service file? [y/N]: " OVERRIDE_SERVICE
+  else
+    log "Non-interactive mode - keeping existing service file"
+    OVERRIDE_SERVICE="n"
+  fi
+  
+  if [[ "$OVERRIDE_SERVICE" =~ ^[Yy] ]]; then
+    log "Installing ${SERVICE_TYPE_NAME} at $SERVICE_PATH..."
+    if [[ "$OS" == "linux" ]]; then
+      install_systemd_service
+    else
+      install_launchd_service
+    fi
+    log "Service installed"
+  else
+    log "Using existing service file"
+  fi
+else
+  log "Installing ${SERVICE_TYPE_NAME} at $SERVICE_PATH..."
+  if [[ "$OS" == "linux" ]]; then
+    install_systemd_service
+  else
+    install_launchd_service
+  fi
+  log "Service installed"
 fi
 
 log "Checking initialization status..."
@@ -339,55 +546,76 @@ else
   log "Initialization complete"
 fi
 
-log "Reloading systemd daemon..."
-sudo systemctl daemon-reload
+log "Reloading service manager..."
+if [[ "$OS" == "linux" ]]; then
+  sudo systemctl daemon-reload
+fi
 
 if [[ "$ENABLE_SERVICE" == "true" ]]; then
-  log "Enabling payram-updater service..."
-  if [[ "$QUIET" == "true" ]]; then
-    sudo systemctl enable payram-updater >/dev/null 2>&1
-  else
-    sudo systemctl enable payram-updater
-  fi
-
-  log "Restarting payram-updater service..."
-  sudo systemctl restart payram-updater
-
-  # Test container-to-updater connectivity if a target container is configured
-  sleep 2  # Give service time to start
-  TARGET_CONTAINER="${TARGET_CONTAINER_NAME:-}"
-  if [[ -z "$TARGET_CONTAINER" ]] && [[ -f "$ENV_PATH" ]]; then
-    TARGET_CONTAINER=$(grep -E "^TARGET_CONTAINER_NAME=" "$ENV_PATH" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
-  fi
-
-  if [[ -n "$TARGET_CONTAINER" ]] && docker ps --format "{{.Names}}" | grep -q "^${TARGET_CONTAINER}$"; then
-    log "Testing container-to-updater connectivity..."
-    # Try wget first, then curl
-    if docker exec "$TARGET_CONTAINER" timeout 3 wget -qO- http://172.17.0.1:${UPDATER_PORT:-2567}/health >/dev/null 2>&1 || \
-       docker exec "$TARGET_CONTAINER" timeout 3 curl -sf http://172.17.0.1:${UPDATER_PORT:-2567}/health >/dev/null 2>&1; then
-      log "Connectivity test passed"
+  if [[ "$OS" == "linux" ]]; then
+    log "Enabling payram-updater service..."
+    if [[ "$QUIET" == "true" ]]; then
+      sudo systemctl enable payram-updater >/dev/null 2>&1
     else
-      log ""
-      log "WARNING: Container cannot reach the updater API."
-      log "This is usually caused by firewall rules blocking docker0 traffic."
-      log ""
-      log "To fix, run ONE of the following based on your firewall:"
-      if command -v ufw >/dev/null 2>&1; then
-        log "  UFW:       sudo ufw allow in on docker0 to any port ${UPDATER_PORT:-2567}"
-      fi
-      if command -v firewall-cmd >/dev/null 2>&1; then
-        log "  firewalld: sudo firewall-cmd --zone=docker --add-port=${UPDATER_PORT:-2567}/tcp --permanent && sudo firewall-cmd --reload"
-      fi
-      log "  iptables:  sudo iptables -I INPUT -i docker0 -p tcp --dport ${UPDATER_PORT:-2567} -j ACCEPT"
-      log ""
-      log "See troubleshooting docs for more details."
+      sudo systemctl enable payram-updater
     fi
+
+    log "Restarting payram-updater service..."
+    sudo systemctl restart payram-updater
+  else
+    # macOS - launchd
+    log "Loading payram-updater service..."
+    # Unload first if already loaded
+    sudo launchctl unload "$SERVICE_PATH" 2>/dev/null || true
+    sudo launchctl load "$SERVICE_PATH"
+    log "Service loaded"
   fi
+
+  # Test container-to-updater connectivity if a target container is configured (Linux only)
+  sleep 2  # Give service time to start
+  if [[ "$OS" == "linux" ]]; then
+    TARGET_CONTAINER="${TARGET_CONTAINER_NAME:-}"
+    if [[ -z "$TARGET_CONTAINER" ]] && [[ -f "$ENV_PATH" ]]; then
+      TARGET_CONTAINER=$(grep -E "^TARGET_CONTAINER_NAME=" "$ENV_PATH" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+    fi
+
+    if [[ -n "$TARGET_CONTAINER" ]] && docker ps --format "{{.Names}}" | grep -q "^${TARGET_CONTAINER}$"; then
+      log "Testing container-to-updater connectivity..."
+      # Try wget first, then curl
+      if docker exec "$TARGET_CONTAINER" timeout 3 wget -qO- http://172.17.0.1:${UPDATER_PORT:-2567}/health >/dev/null 2>&1 || \
+         docker exec "$TARGET_CONTAINER" timeout 3 curl -sf http://172.17.0.1:${UPDATER_PORT:-2567}/health >/dev/null 2>&1; then
+        log "Connectivity test passed"
+      else
+        log ""
+        log "WARNING: Container cannot reach the updater API."
+        log "This is usually caused by firewall rules blocking docker0 traffic."
+        log ""
+        log "To fix, run ONE of the following based on your firewall:"
+        if command -v ufw >/dev/null 2>&1; then
+          log "  UFW:       sudo ufw allow in on docker0 to any port ${UPDATER_PORT:-2567}"
+        fi
+        if command -v firewall-cmd >/dev/null 2>&1; then
+          log "  firewalld: sudo firewall-cmd --zone=docker --add-port=${UPDATER_PORT:-2567}/tcp --permanent && sudo firewall-cmd --reload"
+        fi
+        log "  iptables:  sudo iptables -I INPUT -i docker0 -p tcp --dport ${UPDATER_PORT:-2567} -j ACCEPT"
+        log ""
+        log "See troubleshooting docs for more details."
+      fi
+    fi
+  fi  # End Linux-only connectivity test
 else
   log "Service installed but NOT started (ENABLE_SERVICE is not set)."
-  log "To enable and start the service, run:"
-  log "  sudo systemctl enable payram-updater"
-  log "  sudo systemctl start payram-updater"
+  if [[ "$OS" == "linux" ]]; then
+    log "To enable and start the service, run:"
+    log "  sudo systemctl enable payram-updater"
+    log "  sudo systemctl start payram-updater"
+  else
+    log "To load the service, run:"
+    log "  sudo launchctl load $SERVICE_PATH"
+  fi
 fi
 
 log "Setup complete!"
+if [[ "$OS" == "darwin" ]]; then
+  log "Logs: /var/log/payram-updater.log and /var/log/payram-updater.error.log"
+fi
