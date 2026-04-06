@@ -71,15 +71,16 @@ type Logger interface {
 // Config holds backup configuration.
 // Backups are always enabled.
 type Config struct {
-	Dir          string
-	Retention    int
-	PGHost       string
-	PGPort       int
-	PGDB         string
-	PGUser       string
-	PGPassword   string
-	PGDumpBin    string // Path to pg_dump binary, default "pg_dump"
-	ImagePattern string // Image pattern for container discovery, default "payramapp/payram:"
+	Dir                 string
+	Retention           int
+	PGHost              string
+	PGPort              int
+	PGDB                string
+	PGUser              string
+	PGPassword          string
+	PGDumpBin           string // Path to pg_dump binary, default "pg_dump"
+	ImagePattern        string // Image pattern for container discovery, default "payramapp/payram:"
+	TargetContainerName string // Optional: explicit container name, bypasses semver discovery
 }
 
 // Manager handles backup operations.
@@ -119,9 +120,10 @@ func (m *Manager) CreateBackup(ctx context.Context, meta BackupMeta) (*BackupInf
 
 	// CREDENTIAL DISCOVERY using shared dbexec package
 	dbCtx, err := dbexec.DiscoverDBContext(ctx, executor, dbexec.DiscoverOpts{
-		ImagePattern: m.Config.ImagePattern,
-		BackupDir:    m.Config.Dir,
-		Logger:       m.Logger,
+		ContainerName: m.Config.TargetContainerName,
+		ImagePattern:  m.Config.ImagePattern,
+		BackupDir:     m.Config.Dir,
+		Logger:        m.Logger,
 	})
 	if err != nil {
 		// Check if container not found for in-container DB
@@ -602,9 +604,10 @@ func (m *Manager) RestoreBackup(ctx context.Context, backupPath string, opts Res
 	executor := &executorWrapper{executor: m.Executor}
 
 	dbCtx, err := dbexec.DiscoverDBContext(ctx, executor, dbexec.DiscoverOpts{
-		ImagePattern: m.Config.ImagePattern,
-		BackupDir:    m.Config.Dir,
-		Logger:       m.Logger,
+		ContainerName: m.Config.TargetContainerName,
+		ImagePattern:  m.Config.ImagePattern,
+		BackupDir:     m.Config.Dir,
+		Logger:        m.Logger,
 	})
 	if err != nil {
 		// Check if credentials unavailable

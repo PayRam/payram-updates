@@ -13,6 +13,9 @@ import (
 
 // DiscoverOpts contains options for database context discovery.
 type DiscoverOpts struct {
+	// ContainerName, if set, is used directly instead of running semver-based discovery.
+	// This is required when the running container uses a non-semver tag (e.g. "develop", "sha-abc123").
+	ContainerName string
 	// BackupDir is the directory where backups are stored (used for finding persisted credentials).
 	BackupDir string
 	// ImagePattern is the Docker image pattern to search for (e.g., "payramapp/payram:").
@@ -69,19 +72,31 @@ func DiscoverDBContext(ctx context.Context, executor CommandExecutor, opts Disco
 		imagePattern = "payramapp/payram:"
 	}
 
-	discoverer := container.NewDiscoverer("docker", imagePattern, opts.Logger)
-	discovered, err := discoverer.DiscoverPayramContainer(ctx)
+	// If an explicit container name is provided, use it directly (skips semver-based discovery).
+	// This handles non-semver tags like "develop" or "sha-abc123".
+	var discoveredName string
+	if opts.ContainerName != "" {
+		opts.Logger.Printf("Using explicit container name for DB discovery: %s", opts.ContainerName)
+		discoveredName = opts.ContainerName
+	} else {
+		discoverer := container.NewDiscoverer("docker", imagePattern, opts.Logger)
+		disc, err := discoverer.DiscoverPayramContainer(ctx)
+		if err == nil {
+			discoveredName = disc.Name
+			opts.Logger.Printf("Discovered container via image pattern: %s (version: %s)", disc.Name, disc.ImageTag)
+		}
+	}
 
-	if err == nil {
+	if discoveredName != "" {
 		// Container is running - extract credentials
-		opts.Logger.Printf("Using credentials from running container: %s (version: %s)", discovered.Name, discovered.ImageTag)
+		opts.Logger.Printf("Using credentials from running container: %s", discoveredName)
 
 		// Extract database credentials from container environment
-		dbConfig, err := getContainerDBConfig(ctx, executor, discovered.Name)
+		dbConfig, err := getContainerDBConfig(ctx, executor, discoveredName)
 		if err != nil {
 			return DBContext{}, &DBError{
 				Code:    "INVALID_DB_CONFIG",
-				Message: fmt.Sprintf("failed to extract credentials from running container %s", discovered.Name),
+				Message: fmt.Sprintf("failed to extract credentials from running container %s", discoveredName),
 				Err:     err,
 			}
 		}
@@ -91,7 +106,7 @@ func DiscoverDBContext(ctx context.Context, executor CommandExecutor, opts Disco
 		containerName := ""
 		if isLocalDB(dbConfig.Host) {
 			mode = DBModeInContainer
-			containerName = discovered.Name
+			containerName = discoveredName
 			opts.Logger.Printf("Database is running inside container: %s", containerName)
 		} else {
 			opts.Logger.Printf("Database is external: %s", dbConfig.Host)
@@ -117,7 +132,6 @@ func DiscoverDBContext(ctx context.Context, executor CommandExecutor, opts Disco
 		return DBContext{}, &DBError{
 			Code:    "CONTAINER_NOT_FOUND",
 			Message: "no running container found and no backup directory specified for persisted credentials",
-			Err:     err,
 		}
 	}
 

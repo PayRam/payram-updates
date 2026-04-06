@@ -583,17 +583,19 @@ func (s *Server) buildPlaybookContext(backupPath string) recovery.PlaybookContex
 		ctx.ImageRepo = s.config.ImageRepoOverride
 	}
 
-	// Try to discover running container
-	discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, logger.StdLogger())
-	discovered, err := discoverer.DiscoverPayramContainer(context.Background())
-	if err != nil {
-		// Container not found or discovery failed - return partial context
-		// Placeholders will remain in the playbook
-		return ctx
+	// Try to discover running container. Prefer explicit name (handles non-semver tags).
+	if s.config.TargetContainerName != "" {
+		ctx.ContainerName = s.config.TargetContainerName
+	} else {
+		discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, logger.StdLogger())
+		discovered, err := discoverer.DiscoverPayramContainer(context.Background())
+		if err != nil {
+			// Container not found or discovery failed - return partial context
+			// Placeholders will remain in the playbook
+			return ctx
+		}
+		ctx.ContainerName = discovered.Name
 	}
-
-	// Extract container name
-	ctx.ContainerName = discovered.Name
 
 	// Try to use the core client's base URL for port extraction
 	// The coreClient was initialized with discovered port in New()

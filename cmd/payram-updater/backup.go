@@ -53,14 +53,15 @@ Examples:
 		imagePattern = cfg.ImageRepoOverride + ":"
 	}
 	backupCfg := backup.Config{
-		Dir:          cfg.Backup.Dir,
-		Retention:    cfg.Backup.Retention,
-		PGHost:       cfg.Backup.PGHost,
-		PGPort:       cfg.Backup.PGPort,
-		PGDB:         cfg.Backup.PGDB,
-		PGUser:       cfg.Backup.PGUser,
-		PGPassword:   cfg.Backup.PGPassword,
-		ImagePattern: imagePattern,
+		Dir:                 cfg.Backup.Dir,
+		Retention:           cfg.Backup.Retention,
+		PGHost:              cfg.Backup.PGHost,
+		PGPort:              cfg.Backup.PGPort,
+		PGDB:                cfg.Backup.PGDB,
+		PGUser:              cfg.Backup.PGUser,
+		PGPassword:          cfg.Backup.PGPassword,
+		ImagePattern:        imagePattern,
+		TargetContainerName: cfg.TargetContainerName,
 	}
 	mgr := backup.NewManager(backupCfg, &backup.RealExecutor{}, log.Default())
 
@@ -221,20 +222,25 @@ func performContainerRollback(ctx context.Context, targetVersion string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Discover running container
+	// Discover running container. Prefer explicit name (handles non-semver tags).
 	imagePattern := "payramapp/payram:"
 	if cfg.ImageRepoOverride != "" {
 		imagePattern = cfg.ImageRepoOverride + ":"
 	}
 
-	discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, log.Default())
-	discovered, err := discoverer.DiscoverPayramContainer(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to discover running container: %w", err)
+	var containerName string
+	if cfg.TargetContainerName != "" {
+		containerName = cfg.TargetContainerName
+		log.Printf("Using explicit container name: %s", containerName)
+	} else {
+		discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, log.Default())
+		discovered, err := discoverer.DiscoverPayramContainer(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to discover running container: %w", err)
+		}
+		containerName = discovered.Name
+		log.Printf("Discovered container: %s (current version: %s)", containerName, discovered.ImageTag)
 	}
-
-	containerName := discovered.Name
-	log.Printf("Discovered container: %s (current version: %s)", containerName, discovered.ImageTag)
 
 	// Extract runtime state from current container
 	inspector := container.NewInspector(cfg.DockerBin, log.Default())
@@ -422,19 +428,24 @@ func runBackupRestore(mgr *backup.Manager) {
 			imagePattern = cfg.ImageRepoOverride + ":"
 		}
 
-		discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, log.Default())
-		discovered, err := discoverer.DiscoverPayramContainer(ctx)
-		if err != nil {
-			errResp := map[string]interface{}{
-				"success": false,
-				"error":   fmt.Sprintf("Failed to discover rollback container: %v", err),
+		if cfg.TargetContainerName != "" {
+			rollbackContainerName = cfg.TargetContainerName
+			fmt.Fprintf(os.Stderr, "Rollback container ready: %s\n", rollbackContainerName)
+		} else {
+			discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, log.Default())
+			discovered, err := discoverer.DiscoverPayramContainer(ctx)
+			if err != nil {
+				errResp := map[string]interface{}{
+					"success": false,
+					"error":   fmt.Sprintf("Failed to discover rollback container: %v", err),
+				}
+				jsonOut, _ := json.MarshalIndent(errResp, "", "  ")
+				fmt.Println(string(jsonOut))
+				os.Exit(1)
 			}
-			jsonOut, _ := json.MarshalIndent(errResp, "", "  ")
-			fmt.Println(string(jsonOut))
-			os.Exit(1)
+			rollbackContainerName = discovered.Name
+			fmt.Fprintf(os.Stderr, "Rollback container ready: %s\n", rollbackContainerName)
 		}
-		rollbackContainerName = discovered.Name
-		fmt.Fprintf(os.Stderr, "Rollback container ready: %s\n", rollbackContainerName)
 	}
 
 	// Interactive confirmation if --yes not provided

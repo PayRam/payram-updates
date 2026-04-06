@@ -148,14 +148,15 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 	// Create backup manager (legacy, for backward compatibility with existing backups)
 	// Backups are always enabled
 	backupCfg := backup.Config{
-		Dir:          cfg.Backup.Dir,
-		Retention:    cfg.Backup.Retention,
-		PGHost:       cfg.Backup.PGHost,
-		PGPort:       cfg.Backup.PGPort,
-		PGDB:         cfg.Backup.PGDB,
-		PGUser:       cfg.Backup.PGUser,
-		PGPassword:   cfg.Backup.PGPassword,
-		ImagePattern: imagePattern,
+		Dir:                 cfg.Backup.Dir,
+		Retention:           cfg.Backup.Retention,
+		PGHost:              cfg.Backup.PGHost,
+		PGPort:              cfg.Backup.PGPort,
+		PGDB:                cfg.Backup.PGDB,
+		PGUser:              cfg.Backup.PGUser,
+		PGPassword:          cfg.Backup.PGPassword,
+		ImagePattern:        imagePattern,
+		TargetContainerName: cfg.TargetContainerName,
 	}
 	backupMgr := backup.NewManager(backupCfg, &backup.RealExecutor{}, logger.StdLogger())
 
@@ -613,6 +614,11 @@ func (s *Server) shouldUseLegacyForTarget(initVersion, targetVersion string) boo
 }
 
 func (s *Server) discoverContainerName(ctx context.Context) (string, error) {
+	// Prefer explicit container name (handles non-semver tags like "develop").
+	if s.config.TargetContainerName != "" {
+		return s.config.TargetContainerName, nil
+	}
+
 	imagePattern := "payramapp/payram:"
 	if s.config.ImageRepoOverride != "" {
 		imagePattern = s.config.ImageRepoOverride + ":"
