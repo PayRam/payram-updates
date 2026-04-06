@@ -16,18 +16,55 @@ import (
 )
 
 // discoverCoreBaseURLOrDefault discovers the Payram Core base URL dynamically.
-// If discovery fails, returns the default http://127.0.0.1:8080.
+// Priority: 1) CORE_BASE_URL env 2) TARGET_CONTAINER_NAME port discovery 3) semver-based discovery 4) fallback
 func discoverCoreBaseURLOrDefault(ctx context.Context, cfg *config.Config) string {
-	// Use imagePattern for discovery (default to payramapp/payram if not overridden)
+	return discoverCoreBaseURLWithContainer(ctx, cfg, "")
+}
+
+// discoverCoreBaseURLWithContainer discovers the Payram Core base URL with optional container name override.
+func discoverCoreBaseURLWithContainer(ctx context.Context, cfg *config.Config, containerNameOverride string) string {
+	// 1. Use explicit CORE_BASE_URL if set
+	if cfg.CoreBaseURL != "" {
+		return cfg.CoreBaseURL
+	}
+
+	// Use a null logger to suppress discovery logs for CLI commands
+	nullLogger := log.New(io.Discard, "", 0)
+	inspector := container.NewInspector(cfg.DockerBin, nullLogger)
+	identifier := container.NewPortIdentifier(nullLogger)
+
+	// 2. Use provided container name override (from already-resolved context)
+	if containerNameOverride != "" {
+		runtimeState, err := inspector.ExtractRuntimeState(ctx, containerNameOverride)
+		if err == nil {
+			identifiedPort, err := identifier.IdentifyPayramCorePort(ctx, runtimeState)
+			if err == nil {
+				return fmt.Sprintf("http://127.0.0.1:%s", identifiedPort.HostPort)
+			}
+		}
+		// Fall through to other methods if this fails
+	}
+
+	// 3. Use TARGET_CONTAINER_NAME if set
+	if cfg.TargetContainerName != "" {
+		runtimeState, err := inspector.ExtractRuntimeState(ctx, cfg.TargetContainerName)
+		if err == nil {
+			identifiedPort, err := identifier.IdentifyPayramCorePort(ctx, runtimeState)
+			if err == nil {
+				return fmt.Sprintf("http://127.0.0.1:%s", identifiedPort.HostPort)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "WARNING: Failed to identify port for container %s\n", cfg.TargetContainerName)
+		fmt.Fprintf(os.Stderr, "Falling back to http://127.0.0.1:8080\n")
+		return "http://127.0.0.1:8080"
+	}
+
+	// 4. Fall back to semver-based discovery
 	imagePattern := "payramapp/payram:"
 	if cfg.ImageRepoOverride != "" {
 		imagePattern = cfg.ImageRepoOverride + ":"
 	}
 
-	// Use a null logger to suppress discovery logs for CLI commands
-	nullLogger := log.New(io.Discard, "", 0)
-
-	// Discover container
 	discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, nullLogger)
 	discovered, err := discoverer.DiscoverPayramContainer(ctx)
 	if err != nil {
@@ -37,7 +74,6 @@ func discoverCoreBaseURLOrDefault(ctx context.Context, cfg *config.Config) strin
 	}
 
 	// Extract runtime state to get ports
-	inspector := container.NewInspector(cfg.DockerBin, nullLogger)
 	runtimeState, err := inspector.ExtractRuntimeState(ctx, discovered.Name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "WARNING: Failed to extract runtime state: %v\n", err)
@@ -46,7 +82,6 @@ func discoverCoreBaseURLOrDefault(ctx context.Context, cfg *config.Config) strin
 	}
 
 	// Identify which port serves Payram Core
-	identifier := container.NewPortIdentifier(nullLogger)
 	identifiedPort, err := identifier.IdentifyPayramCorePort(ctx, runtimeState)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "WARNING: Failed to identify Payram Core port: %v\n", err)

@@ -72,8 +72,8 @@ func runInspect() {
 		fmt.Printf("Target container resolved as: %s\n\n", containerName)
 	}
 
-	// Determine CoreBaseURL: if not provided, discover it dynamically
-	coreBaseURL := discoverCoreBaseURLOrDefault(ctx, cfg)
+	// Determine CoreBaseURL: if not provided, discover it using the resolved container name
+	coreBaseURL := discoverCoreBaseURLWithContainer(ctx, cfg, containerName)
 
 	inspector := inspect.NewInspector(
 		jobStore,
