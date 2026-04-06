@@ -91,8 +91,10 @@ func archSuffixFromTag(tag string) string {
 // only the semver portion used for version comparisons.
 // e.g. "1.9.3-arm64" → "1.9.3", "1.9.3" → "1.9.3"
 func baseVersionTag(tag string) string {
-	if idx := strings.Index(tag, "-"); idx != -1 {
-		return tag[:idx]
+	for _, suffix := range knownArchSuffixes {
+		if strings.HasSuffix(tag, suffix) {
+			return tag[:len(tag)-len(suffix)]
+		}
 	}
 	return tag
 }
