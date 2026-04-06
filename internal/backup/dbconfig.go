@@ -151,9 +151,15 @@ func (d *DockerInspector) GetDBConfig(ctx context.Context, container string) (*C
 		username = env["POSTGRES_USERNAME"]
 	}
 
+	// Default port to 5432 if not specified
+	port := env["POSTGRES_PORT"]
+	if port == "" {
+		port = "5432"
+	}
+
 	config := &ContainerDBConfig{
 		Host:     env["POSTGRES_HOST"],
-		Port:     env["POSTGRES_PORT"],
+		Port:     port,
 		Database: database,
 		Username: username,
 		Password: env["POSTGRES_PASSWORD"],
