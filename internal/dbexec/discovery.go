@@ -235,9 +235,14 @@ func loadPersistedCredentials(backupDir string) (*containerDBConfig, error) {
 		}
 	}
 
+	persistedPort := envMap["POSTGRES_PORT"]
+	if persistedPort == "" {
+		persistedPort = "5432"
+	}
+
 	config := &containerDBConfig{
 		Host:     envMap["POSTGRES_HOST"],
-		Port:     envMap["POSTGRES_PORT"],
+		Port:     persistedPort,
 		Database: envMap["POSTGRES_DATABASE"],
 		Username: envMap["POSTGRES_USERNAME"],
 		Password: envMap["POSTGRES_PASSWORD"],
@@ -317,9 +322,15 @@ func getContainerDBConfig(ctx context.Context, executor CommandExecutor, contain
 		username = envMap["POSTGRES_USERNAME"]
 	}
 
+	// Default port to 5432 if not set
+	port := envMap["POSTGRES_PORT"]
+	if port == "" {
+		port = "5432"
+	}
+
 	config := &containerDBConfig{
 		Host:     envMap["POSTGRES_HOST"],
-		Port:     envMap["POSTGRES_PORT"],
+		Port:     port,
 		Database: database,
 		Username: username,
 		Password: envMap["POSTGRES_PASSWORD"],
