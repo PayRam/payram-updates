@@ -33,22 +33,23 @@ const (
 // via Docker inspection and overlaid with manifest settings. Only job state,
 // logs, and backups are persisted.
 type Config struct {
-	Port                int
-	PolicyURL           string
-	RuntimeManifestURL  string
-	FetchTimeoutSeconds int
-	StateDir            string // For job state persistence only
-	CoreBaseURL         string
-	ExecutionMode       string
-	DockerBin           string
-	TargetContainerName string // Optional: overrides manifest container_name
-	ImageRepoOverride   string // Optional: for testing with different image repos (e.g., payram-dummy)
-	DebugVersionMode    bool   // When true, allows arbitrary version names and uses release list ordering
-	AutoUpdateEnabled   bool
-	AutoUpdateInterval  int // Hours
-	SupervisorExclude   []string
-	SupervisorInclude   []string
-	Backup              BackupConfig
+	Port                 int
+	PolicyURL            string
+	RuntimeManifestURL   string
+	FetchTimeoutSeconds  int
+	StateDir             string // For job state persistence only
+	CoreBaseURL          string
+	ExecutionMode        string
+	DockerBin            string
+	TargetContainerName  string // Optional: overrides manifest container_name
+	ImageRepoOverride    string // Optional: for testing with different image repos (e.g., payram-dummy)
+	DebugVersionMode     bool   // When true, allows arbitrary version names and uses release list ordering
+	AutoUpdateEnabled    bool
+	AutoUpdateInterval   int // Hours
+	BackupTimeoutSeconds int // Timeout for pre-upgrade backup operations (default 600s)
+	SupervisorExclude    []string
+	SupervisorInclude    []string
+	Backup               BackupConfig
 }
 
 // Load reads configuration with the following precedence order:
@@ -80,21 +81,22 @@ func Load() (*Config, error) {
 
 	// Build config from environment variables (OS env vars have highest priority)
 	cfg := &Config{
-		Port:                getEnvInt("UPDATER_PORT", 2567),
-		PolicyURL:           os.Getenv("POLICY_URL"),
-		RuntimeManifestURL:  os.Getenv("RUNTIME_MANIFEST_URL"),
-		FetchTimeoutSeconds: getEnvInt("FETCH_TIMEOUT_SECONDS", 10),
-		StateDir:            getEnvString("STATE_DIR", "/var/lib/payram-updater"),
-		CoreBaseURL:         os.Getenv("CORE_BASE_URL"), // Optional: will be discovered if not provided
-		ExecutionMode:       getEnvString("EXECUTION_MODE", "dry-run"),
-		DockerBin:           getEnvString("DOCKER_BIN", "docker"),
-		TargetContainerName: os.Getenv("TARGET_CONTAINER_NAME"), // Optional: no default
-		ImageRepoOverride:   os.Getenv("IMAGE_REPO_OVERRIDE"),   // Optional: for testing (e.g., "payram-dummy")
-		DebugVersionMode:    getEnvString("DEBUG_VERSION_MODE", "") == "true",
-		AutoUpdateEnabled:   DefaultAutoUpdateEnabled,
-		AutoUpdateInterval:  DefaultAutoUpdateIntervalHours,
-		SupervisorExclude:   parseCSV(getEnvString("SUPERVISOR_EXCLUDE", "postgres,postgresql")),
-		SupervisorInclude:   parseCSV(os.Getenv("SUPERVISOR_INCLUDE")),
+		Port:                 getEnvInt("UPDATER_PORT", 2567),
+		PolicyURL:            os.Getenv("POLICY_URL"),
+		RuntimeManifestURL:   os.Getenv("RUNTIME_MANIFEST_URL"),
+		FetchTimeoutSeconds:  getEnvInt("FETCH_TIMEOUT_SECONDS", 10),
+		StateDir:             getEnvString("STATE_DIR", "/var/lib/payram-updater"),
+		CoreBaseURL:          os.Getenv("CORE_BASE_URL"), // Optional: will be discovered if not provided
+		ExecutionMode:        getEnvString("EXECUTION_MODE", "dry-run"),
+		DockerBin:            getEnvString("DOCKER_BIN", "docker"),
+		TargetContainerName:  os.Getenv("TARGET_CONTAINER_NAME"), // Optional: no default
+		ImageRepoOverride:    os.Getenv("IMAGE_REPO_OVERRIDE"),   // Optional: for testing (e.g., "payram-dummy")
+		DebugVersionMode:     getEnvString("DEBUG_VERSION_MODE", "") == "true",
+		AutoUpdateEnabled:    DefaultAutoUpdateEnabled,
+		AutoUpdateInterval:   DefaultAutoUpdateIntervalHours,
+		BackupTimeoutSeconds: getEnvInt("BACKUP_TIMEOUT_SECONDS", 600),
+		SupervisorExclude:    parseCSV(getEnvString("SUPERVISOR_EXCLUDE", "postgres,postgresql")),
+		SupervisorInclude:    parseCSV(os.Getenv("SUPERVISOR_INCLUDE")),
 		Backup: BackupConfig{
 			Dir:        getEnvString("BACKUP_DIR", "data/backups"),
 			Retention:  getEnvInt("BACKUP_RETENTION", 10),

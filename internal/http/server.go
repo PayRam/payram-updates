@@ -167,6 +167,7 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 		cfg.Backup.Dir,
 		logger.StdLogger(),
 	)
+	containerBackupExec.BackupTimeout = time.Duration(cfg.BackupTimeoutSeconds) * time.Second
 
 	s := &Server{
 		port:                cfg.Port,
