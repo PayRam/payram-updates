@@ -766,6 +766,20 @@ func (i *Inspector) compareVersions(v1, v2 string) int {
 	v1 = strings.TrimPrefix(v1, "v")
 	v2 = strings.TrimPrefix(v2, "v")
 
+	// Check if either version is non-semver (doesn't start with a digit)
+	v1IsSemver := len(v1) > 0 && v1[0] >= '0' && v1[0] <= '9'
+	v2IsSemver := len(v2) > 0 && v2[0] >= '0' && v2[0] <= '9'
+
+	// If either is non-semver, do string comparison (only equal if identical)
+	if !v1IsSemver || !v2IsSemver {
+		if v1 == v2 {
+			return 0
+		}
+		// Non-semver versions can't be ordered, but they're definitely different
+		// Report as "update available" (-1) when current is non-semver and latest differs
+		return -1
+	}
+
 	parts1 := strings.Split(v1, ".")
 	parts2 := strings.Split(v2, ".")
 
