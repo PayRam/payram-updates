@@ -59,8 +59,8 @@ func discoverCoreBaseURLByName(ctx context.Context, dockerBin string, containerN
 		return "", fmt.Errorf("failed to identify Payram Core port: %w", err)
 	}
 
-	// Build the base URL from the identified port
-	baseURL := fmt.Sprintf("http://127.0.0.1:%s", identifiedPort.HostPort)
+	// Build the base URL from the identified port using the discovered scheme
+	baseURL := fmt.Sprintf("%s://127.0.0.1:%s", identifiedPort.Scheme, identifiedPort.HostPort)
 	return baseURL, nil
 }
 
