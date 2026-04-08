@@ -39,7 +39,7 @@ func discoverCoreBaseURLWithContainer(ctx context.Context, cfg *config.Config, c
 		if err == nil {
 			identifiedPort, err := identifier.IdentifyPayramCorePort(ctx, runtimeState)
 			if err == nil {
-				return fmt.Sprintf("http://127.0.0.1:%s", identifiedPort.HostPort)
+				return fmt.Sprintf("%s://127.0.0.1:%s", identifiedPort.Scheme, identifiedPort.HostPort)
 			}
 		}
 		// Fall through to other methods if this fails
@@ -51,7 +51,7 @@ func discoverCoreBaseURLWithContainer(ctx context.Context, cfg *config.Config, c
 		if err == nil {
 			identifiedPort, err := identifier.IdentifyPayramCorePort(ctx, runtimeState)
 			if err == nil {
-				return fmt.Sprintf("http://127.0.0.1:%s", identifiedPort.HostPort)
+				return fmt.Sprintf("%s://127.0.0.1:%s", identifiedPort.Scheme, identifiedPort.HostPort)
 			}
 		}
 		fmt.Fprintf(os.Stderr, "WARNING: Failed to identify port for container %s\n", cfg.TargetContainerName)
@@ -89,7 +89,7 @@ func discoverCoreBaseURLWithContainer(ctx context.Context, cfg *config.Config, c
 		return "http://127.0.0.1:8080"
 	}
 
-	coreBaseURL := fmt.Sprintf("http://127.0.0.1:%s", identifiedPort.HostPort)
+	coreBaseURL := fmt.Sprintf("%s://127.0.0.1:%s", identifiedPort.Scheme, identifiedPort.HostPort)
 	return coreBaseURL
 }
 

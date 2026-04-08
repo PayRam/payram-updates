@@ -55,6 +55,10 @@ func TestIdentifyPayramCorePort_Success(t *testing.T) {
 	if identifiedPort.Protocol != "tcp" {
 		t.Errorf("Expected protocol 'tcp', got '%s'", identifiedPort.Protocol)
 	}
+
+	if identifiedPort.Scheme != "http" {
+		t.Errorf("Expected scheme 'http', got '%s'", identifiedPort.Scheme)
+	}
 }
 
 // TestIdentifyPayramCorePort_MultiplePorts tests identification with multiple ports.
@@ -401,9 +405,12 @@ func TestCheckPort(t *testing.T) {
 			logger := &mockLogger{}
 			identifier := NewPortIdentifier(logger)
 
-			result := identifier.checkPort(context.Background(), port)
-			if result != tt.shouldMatch {
-				t.Errorf("Expected match=%v, got match=%v", tt.shouldMatch, result)
+			result, ok := identifier.checkPort(context.Background(), port)
+			if ok != tt.shouldMatch {
+				t.Errorf("Expected match=%v, got match=%v", tt.shouldMatch, ok)
+			}
+			if ok && result != "http" {
+				t.Errorf("Expected scheme 'http', got '%s'", result)
 			}
 		})
 	}
@@ -424,6 +431,10 @@ func TestNewPortIdentifier(t *testing.T) {
 
 	if identifier.httpClient == nil {
 		t.Fatal("HTTP client not initialized")
+	}
+
+	if identifier.httpsClient == nil {
+		t.Fatal("HTTPS client not initialized")
 	}
 
 	if identifier.httpClient.Timeout != PortIdentificationTimeout {
@@ -450,6 +461,7 @@ func TestIdentifiedPortStructure(t *testing.T) {
 		HostPort:      "8080",
 		ContainerPort: "80",
 		Protocol:      "tcp",
+		Scheme:        "http",
 	}
 
 	if port.HostPort != "8080" {
@@ -462,6 +474,10 @@ func TestIdentifiedPortStructure(t *testing.T) {
 
 	if port.Protocol != "tcp" {
 		t.Errorf("Expected Protocol 'tcp', got '%s'", port.Protocol)
+	}
+
+	if port.Scheme != "http" {
+		t.Errorf("Expected Scheme 'http', got '%s'", port.Scheme)
 	}
 }
 
@@ -507,6 +523,70 @@ func TestIdentifyPayramCorePort_FirstMatchWins(t *testing.T) {
 	// Should return the first matching port
 	if identifiedPort.HostPort != port1 {
 		t.Errorf("Expected first port %s, got %s", port1, identifiedPort.HostPort)
+	}
+}
+
+// TestIdentifyPayramCorePort_HTTPSFallback tests that an HTTPS-only port is
+// discovered when the HTTP probe fails.
+func TestIdentifyPayramCorePort_HTTPSFallback(t *testing.T) {
+	// httptest.NewTLSServer starts an HTTPS server with a self-signed certificate
+	// whose SAN covers 127.0.0.1, matching how the real container behaves.
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, PayramCoreWelcomeMessage)
+	}))
+	defer server.Close()
+
+	port := server.URL[len("https://127.0.0.1:"):]
+
+	state := &RuntimeState{
+		Ports: []PortMapping{
+			{HostPort: port, ContainerPort: "443", Protocol: "tcp"},
+		},
+	}
+
+	logger := &mockLogger{}
+	identifier := NewPortIdentifier(logger)
+
+	identifiedPort, err := identifier.IdentifyPayramCorePort(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if identifiedPort.HostPort != port {
+		t.Errorf("Expected port %s, got %s", port, identifiedPort.HostPort)
+	}
+
+	if identifiedPort.Scheme != "https" {
+		t.Errorf("Expected scheme 'https', got '%s'", identifiedPort.Scheme)
+	}
+}
+
+// TestIdentifyPayramCorePort_HTTPSchemeReturned tests that HTTP scheme is
+// populated in the returned IdentifiedPort.
+func TestIdentifyPayramCorePort_HTTPSchemeReturned(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, PayramCoreWelcomeMessage)
+	}))
+	defer server.Close()
+
+	port := server.URL[len("http://127.0.0.1:"):]
+
+	state := &RuntimeState{
+		Ports: []PortMapping{
+			{HostPort: port, ContainerPort: "80", Protocol: "tcp"},
+		},
+	}
+
+	logger := &mockLogger{}
+	identifier := NewPortIdentifier(logger)
+
+	identifiedPort, err := identifier.IdentifyPayramCorePort(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if identifiedPort.Scheme != "http" {
+		t.Errorf("Expected scheme 'http', got '%s'", identifiedPort.Scheme)
 	}
 }
 

@@ -2,10 +2,13 @@ package coreclient
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -42,11 +45,30 @@ type VersionResponse struct {
 }
 
 // NewClient creates a new core API client with default timeout.
+// When the base URL is an HTTPS endpoint targeting a loopback address (127.0.0.1
+// or ::1 or localhost), TLS certificate verification is skipped because the
+// container may present a self-signed certificate or one whose SAN does not
+// include the loopback IP.  For all other HTTPS endpoints the default TLS
+// verification is applied.
 func NewClient(baseURL string) *Client {
+	transport := http.DefaultTransport
+	if parsed, err := url.Parse(baseURL); err == nil && parsed.Scheme == "https" {
+		host := parsed.Hostname()
+		if host == "localhost" || host == "::1" {
+			transport = &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+			}
+		} else if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			transport = &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+			}
+		}
+	}
 	return &Client{
 		BaseURL: strings.TrimSuffix(baseURL, "/"),
 		HTTPClient: &http.Client{
-			Timeout: DefaultTimeout,
+			Timeout:   DefaultTimeout,
+			Transport: transport,
 		},
 	}
 }
