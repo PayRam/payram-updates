@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	goversion "github.com/hashicorp/go-version"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/manifest"
 	"github.com/payram/payram-updater/internal/policy"
@@ -38,7 +39,16 @@ type UpgradePlan struct {
 // - Fetches manifest (read-only HTTP)
 // - Validates policy constraints
 // - Resolves target version
-func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTarget string) *UpgradePlan {
+//
+// currentVersion is the running version of the core container. When non-empty it
+// enables breakpoint-aware target capping: if the requested upgrade would cross a
+// breakpoint, the target is automatically capped at the highest release below that
+// breakpoint so the dashboard can advance the user up to the SSH boundary without
+// skipping it. If the user is already at the cap, MANUAL_UPGRADE_REQUIRED is
+// returned so the operator knows to SSH through the breakpoint before retrying.
+// When empty, the check falls back to exact-match so directly targeting a
+// breakpoint version is still blocked.
+func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTarget string, currentVersion string) *UpgradePlan {
 	plan := &UpgradePlan{
 		Mode:            mode,
 		RequestedTarget: requestedTarget,
@@ -109,15 +119,90 @@ func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTa
 		}
 	}
 
-	// Check for breakpoints after resolving (DASHBOARD mode only)
+	// Breakpoint enforcement (DASHBOARD mode only).
+	//
+	// Breakpoints mark versions that require a manual SSH upgrade. The dashboard
+	// must never jump over one automatically.
+	//
+	// Algorithm when currentVersion is known:
+	//   1. Find the lowest breakpoint that sits between currentVersion (exclusive)
+	//      and resolvedTarget (inclusive) — the first one the user would cross.
+	//   2. If such a breakpoint exists, cap the target at the highest release that
+	//      is strictly below that breakpoint (the "safe ceiling").
+	//   3. If the user is already at or above the safe ceiling (i.e. cap <= current),
+	//      they must SSH through the breakpoint — return MANUAL_UPGRADE_REQUIRED.
+	//   4. Otherwise, redirect resolvedTarget to the cap and allow the upgrade.
+	//
+	// This means:
+	//   • 1.7.5 → 1.9.9, breakpoint 1.8.0: caps to 1.7.9, upgrade proceeds ✓
+	//   • 1.7.9 → 1.9.9, breakpoint 1.8.0: cap == current, MANUAL_UPGRADE_REQUIRED ✓
+	//   • 1.8.0 → 1.9.9, breakpoint 2.0.0: not crossed, upgrade proceeds ✓
+	//   • 1.9.9 → 2.0.0, breakpoint 2.0.0: cap == current, MANUAL_UPGRADE_REQUIRED ✓
+	//
+	// When currentVersion is empty the check falls back to exact-match so that
+	// directly targeting a breakpoint version is still blocked.
 	if mode == jobs.JobModeDashboard && policyData != nil {
-		for _, breakpoint := range policyData.Breakpoints {
-			if breakpoint.Version == resolvedTarget {
-				// Breakpoint hit - manual upgrade required
-				plan.State = jobs.JobStateFailed
-				plan.FailureCode = "MANUAL_UPGRADE_REQUIRED"
-				plan.Message = fmt.Sprintf("%s %s", breakpoint.Reason, breakpoint.Docs)
-				return plan
+		normalizeVer := func(v string) string {
+			return strings.TrimPrefix(strings.TrimSpace(v), "v")
+		}
+
+		if currentVersion != "" {
+			cur, curErr := goversion.NewVersion(normalizeVer(currentVersion))
+			tgt, tgtErr := goversion.NewVersion(normalizeVer(resolvedTarget))
+
+			if curErr == nil && tgtErr == nil {
+				// Step 1: find the lowest breakpoint crossed by this upgrade.
+				var firstBPVer *goversion.Version
+				var firstBP policy.Breakpoint
+				for _, bp := range policyData.Breakpoints {
+					bpv, err := goversion.NewVersion(normalizeVer(bp.Version))
+					if err != nil {
+						continue
+					}
+					// crossed = current < breakpoint <= target
+					if cur.LessThan(bpv) && tgt.GreaterThanOrEqual(bpv) {
+						if firstBPVer == nil || bpv.LessThan(firstBPVer) {
+							firstBPVer = bpv
+							firstBP = bp
+						}
+					}
+				}
+
+				if firstBPVer != nil {
+					// Step 2: find the highest release strictly below that breakpoint.
+					var capVer *goversion.Version
+					for _, rel := range policyData.Releases {
+						rv, err := goversion.NewVersion(normalizeVer(rel))
+						if err != nil || !rv.LessThan(firstBPVer) {
+							continue
+						}
+						if capVer == nil || rv.GreaterThan(capVer) {
+							capVer = rv
+						}
+					}
+
+					// Step 3/4: redirect or block.
+					if capVer != nil && capVer.GreaterThan(cur) {
+						// Safe to upgrade up to the cap; proceed with capped target.
+						resolvedTarget = capVer.Original()
+					} else {
+						// Already at (or past) the cap — must SSH through the breakpoint.
+						plan.State = jobs.JobStateFailed
+						plan.FailureCode = "MANUAL_UPGRADE_REQUIRED"
+						plan.Message = fmt.Sprintf("%s %s", firstBP.Reason, firstBP.Docs)
+						return plan
+					}
+				}
+			}
+		} else {
+			// Fallback: no currentVersion — block only if target IS a breakpoint.
+			for _, bp := range policyData.Breakpoints {
+				if bp.Version == resolvedTarget {
+					plan.State = jobs.JobStateFailed
+					plan.FailureCode = "MANUAL_UPGRADE_REQUIRED"
+					plan.Message = fmt.Sprintf("%s %s", bp.Reason, bp.Docs)
+					return plan
+				}
 			}
 		}
 	}

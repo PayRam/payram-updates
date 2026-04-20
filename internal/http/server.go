@@ -391,7 +391,7 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	// Plan upgrade using DASHBOARD mode
 	planCtx, cancel3 := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel3()
-	plan := s.PlanUpgrade(planCtx, jobs.JobModeDashboard, latest)
+	plan := s.PlanUpgrade(planCtx, jobs.JobModeDashboard, latest, currentVersion)
 	if plan.State == jobs.JobStateFailed {
 		logger.Warnf("Server", "runAutoUpdateOnce", "Auto update: planning failed (%s): %s", plan.FailureCode, plan.Message)
 		return

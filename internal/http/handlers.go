@@ -40,6 +40,7 @@ type PlanRequest struct {
 	Mode            string `json:"mode"`
 	RequestedTarget string `json:"requestedTarget"`
 	Source          string `json:"source"`
+	CurrentVersion  string `json:"currentVersion"` // running version of the core container; enables breakpoint crossing detection
 }
 
 // PlanResponse represents the response for POST /upgrade/plan.
@@ -59,6 +60,7 @@ type RunRequest struct {
 	Mode            string `json:"mode"`
 	RequestedTarget string `json:"requestedTarget"`
 	Source          string `json:"source"` // Origin of request, defaults to "UNKNOWN"
+	CurrentVersion  string `json:"currentVersion"` // running version of the core container; enables breakpoint crossing detection
 }
 
 func parseJobMode(value string) (jobs.JobMode, error) {
@@ -411,7 +413,7 @@ func (s *Server) HandleUpgradePlan() http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 
-		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget)
+		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, req.CurrentVersion)
 
 		// Build response
 		response := PlanResponse{
@@ -517,7 +519,7 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 
-		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget)
+		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, req.CurrentVersion)
 		if plan.State == jobs.JobStateFailed {
 			// Planning failed - return error without creating a job
 			w.Header().Set("Content-Type", "application/json")
