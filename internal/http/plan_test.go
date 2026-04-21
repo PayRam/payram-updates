@@ -20,26 +20,42 @@ const minimalManifest = `{
   "defaults": {"container_name": "payram-core", "restart_policy": "unless-stopped", "ports": [], "volumes": []}
 }`
 
-// buildPolicyJSON writes a policy file and returns its path.
+// buildPolicyFile writes a policy file and returns its path.
 // releases should include every version that might be used as a cap.
+// breakpoints and stopPoints are slices of maps with keys: version, reason, docs.
 func buildPolicyFile(t *testing.T, latest string, releases []string, breakpoints []map[string]string) string {
+	return buildPolicyFileWithStopPoints(t, latest, releases, breakpoints, nil)
+}
+
+// buildPolicyFileWithStopPoints is like buildPolicyFile but also accepts stop_points.
+func buildPolicyFileWithStopPoints(t *testing.T, latest string, releases []string, breakpoints []map[string]string, stopPoints []map[string]string) string {
 	t.Helper()
-	type bp struct {
+	type entry struct {
 		Version string `json:"version"`
 		Reason  string `json:"reason"`
-		Docs    string `json:"docs"`
+		Docs    string `json:"docs,omitempty"`
 	}
 	type pol struct {
 		Latest      string   `json:"latest"`
 		Releases    []string `json:"releases"`
-		Breakpoints []bp     `json:"breakpoints"`
+		Breakpoints []entry  `json:"breakpoints"`
+		StopPoints  []entry  `json:"stop_points"`
 	}
 
-	bps := make([]bp, 0, len(breakpoints))
-	for _, m := range breakpoints {
-		bps = append(bps, bp{Version: m["version"], Reason: m["reason"], Docs: m["docs"]})
+	toEntries := func(ms []map[string]string) []entry {
+		out := make([]entry, 0, len(ms))
+		for _, m := range ms {
+			out = append(out, entry{Version: m["version"], Reason: m["reason"], Docs: m["docs"]})
+		}
+		return out
 	}
-	p := pol{Latest: latest, Releases: releases, Breakpoints: bps}
+
+	p := pol{
+		Latest:      latest,
+		Releases:    releases,
+		Breakpoints: toEntries(breakpoints),
+		StopPoints:  toEntries(stopPoints),
+	}
 
 	data, err := json.Marshal(p)
 	if err != nil {
@@ -83,51 +99,54 @@ func TestPlanUpgrade_BreakpointCapping(t *testing.T) {
 	}
 
 	tests := []struct {
-		name            string
-		currentVersion  string // empty = caller did not provide it
-		requestedTarget string
-		wantState       jobs.JobState
-		wantFailureCode string
-		// when state==Ready, wantResolved is the expected resolvedTarget
-		wantResolved string
+		name               string
+		currentVersion     string // empty = caller did not provide it
+		requestedTarget    string
+		wantState          jobs.JobState
+		wantFailureCode    string
+		wantResolved       string
+		wantSteppingStone  string // non-empty when a two-hop chain is expected
 	}{
-		// --- crossing first breakpoint → cap to 1.7.9 ---
+		// --- below stepping stone: chain through stepping stone to breakpoint in one job ---
 		{
-			name:            "1.7.5 to 1.9.9 is capped at 1.7.9 (crosses 1.8.0)",
-			currentVersion:  "1.7.5",
-			requestedTarget: "1.9.9",
-			wantState:       jobs.JobStateReady,
-			wantResolved:    "1.7.9",
+			name:              "1.7.5 to 1.9.9: chains through 1.7.9 (stepping stone) to 1.8.0 (breakpoint)",
+			currentVersion:    "1.7.5",
+			requestedTarget:   "1.9.9",
+			wantState:         jobs.JobStateReady,
+			wantResolved:      "1.8.0",
+			wantSteppingStone: "1.7.9",
 		},
 		{
-			name:            "1.7.0 to latest (1.9.9) is capped at 1.7.9",
-			currentVersion:  "1.7.0",
-			requestedTarget: "latest",
-			wantState:       jobs.JobStateReady,
-			wantResolved:    "1.7.9",
+			name:              "1.7.0 to latest (1.9.9): chains through 1.7.9 to 1.8.0",
+			currentVersion:    "1.7.0",
+			requestedTarget:   "latest",
+			wantState:         jobs.JobStateReady,
+			wantResolved:      "1.8.0",
+			wantSteppingStone: "1.7.9",
 		},
 		{
-			name:            "1.7.5 to 2.0.0 is capped at 1.7.9 (first breakpoint wins)",
-			currentVersion:  "1.7.5",
-			requestedTarget: "2.0.0",
-			wantState:       jobs.JobStateReady,
-			wantResolved:    "1.7.9",
+			name:              "1.7.5 to 2.0.0: first breakpoint (1.8.0) wins, chains through 1.7.9",
+			currentVersion:    "1.7.5",
+			requestedTarget:   "2.0.0",
+			wantState:         jobs.JobStateReady,
+			wantResolved:      "1.8.0",
+			wantSteppingStone: "1.7.9",
 		},
 
-		// --- already at cap → MANUAL_UPGRADE_REQUIRED ---
+		// --- at stepping stone → direct advance through the breakpoint version (no chain) ---
 		{
-			name:            "1.7.9 to 1.9.9 requires SSH through 1.8.0",
+			name:            "1.7.9 to 1.9.9: at stepping stone, advances through 1.8.0 directly",
 			currentVersion:  "1.7.9",
 			requestedTarget: "1.9.9",
-			wantState:       jobs.JobStateFailed,
-			wantFailureCode: "MANUAL_UPGRADE_REQUIRED",
+			wantState:       jobs.JobStateReady,
+			wantResolved:    "1.8.0",
 		},
 		{
-			name:            "1.7.9 to 1.8.0 requires SSH (target is the breakpoint itself)",
+			name:            "1.7.9 to 1.8.0: at stepping stone, advances through 1.8.0 directly",
 			currentVersion:  "1.7.9",
 			requestedTarget: "1.8.0",
-			wantState:       jobs.JobStateFailed,
-			wantFailureCode: "MANUAL_UPGRADE_REQUIRED",
+			wantState:       jobs.JobStateReady,
+			wantResolved:    "1.8.0",
 		},
 
 		// --- already past first breakpoint, no second crossing → normal upgrade ---
@@ -146,23 +165,26 @@ func TestPlanUpgrade_BreakpointCapping(t *testing.T) {
 			wantResolved:    "1.9.9",
 		},
 
-		// --- crossing second breakpoint → MANUAL_UPGRADE_REQUIRED at 1.9.9 cap ---
+		// --- below stepping stone before second breakpoint → chain through 1.9.9 to 2.0.0 ---
 		{
-			name:            "1.9.9 to 2.0.0 requires SSH through 2.0.0",
-			currentVersion:  "1.9.9",
-			requestedTarget: "2.0.0",
-			wantState:       jobs.JobStateFailed,
-			wantFailureCode: "MANUAL_UPGRADE_REQUIRED",
-		},
-		{
-			name:            "1.9.0 to 2.0.0 is capped at 1.9.9 (crosses 2.0.0)",
-			currentVersion:  "1.9.0",
-			requestedTarget: "2.0.0",
-			wantState:       jobs.JobStateReady,
-			wantResolved:    "1.9.9",
+			name:              "1.9.0 to 2.0.0: chains through 1.9.9 (stepping stone) to 2.0.0 (breakpoint)",
+			currentVersion:    "1.9.0",
+			requestedTarget:   "2.0.0",
+			wantState:         jobs.JobStateReady,
+			wantResolved:      "2.0.0",
+			wantSteppingStone: "1.9.9",
 		},
 
-		// --- already on latest, no upgrade needed (resolved == requested, no breakpoint) ---
+		// --- at stepping stone before second breakpoint → advance through it ---
+		{
+			name:            "1.9.9 to 2.0.0: at stepping stone, advances through 2.0.0 directly",
+			currentVersion:  "1.9.9",
+			requestedTarget: "2.0.0",
+			wantState:       jobs.JobStateReady,
+			wantResolved:    "2.0.0",
+		},
+
+		// --- already on latest, no upgrade needed ---
 		{
 			name:            "already on 1.9.9, target 1.9.9 proceeds (no crossing)",
 			currentVersion:  "1.9.9",
@@ -171,16 +193,16 @@ func TestPlanUpgrade_BreakpointCapping(t *testing.T) {
 			wantResolved:    "1.9.9",
 		},
 
-		// --- no currentVersion fallback: block only if target IS a breakpoint ---
+		// --- no currentVersion: gate logic skipped, upgrade proceeds as-is ---
 		{
-			name:            "no currentVersion, targeting 1.8.0 (breakpoint) is blocked",
+			name:            "no currentVersion, targeting 1.8.0 (breakpoint) proceeds as-is",
 			currentVersion:  "",
 			requestedTarget: "1.8.0",
-			wantState:       jobs.JobStateFailed,
-			wantFailureCode: "MANUAL_UPGRADE_REQUIRED",
+			wantState:       jobs.JobStateReady,
+			wantResolved:    "1.8.0",
 		},
 		{
-			name:            "no currentVersion, targeting 1.9.9 (not a breakpoint) proceeds",
+			name:            "no currentVersion, targeting 1.9.9 proceeds as-is",
 			currentVersion:  "",
 			requestedTarget: "1.9.9",
 			wantState:       jobs.JobStateReady,
@@ -209,11 +231,156 @@ func TestPlanUpgrade_BreakpointCapping(t *testing.T) {
 			if tt.wantResolved != "" && plan.ResolvedTarget != tt.wantResolved {
 				t.Errorf("ResolvedTarget: got %q, want %q", plan.ResolvedTarget, tt.wantResolved)
 			}
+
+			if plan.SteppingStone != tt.wantSteppingStone {
+				t.Errorf("SteppingStone: got %q, want %q", plan.SteppingStone, tt.wantSteppingStone)
+			}
 		})
 	}
 }
 
-// TestPlanUpgrade_ManualModeIgnoresBreakpoints ensures MANUAL mode bypasses all breakpoint logic.
+// TestPlanUpgrade_StopPoints covers stop point logic: cap at stepping stone then
+// block with MANUAL_UPGRADE_REQUIRED when the user reaches it.
+func TestPlanUpgrade_StopPoints(t *testing.T) {
+	releases := []string{"1.7.0", "1.7.5", "1.7.9", "1.8.0", "1.9.0", "1.9.9", "2.0.0"}
+	stopPoints := []map[string]string{
+		{"version": "2.0.0", "reason": "Major release: SSH required."},
+	}
+
+	tests := []struct {
+		name            string
+		currentVersion  string
+		requestedTarget string
+		wantState       jobs.JobState
+		wantFailureCode string
+		wantResolved    string
+	}{
+		// below stepping stone → redirect there (same as breakpoint)
+		{
+			name:            "1.9.0 to 2.0.0 is capped at 1.9.9 (stepping stone before stop point)",
+			currentVersion:  "1.9.0",
+			requestedTarget: "2.0.0",
+			wantState:       jobs.JobStateReady,
+			wantResolved:    "1.9.9",
+		},
+		// at stepping stone → MANUAL_UPGRADE_REQUIRED (unlike breakpoint which auto-advances)
+		{
+			name:            "1.9.9 to 2.0.0 requires SSH (at stepping stone for stop point)",
+			currentVersion:  "1.9.9",
+			requestedTarget: "2.0.0",
+			wantState:       jobs.JobStateFailed,
+			wantFailureCode: "MANUAL_UPGRADE_REQUIRED",
+		},
+		// not crossing the stop point → proceeds normally
+		{
+			name:            "1.9.0 to 1.9.9 proceeds normally (stop point not crossed)",
+			currentVersion:  "1.9.0",
+			requestedTarget: "1.9.9",
+			wantState:       jobs.JobStateReady,
+			wantResolved:    "1.9.9",
+		},
+		// no currentVersion → gate logic skipped
+		{
+			name:            "no currentVersion, targeting 2.0.0 (stop point) proceeds as-is",
+			currentVersion:  "",
+			requestedTarget: "2.0.0",
+			wantState:       jobs.JobStateReady,
+			wantResolved:    "2.0.0",
+		},
+	}
+
+	manifestPath := buildManifestFile(t)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policyPath := buildPolicyFileWithStopPoints(t, "2.0.0", releases, nil, stopPoints)
+			srv := newTestServer(t, policyPath, manifestPath)
+
+			plan := srv.PlanUpgrade(context.Background(), jobs.JobModeDashboard, tt.requestedTarget, tt.currentVersion)
+
+			if plan.State != tt.wantState {
+				t.Errorf("State: got %q, want %q (failureCode=%q, message=%q)",
+					plan.State, tt.wantState, plan.FailureCode, plan.Message)
+			}
+			if tt.wantFailureCode != "" && plan.FailureCode != tt.wantFailureCode {
+				t.Errorf("FailureCode: got %q, want %q", plan.FailureCode, tt.wantFailureCode)
+			}
+			if tt.wantResolved != "" && plan.ResolvedTarget != tt.wantResolved {
+				t.Errorf("ResolvedTarget: got %q, want %q", plan.ResolvedTarget, tt.wantResolved)
+			}
+		})
+	}
+}
+
+// TestPlanUpgrade_MixedGates verifies that when a breakpoint and a stop point both
+// exist, the lowest-version gate wins and its specific behaviour applies.
+func TestPlanUpgrade_MixedGates(t *testing.T) {
+	// breakpoint at 1.8.0 (auto-advance), stop point at 2.0.0 (SSH required)
+	releases := []string{"1.7.9", "1.8.0", "1.9.9", "2.0.0"}
+	breakpoints := []map[string]string{
+		{"version": "1.8.0", "reason": "Step through 1.8.0."},
+	}
+	stopPoints := []map[string]string{
+		{"version": "2.0.0", "reason": "SSH required for 2.0.0."},
+	}
+	manifestPath := buildManifestFile(t)
+
+	tests := []struct {
+		name            string
+		currentVersion  string
+		requestedTarget string
+		wantState       jobs.JobState
+		wantFailureCode string
+		wantResolved    string
+	}{
+		// breakpoint (1.8.0) is lower → auto-advance wins
+		{
+			name:            "1.7.9 to 2.0.0: lowest gate is breakpoint 1.8.0, auto-advances through it",
+			currentVersion:  "1.7.9",
+			requestedTarget: "2.0.0",
+			wantState:       jobs.JobStateReady,
+			wantResolved:    "1.8.0",
+		},
+		// past breakpoint, now hits stop point
+		{
+			name:            "1.9.9 to 2.0.0: lowest gate is stop point 2.0.0, SSH required",
+			currentVersion:  "1.9.9",
+			requestedTarget: "2.0.0",
+			wantState:       jobs.JobStateFailed,
+			wantFailureCode: "MANUAL_UPGRADE_REQUIRED",
+		},
+		// past both gates
+		{
+			name:            "2.0.0 to 2.0.0: already on target, no gate",
+			currentVersion:  "2.0.0",
+			requestedTarget: "2.0.0",
+			wantState:       jobs.JobStateReady,
+			wantResolved:    "2.0.0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policyPath := buildPolicyFileWithStopPoints(t, "2.0.0", releases, breakpoints, stopPoints)
+			srv := newTestServer(t, policyPath, manifestPath)
+
+			plan := srv.PlanUpgrade(context.Background(), jobs.JobModeDashboard, tt.requestedTarget, tt.currentVersion)
+
+			if plan.State != tt.wantState {
+				t.Errorf("State: got %q, want %q (failureCode=%q, message=%q)",
+					plan.State, tt.wantState, plan.FailureCode, plan.Message)
+			}
+			if tt.wantFailureCode != "" && plan.FailureCode != tt.wantFailureCode {
+				t.Errorf("FailureCode: got %q, want %q", plan.FailureCode, tt.wantFailureCode)
+			}
+			if tt.wantResolved != "" && plan.ResolvedTarget != tt.wantResolved {
+				t.Errorf("ResolvedTarget: got %q, want %q", plan.ResolvedTarget, tt.wantResolved)
+			}
+		})
+	}
+}
+
+// TestPlanUpgrade_ManualModeIgnoresBreakpoints ensures MANUAL mode bypasses all gate logic.
 func TestPlanUpgrade_ManualModeIgnoresBreakpoints(t *testing.T) {
 	releases := []string{"1.7.0", "1.7.9", "1.8.0", "1.9.9"}
 	breakpoints := []map[string]string{
@@ -302,19 +469,20 @@ func TestHandleUpgradePlan_CurrentVersionWiredThrough(t *testing.T) {
 		wantResolved    string
 	}{
 		{
-			// 1.7.5 → 1.9.9 with breakpoint at 1.8.0: should be capped at 1.7.9
-			name:         "crossing breakpoint is capped via API",
+			// 1.7.5 → 1.9.9 with breakpoint at 1.8.0: below stepping stone → chains to 1.8.0 directly
+			name:         "crossing breakpoint chains to breakpoint version via API",
 			body:         `{"requestedTarget":"1.9.9","currentVersion":"1.7.5"}`,
-			wantResolved: "1.7.9",
+			wantResolved: "1.8.0",
 		},
 		{
-			// 1.7.9 → 1.9.9 with breakpoint at 1.8.0: already at cap, blocked
-			name:            "at cap via API returns MANUAL_UPGRADE_REQUIRED",
-			body:            `{"requestedTarget":"1.9.9","currentVersion":"1.7.9"}`,
-			wantFailureCode: "MANUAL_UPGRADE_REQUIRED",
+			// 1.7.9 → 1.9.9 with breakpoint at 1.8.0: at stepping stone, advances through 1.8.0
+			name:         "at stepping stone via API advances through breakpoint",
+			body:         `{"requestedTarget":"1.9.9","currentVersion":"1.7.9"}`,
+			wantResolved: "1.8.0",
 		},
 		{
-			// no currentVersion sent: fallback to exact-match — targeting 1.9.9 is fine
+			// no currentVersion sent: gate logic resolved internally from container; in tests no container is
+			// running so it falls back to empty, meaning no gate enforcement — targeting 1.9.9 is fine
 			name:         "no currentVersion, non-breakpoint target proceeds",
 			body:         `{"requestedTarget":"1.9.9"}`,
 			wantResolved: "1.9.9",
@@ -372,7 +540,7 @@ func TestHandleUpgradeRun_CurrentVersionWiredThrough(t *testing.T) {
 	tmpDir := t.TempDir()
 	srv := &Server{config: cfg, jobStore: jobs.NewStore(tmpDir)}
 
-	// 1.7.9 → 1.9.9 crosses 1.8.0 breakpoint and user is at cap → must be blocked.
+	// 1.7.9 → 1.9.9 with breakpoint at 1.8.0: at stepping stone → redirected to 1.8.0, job created.
 	body := strings.NewReader(`{"requestedTarget":"1.9.9","currentVersion":"1.7.9"}`)
 	req := httptest.NewRequest(http.MethodPost, "/upgrade/run", body)
 	w := httptest.NewRecorder()
@@ -383,13 +551,16 @@ func TestHandleUpgradeRun_CurrentVersionWiredThrough(t *testing.T) {
 		t.Fatalf("decode response: %v", err)
 	}
 
-	if resp.FailureCode != "MANUAL_UPGRADE_REQUIRED" {
-		t.Errorf("expected MANUAL_UPGRADE_REQUIRED, got %q (message: %s)", resp.FailureCode, resp.Message)
+	if resp.FailureCode != "" {
+		t.Errorf("expected no failure, got %q (message: %s)", resp.FailureCode, resp.Message)
 	}
 
-	// Confirm no job was created.
+	// Confirm a job was created targeting the breakpoint version (1.8.0).
 	job, _ := srv.jobStore.LoadLatest()
-	if job != nil {
-		t.Errorf("expected no job to be created, found job %s in state %s", job.JobID, job.State)
+	if job == nil {
+		t.Fatal("expected a job to be created, got nil")
+	}
+	if job.ResolvedTarget != "1.8.0" {
+		t.Errorf("expected job resolvedTarget 1.8.0, got %q", job.ResolvedTarget)
 	}
 }

@@ -413,7 +413,22 @@ func (s *Server) HandleUpgradePlan() http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 
-		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, req.CurrentVersion)
+		// If caller did not supply currentVersion, resolve it from the running container.
+		// This allows payram-core to omit the field entirely while still getting full
+		// gate enforcement (breakpoints and stop points).
+		currentVersion := req.CurrentVersion
+		if currentVersion == "" {
+			resolveCtx, resolveCancel := context.WithTimeout(r.Context(), time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
+			defer resolveCancel()
+			if containerName, cnErr := s.discoverContainerName(resolveCtx); cnErr == nil {
+				initVersion := s.fetchPolicyInitVersion(resolveCtx)
+				if ver, _, verErr := s.resolveCoreVersion(resolveCtx, containerName, initVersion); verErr == nil {
+					currentVersion = ver
+				}
+			}
+		}
+
+		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, currentVersion)
 
 		// Build response
 		response := PlanResponse{
@@ -519,7 +534,20 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 
-		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, req.CurrentVersion)
+		// If caller did not supply currentVersion, resolve it from the running container.
+		currentVersion := req.CurrentVersion
+		if currentVersion == "" {
+			resolveCtx, resolveCancel := context.WithTimeout(r.Context(), time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
+			defer resolveCancel()
+			if containerName, cnErr := s.discoverContainerName(resolveCtx); cnErr == nil {
+				initVersion := s.fetchPolicyInitVersion(resolveCtx)
+				if ver, _, verErr := s.resolveCoreVersion(resolveCtx, containerName, initVersion); verErr == nil {
+					currentVersion = ver
+				}
+			}
+		}
+
+		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, currentVersion)
 		if plan.State == jobs.JobStateFailed {
 			// Planning failed - return error without creating a job
 			w.Header().Set("Content-Type", "application/json")
@@ -554,7 +582,7 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 			jobID, mode, req.RequestedTarget, plan.ResolvedTarget, source))
 
 		// Launch background execution goroutine
-		go s.executeUpgrade(job, plan.Manifest, plan.ArchSupport)
+		go s.executeUpgrade(job, plan.Manifest, plan.ArchSupport, plan.SteppingStone)
 		// Return response
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)

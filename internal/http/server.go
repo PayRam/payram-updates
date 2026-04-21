@@ -417,7 +417,7 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	}
 
 	s.jobStore.AppendLog(fmt.Sprintf("Starting auto update job %s: mode=%s target=%s source=AUTO", jobID, "DASHBOARD", plan.RequestedTarget))
-	go s.executeUpgrade(job, plan.Manifest, plan.ArchSupport)
+	go s.executeUpgrade(job, plan.Manifest, plan.ArchSupport, plan.SteppingStone)
 }
 
 // executeUpgrade runs the upgrade execution in the background.
@@ -442,7 +442,7 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 // ALL FAILURE CODES HAVE RECOVERY PLAYBOOKS:
 // See internal/recovery/playbook.go for complete recovery instructions.
 // Every failure includes next steps for manual recovery.
-func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest, archSupport map[string]string) {
+func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest, archSupport map[string]string, steppingStone string) {
 	ctx := context.Background()
 	isDryRun := s.config.ExecutionMode == "dry-run"
 	imageTag := job.ResolvedTarget
@@ -526,6 +526,88 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest, 
 	if !s.preflightChecks(ctx, job, containerName) {
 		return
 	}
+
+	if steppingStone != "" {
+		// TWO-HOP UPGRADE: breakpoint chaining.
+		// Hop 1: upgrade silently through the stepping stone version.
+		// Hop 2: upgrade to the resolved target (breakpoint version).
+		// Both hops use the same pre-hop backup for rollback safety.
+
+		// Phase 5a: Pull stepping stone image
+		steppingArgs, steppingTag, ok := s.prepareUpgradeArgs(ctx, job, containerName, manifestData, steppingStone, archSupport)
+		if !ok {
+			return
+		}
+		s.jobStore.AppendLog(fmt.Sprintf("Breakpoint upgrade: passing through stepping stone %s first, then continuing to %s", steppingTag, imageTag))
+		if !s.pullUpgradeImage(ctx, job, imageRepo, steppingTag) {
+			return
+		}
+
+		// Phase 6a: Quiesce + Backup (once, covers both hops)
+		stoppedPrograms, usedSupervisor, ok := s.quiesceSupervisorPrograms(ctx, job, containerName)
+		if !ok {
+			return
+		}
+		if usedSupervisor {
+			if _, ok := s.createPreUpgradeBackupAfterQuiesce(ctx, job, containerName, steppingTag, policyInitVersion, 3, stoppedPrograms); !ok {
+				return
+			}
+		} else {
+			if _, ok := s.createPreUpgradeBackupBeforeStop(ctx, job, containerName, steppingTag, policyInitVersion); !ok {
+				return
+			}
+		}
+
+		// Phase 7a: Stop → replace → verify stepping stone
+		if !s.stopContainerForUpgrade(ctx, job, containerName) {
+			return
+		}
+		if !s.replaceContainer(ctx, job, containerName, steppingArgs) {
+			return
+		}
+		job.Message = fmt.Sprintf("Passing through %s, upgrading to %s...", steppingTag, imageTag)
+		job.UpdatedAt = time.Now().UTC()
+		s.jobStore.Save(job)
+		if !s.verifyUpgrade(ctx, job, containerName, steppingTag, policyInitVersion) {
+			return
+		}
+		s.jobStore.AppendLog(fmt.Sprintf("Stepping stone %s healthy, continuing to %s", steppingTag, imageTag))
+
+		// Phase 5b: Pull final image (stepping stone is now running — re-read runtime state)
+		dockerArgs, imageTag, ok = s.prepareUpgradeArgs(ctx, job, containerName, manifestData, imageTag, archSupport)
+		if !ok {
+			return
+		}
+		if !s.pullUpgradeImage(ctx, job, imageRepo, imageTag) {
+			return
+		}
+
+		// Phase 7b: Stop stepping stone → replace → verify final target
+		if !s.stopContainerForUpgrade(ctx, job, containerName) {
+			return
+		}
+		if !s.replaceContainer(ctx, job, containerName, dockerArgs) {
+			return
+		}
+		if !s.verifyUpgrade(ctx, job, containerName, imageTag, policyInitVersion) {
+			// Hop 2 failed. System is on stepping stone (now stopped). Report clearly.
+			job.FailureCode = "HEALTHCHECK_FAILED"
+			job.Message = fmt.Sprintf(
+				"Upgrade to %s failed after passing through stepping stone %s. "+
+					"System was on %s (healthy). Backup available at: %s. "+
+					"Retry the upgrade to attempt %s again.",
+				imageTag, steppingTag, steppingTag, job.BackupPath, imageTag,
+			)
+			job.UpdatedAt = time.Now().UTC()
+			s.jobStore.Save(job)
+			return
+		}
+
+		s.finalizeUpgrade(ctx, job, imageRepo, imageTag)
+		return
+	}
+
+	// SINGLE-HOP UPGRADE (no stepping stone)
 
 	// Phase 5: Pull image before stopping container
 	if !s.pullUpgradeImage(ctx, job, imageRepo, imageTag) {

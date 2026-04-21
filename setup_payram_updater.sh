@@ -259,6 +259,19 @@ case "$ARCH_RAW" in
 esac
 log "Detected: ${OS}-${ARCH}"
 
+# macOS: root doesn't inherit the user-owned Colima Docker socket.
+# Detect it now so payram-updater init (run via sudo) can reach Docker.
+if [[ "$OS" == "darwin" && -z "${DOCKER_HOST:-}" ]]; then
+  _COLIMA_USER="${SUDO_USER:-$(logname 2>/dev/null || echo "")}"
+  if [[ -n "$_COLIMA_USER" ]]; then
+    _COLIMA_SOCKET="$(eval echo "~$_COLIMA_USER")/.colima/default/docker.sock"
+    if [[ -S "$_COLIMA_SOCKET" ]]; then
+      export DOCKER_HOST="unix://$_COLIMA_SOCKET"
+      log "macOS: DOCKER_HOST auto-detected ($DOCKER_HOST)"
+    fi
+  fi
+fi
+
 log "Fetching latest version..."
 VERSION="${PAYRAM_UPDATER_VERSION:-}"
 if [[ -z "$VERSION" ]]; then
@@ -407,6 +420,15 @@ EOF
   log "Environment file created"
 fi
 
+# macOS: persist DOCKER_HOST (Colima socket) into the env file so the
+# launchd service (running as root) can reach the user-owned Docker daemon.
+if [[ "$OS" == "darwin" && -n "${DOCKER_HOST:-}" ]]; then
+  if ! sudo grep -q "^DOCKER_HOST=" "$ENV_PATH" 2>/dev/null; then
+    echo "DOCKER_HOST=${DOCKER_HOST}" | sudo tee -a "$ENV_PATH" >/dev/null
+    log "macOS: Persisted DOCKER_HOST=$DOCKER_HOST to $ENV_PATH"
+  fi
+fi
+
 # Helper functions for service installation
 install_systemd_service() {
   sudo tee "$SERVICE_PATH" >/dev/null <<'EOF'
@@ -527,7 +549,7 @@ if sudo test -f "$INIT_CONFIG" && sudo grep -q '"initialized": true' "$INIT_CONF
   
   if [[ "$REINIT" =~ ^[Yy] ]]; then
     log "Running updater init..."
-    if ! init_out=$(sudo "${INSTALL_DIR}/${BIN_NAME}" init --no-autoupdate 2>&1); then
+    if ! init_out=$(sudo env DOCKER_HOST="${DOCKER_HOST:-}" "${INSTALL_DIR}/${BIN_NAME}" init --no-autoupdate 2>&1); then
       echo "$init_out" >&2
       echo "ERROR: Initialization failed" >&2
       exit 1
@@ -538,7 +560,7 @@ if sudo test -f "$INIT_CONFIG" && sudo grep -q '"initialized": true' "$INIT_CONF
   fi
 else
   log "Running updater init..."
-  if ! init_out=$(sudo "${INSTALL_DIR}/${BIN_NAME}" init --no-autoupdate 2>&1); then
+  if ! init_out=$(sudo env DOCKER_HOST="${DOCKER_HOST:-}" "${INSTALL_DIR}/${BIN_NAME}" init --no-autoupdate 2>&1); then
     echo "$init_out" >&2
     echo "ERROR: Initialization failed" >&2
     exit 1

@@ -20,8 +20,20 @@ var (
 	ErrInvalidJSON    = errors.New("invalid JSON response")
 )
 
-// Breakpoint represents a version breakpoint in the policy.
+// Breakpoint represents a version that requires an automatic stepping-stone
+// upgrade: the dashboard will stop at the highest release below this version,
+// then on the next run advance through it automatically. No SSH needed.
 type Breakpoint struct {
+	Version string `json:"version"`
+	Reason  string `json:"reason"`
+	Docs    string `json:"docs"`
+}
+
+// StopPoint represents a version that requires a manual SSH upgrade.
+// The dashboard will stop at the highest release below this version and
+// return MANUAL_UPGRADE_REQUIRED — the operator must SSH and upgrade
+// through this version before the dashboard can continue.
+type StopPoint struct {
 	Version string `json:"version"`
 	Reason  string `json:"reason"`
 	Docs    string `json:"docs"`
@@ -33,6 +45,7 @@ type Policy struct {
 	UpdaterAPIInitVersion string            `json:"updater_api_init_version"`
 	Releases              []string          `json:"releases"`
 	Breakpoints           []Breakpoint      `json:"breakpoints"`
+	StopPoints            []StopPoint       `json:"stop_points"`
 	ArchSupport           map[string]string `json:"arch_support,omitempty"` // e.g. {"arm64": "1.9.1"}
 }
 

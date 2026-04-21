@@ -18,6 +18,10 @@ type UpgradePlan struct {
 	Mode            jobs.JobMode       `json:"mode"`
 	RequestedTarget string             `json:"requestedTarget"`
 	ResolvedTarget  string             `json:"resolvedTarget"`
+	// SteppingStone is set when a breakpoint requires a transparent intermediate hop.
+	// The executor upgrades through SteppingStone first, then continues to ResolvedTarget,
+	// all within a single job. Empty for stop points and when no chaining is needed.
+	SteppingStone   string             `json:"steppingStone,omitempty"`
 	FailureCode     string             `json:"failureCode,omitempty"`
 	Message         string             `json:"message"`
 	Manifest        *manifest.Manifest `json:"manifest,omitempty"`
@@ -41,13 +45,9 @@ type UpgradePlan struct {
 // - Resolves target version
 //
 // currentVersion is the running version of the core container. When non-empty it
-// enables breakpoint-aware target capping: if the requested upgrade would cross a
-// breakpoint, the target is automatically capped at the highest release below that
-// breakpoint so the dashboard can advance the user up to the SSH boundary without
-// skipping it. If the user is already at the cap, MANUAL_UPGRADE_REQUIRED is
-// returned so the operator knows to SSH through the breakpoint before retrying.
-// When empty, the check falls back to exact-match so directly targeting a
-// breakpoint version is still blocked.
+// enables gate enforcement: breakpoints force automatic stepping-stone upgrades
+// (no SSH), stop points require manual SSH through that version before the
+// dashboard can continue. When empty, gate logic is skipped.
 func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTarget string, currentVersion string) *UpgradePlan {
 	plan := &UpgradePlan{
 		Mode:            mode,
@@ -119,89 +119,112 @@ func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTa
 		}
 	}
 
-	// Breakpoint enforcement (DASHBOARD mode only).
+	// Gate enforcement (DASHBOARD mode only, requires currentVersion).
 	//
-	// Breakpoints mark versions that require a manual SSH upgrade. The dashboard
-	// must never jump over one automatically.
+	// Two kinds of upgrade gates are supported:
 	//
-	// Algorithm when currentVersion is known:
-	//   1. Find the lowest breakpoint that sits between currentVersion (exclusive)
-	//      and resolvedTarget (inclusive) — the first one the user would cross.
-	//   2. If such a breakpoint exists, cap the target at the highest release that
-	//      is strictly below that breakpoint (the "safe ceiling").
-	//   3. If the user is already at or above the safe ceiling (i.e. cap <= current),
-	//      they must SSH through the breakpoint — return MANUAL_UPGRADE_REQUIRED.
-	//   4. Otherwise, redirect resolvedTarget to the cap and allow the upgrade.
+	// BREAKPOINT — automatic stepping stone (no SSH needed):
+	//   The dashboard stops at the highest release below the breakpoint version,
+	//   then on the next run advances through it automatically.
+	//   Example (breakpoint at 2.0.0, last release before it is 1.9.7):
+	//     • 1.9.1 → 2.0.0: redirected to 1.9.7 first
+	//     • 1.9.7 → 2.0.0: redirected through 2.0.0 automatically
 	//
-	// This means:
-	//   • 1.7.5 → 1.9.9, breakpoint 1.8.0: caps to 1.7.9, upgrade proceeds ✓
-	//   • 1.7.9 → 1.9.9, breakpoint 1.8.0: cap == current, MANUAL_UPGRADE_REQUIRED ✓
-	//   • 1.8.0 → 1.9.9, breakpoint 2.0.0: not crossed, upgrade proceeds ✓
-	//   • 1.9.9 → 2.0.0, breakpoint 2.0.0: cap == current, MANUAL_UPGRADE_REQUIRED ✓
+	// STOP POINT — manual SSH required:
+	//   The dashboard stops at the highest release below the stop point version
+	//   and returns MANUAL_UPGRADE_REQUIRED. The operator must SSH and manually
+	//   upgrade through that version before the dashboard can continue.
+	//   Example (stop point at 2.0.0, last release before it is 1.9.7):
+	//     • 1.9.1 → 2.0.0: redirected to 1.9.7 first
+	//     • 1.9.7 → 2.0.0: MANUAL_UPGRADE_REQUIRED
 	//
-	// When currentVersion is empty the check falls back to exact-match so that
-	// directly targeting a breakpoint version is still blocked.
-	if mode == jobs.JobModeDashboard && policyData != nil {
+	// When both kinds exist, the lowest-version gate wins.
+	// When currentVersion is empty, gate logic is skipped.
+	if mode == jobs.JobModeDashboard && policyData != nil && currentVersion != "" {
 		normalizeVer := func(v string) string {
 			return strings.TrimPrefix(strings.TrimSpace(v), "v")
 		}
 
-		if currentVersion != "" {
-			cur, curErr := goversion.NewVersion(normalizeVer(currentVersion))
-			tgt, tgtErr := goversion.NewVersion(normalizeVer(resolvedTarget))
+		cur, curErr := goversion.NewVersion(normalizeVer(currentVersion))
+		tgt, tgtErr := goversion.NewVersion(normalizeVer(resolvedTarget))
 
-			if curErr == nil && tgtErr == nil {
-				// Step 1: find the lowest breakpoint crossed by this upgrade.
-				var firstBPVer *goversion.Version
-				var firstBP policy.Breakpoint
-				for _, bp := range policyData.Breakpoints {
-					bpv, err := goversion.NewVersion(normalizeVer(bp.Version))
-					if err != nil {
-						continue
-					}
-					// crossed = current < breakpoint <= target
-					if cur.LessThan(bpv) && tgt.GreaterThanOrEqual(bpv) {
-						if firstBPVer == nil || bpv.LessThan(firstBPVer) {
-							firstBPVer = bpv
-							firstBP = bp
-						}
-					}
+		if curErr == nil && tgtErr == nil {
+			// Find the lowest gate (breakpoint or stop point) crossed by this upgrade.
+			// crossed = current < gate <= target
+			type gateKind int
+			const (
+				gateBreakpoint gateKind = iota
+				gateStopPoint
+			)
+			type gate struct {
+				ver    *goversion.Version
+				kind   gateKind
+				reason string
+				docs   string
+			}
+
+			var firstGate *gate
+			for _, bp := range policyData.Breakpoints {
+				bpv, err := goversion.NewVersion(normalizeVer(bp.Version))
+				if err != nil {
+					continue
 				}
-
-				if firstBPVer != nil {
-					// Step 2: find the highest release strictly below that breakpoint.
-					var capVer *goversion.Version
-					for _, rel := range policyData.Releases {
-						rv, err := goversion.NewVersion(normalizeVer(rel))
-						if err != nil || !rv.LessThan(firstBPVer) {
-							continue
-						}
-						if capVer == nil || rv.GreaterThan(capVer) {
-							capVer = rv
-						}
-					}
-
-					// Step 3/4: redirect or block.
-					if capVer != nil && capVer.GreaterThan(cur) {
-						// Safe to upgrade up to the cap; proceed with capped target.
-						resolvedTarget = capVer.Original()
-					} else {
-						// Already at (or past) the cap — must SSH through the breakpoint.
-						plan.State = jobs.JobStateFailed
-						plan.FailureCode = "MANUAL_UPGRADE_REQUIRED"
-						plan.Message = fmt.Sprintf("%s %s", firstBP.Reason, firstBP.Docs)
-						return plan
+				if cur.LessThan(bpv) && tgt.GreaterThanOrEqual(bpv) {
+					if firstGate == nil || bpv.LessThan(firstGate.ver) {
+						firstGate = &gate{ver: bpv, kind: gateBreakpoint, reason: bp.Reason, docs: bp.Docs}
 					}
 				}
 			}
-		} else {
-			// Fallback: no currentVersion — block only if target IS a breakpoint.
-			for _, bp := range policyData.Breakpoints {
-				if bp.Version == resolvedTarget {
-					plan.State = jobs.JobStateFailed
-					plan.FailureCode = "MANUAL_UPGRADE_REQUIRED"
-					plan.Message = fmt.Sprintf("%s %s", bp.Reason, bp.Docs)
-					return plan
+			for _, sp := range policyData.StopPoints {
+				spv, err := goversion.NewVersion(normalizeVer(sp.Version))
+				if err != nil {
+					continue
+				}
+				if cur.LessThan(spv) && tgt.GreaterThanOrEqual(spv) {
+					if firstGate == nil || spv.LessThan(firstGate.ver) {
+						firstGate = &gate{ver: spv, kind: gateStopPoint, reason: sp.Reason, docs: sp.Docs}
+					}
+				}
+			}
+
+			if firstGate != nil {
+				// Find the highest release strictly below this gate (the "stepping stone").
+				var capVer *goversion.Version
+				for _, rel := range policyData.Releases {
+					rv, err := goversion.NewVersion(normalizeVer(rel))
+					if err != nil || !rv.LessThan(firstGate.ver) {
+						continue
+					}
+					if capVer == nil || rv.GreaterThan(capVer) {
+						capVer = rv
+					}
+				}
+
+				if capVer != nil && capVer.GreaterThan(cur) {
+					// User is below the stepping stone.
+					switch firstGate.kind {
+					case gateBreakpoint:
+						// Chain both hops into one job: executor upgrades to stepping stone
+						// first (silently), then continues to the breakpoint version.
+						plan.SteppingStone = capVer.Original()
+						resolvedTarget = firstGate.ver.Original()
+					case gateStopPoint:
+						// Redirect to stepping stone — user must SSH after reaching it.
+						resolvedTarget = capVer.Original()
+					}
+				} else {
+					// User is at or past the stepping stone — apply gate-specific behaviour.
+					switch firstGate.kind {
+					case gateBreakpoint:
+						// Already at stepping stone: advance through breakpoint directly (no chain needed).
+						resolvedTarget = firstGate.ver.Original()
+					case gateStopPoint:
+						// Block — operator must SSH through this version manually.
+						plan.State = jobs.JobStateFailed
+						plan.FailureCode = "MANUAL_UPGRADE_REQUIRED"
+						plan.Message = fmt.Sprintf("%s %s", firstGate.reason, firstGate.docs)
+						return plan
+					}
 				}
 			}
 		}

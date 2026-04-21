@@ -659,40 +659,56 @@ func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *Inspect
 		}
 	} else {
 		// Update available
-		// Check if there's a breakpoint between current and latest
+		// Find the lowest gate (breakpoint or stop point) between current and latest.
+		// Both are surfaced via nextBreakpoint for backward compatibility with payram-core.
 		hasBreakpoint := false
 		var nextBreakpoint *policy.Breakpoint
+		nextBreakpointIsStopPoint := false
 
 		for _, bp := range policyData.Breakpoints {
 			bpNorm := corecompat.NormalizeVersion(bp.Version)
-			// Check if breakpoint is between current and latest (or equal to latest)
+			// Check if gate is between current and latest (or equal to latest)
 			cmpCurrent := i.compareVersions(bpNorm, currentNorm)
 			cmpLatest := i.compareVersions(bpNorm, latestNorm)
 
 			if cmpCurrent > 0 && cmpLatest <= 0 {
-				// Breakpoint is after current and at or before latest
 				hasBreakpoint = true
 				if nextBreakpoint == nil || i.compareVersions(bpNorm, corecompat.NormalizeVersion(nextBreakpoint.Version)) < 0 {
 					nextBreakpoint = &bp
+					nextBreakpointIsStopPoint = false
 				}
 			}
 		}
+		for _, sp := range policyData.StopPoints {
+			spNorm := corecompat.NormalizeVersion(sp.Version)
+			cmpCurrent := i.compareVersions(spNorm, currentNorm)
+			cmpLatest := i.compareVersions(spNorm, latestNorm)
+
+			if cmpCurrent > 0 && cmpLatest <= 0 {
+				hasBreakpoint = true
+				if nextBreakpoint == nil || i.compareVersions(spNorm, corecompat.NormalizeVersion(nextBreakpoint.Version)) < 0 {
+					// Map stop point into a Breakpoint so the rest of the logic is identical.
+					nextBreakpoint = &policy.Breakpoint{Version: sp.Version, Reason: sp.Reason, Docs: sp.Docs}
+					nextBreakpointIsStopPoint = true
+				}
+			}
+		}
+		_ = nextBreakpointIsStopPoint // used in canUpdateViaDashboard logic below
 
 		if hasBreakpoint && nextBreakpoint != nil {
 			// Breakpoint in the way of latest - may still allow dashboard update up to max version
-			updateInfo.CanUpdateViaDashboard = false
 			updateInfo.NextBreakpoint = &BreakpointInfo{
 				Version: nextBreakpoint.Version,
 				Reason:  nextBreakpoint.Reason,
 				Docs:    nextBreakpoint.Docs,
 			}
 
-			// Find max dashboard version (highest release before breakpoint)
+			// Find max dashboard version (highest release before the gate)
 			maxDashboardVer := ""
 			breakpointNorm := corecompat.NormalizeVersion(nextBreakpoint.Version)
 			for _, release := range policyData.Releases {
 				releaseNorm := corecompat.NormalizeVersion(release)
-				// Release must be after current and before breakpoint
+				// Release must be after current and before gate
 				if i.compareVersions(releaseNorm, currentNorm) > 0 && i.compareVersions(releaseNorm, breakpointNorm) < 0 {
 					if maxDashboardVer == "" || i.compareVersions(releaseNorm, corecompat.NormalizeVersion(maxDashboardVer)) > 0 {
 						maxDashboardVer = release
@@ -703,18 +719,32 @@ func (i *Inspector) checkUpdateAvailability(ctx context.Context, result *Inspect
 				updateInfo.MaxDashboardVersion = maxDashboardVer
 			}
 
-			if maxDashboardVer != "" {
+			if !nextBreakpointIsStopPoint {
+				// Breakpoint: dashboard chains through the stepping stone transparently in one job.
+				// MaxDashboardVersion is the breakpoint version itself — the frontend sends this as
+				// requestedTarget, the updater handles the stepping-stone hop silently inside the job.
 				updateInfo.CanUpdateViaDashboard = true
-				updateInfo.Message = fmt.Sprintf("Update to %s available via dashboard; latest %s requires manual CLI upgrade (breakpoint at %s)", maxDashboardVer, latestVersion, nextBreakpoint.Version)
+				updateInfo.MaxDashboardVersion = nextBreakpoint.Version
+				updateInfo.Message = fmt.Sprintf("Update to %s available via dashboard (breakpoint at %s handled automatically)", nextBreakpoint.Version, nextBreakpoint.Version)
+				result.Checks["updateCheck"] = CheckResult{
+					Status:  "OK",
+					Message: fmt.Sprintf("Update available: %s → %s (dashboard upgrade, breakpoint handled automatically)", currentVersion, nextBreakpoint.Version),
+				}
+			} else if maxDashboardVer != "" {
+				// Stop point: dashboard can upgrade to the stepping stone; SSH needed after.
+				updateInfo.CanUpdateViaDashboard = true
+				updateInfo.Message = fmt.Sprintf("Update to %s available via dashboard; upgrade to %s requires SSH (stop point at %s)", maxDashboardVer, latestVersion, nextBreakpoint.Version)
 				result.Checks["updateCheck"] = CheckResult{
 					Status:  "WARNING",
-					Message: fmt.Sprintf("Update available up to %s via dashboard; latest %s blocked by breakpoint at %s.", maxDashboardVer, latestVersion, nextBreakpoint.Version),
+					Message: fmt.Sprintf("Update available up to %s via dashboard; %s requires SSH at stop point %s.", maxDashboardVer, latestVersion, nextBreakpoint.Version),
 				}
 			} else {
-				updateInfo.Message = fmt.Sprintf("Update to %s available, but requires manual CLI upgrade (breakpoint at %s)", latestVersion, nextBreakpoint.Version)
+				// Stop point and no stepping stone below it — SSH required immediately.
+				updateInfo.CanUpdateViaDashboard = false
+				updateInfo.Message = fmt.Sprintf("Upgrade to %s requires SSH (stop point at %s)", latestVersion, nextBreakpoint.Version)
 				result.Checks["updateCheck"] = CheckResult{
 					Status:  "WARNING",
-					Message: fmt.Sprintf("Update available but blocked by breakpoint at %s. Manual upgrade required.", nextBreakpoint.Version),
+					Message: fmt.Sprintf("Update available but blocked by stop point at %s. SSH required.", nextBreakpoint.Version),
 				}
 			}
 		} else {
