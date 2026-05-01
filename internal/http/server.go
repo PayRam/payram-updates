@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -75,6 +76,7 @@ type Server struct {
 	backupManager       *backup.Manager
 	containerBackupExec *backup.ContainerBackupExecutor
 	historyStore        *history.Store
+	upgradeWg           sync.WaitGroup
 }
 
 // New creates a new HTTP server instance.
@@ -443,6 +445,7 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 // See internal/recovery/playbook.go for complete recovery instructions.
 // Every failure includes next steps for manual recovery.
 func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest, archSupport map[string]string, steppingStone string) {
+	defer s.upgradeWg.Done()
 	ctx := context.Background()
 	isDryRun := s.config.ExecutionMode == "dry-run"
 	imageTag := job.ResolvedTarget

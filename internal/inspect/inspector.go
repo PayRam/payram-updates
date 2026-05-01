@@ -203,6 +203,20 @@ func (i *Inspector) checkLastJob(result *InspectResult) {
 		if result.OverallState == StateOK {
 			result.OverallState = StateDegraded
 		}
+
+		// Attach a stale-state recovery playbook so clients know how to recover.
+		var staleCode string
+		switch job.State {
+		case jobs.JobStateBackingUp:
+			staleCode = "STALE_BACKING_UP"
+		case jobs.JobStateExecuting:
+			staleCode = "STALE_EXECUTING"
+		case jobs.JobStateVerifying:
+			staleCode = "STALE_VERIFYING"
+		}
+		pbCtx := i.buildPlaybookContext(job.BackupPath)
+		playbook := recovery.RenderPlaybook(staleCode, pbCtx)
+		result.RecoveryPlaybook = &playbook
 	default:
 		result.Checks["lastJob"] = CheckResult{
 			Status:  "OK",

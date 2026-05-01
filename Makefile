@@ -41,7 +41,7 @@ fmt: ## Format all Go source files
 .PHONY: fmt-check
 fmt-check: ## Check if all Go files are formatted
 	@echo "Checking Go formatting..."
-	@UNFORMATTED=$$(find . -name '*.go' -not -path './data*' -not -path './vendor/*' -exec gofmt -l {} +); \
+	@UNFORMATTED=$$(find . \( -path './data' -o -path './vendor' \) -prune -o -name '*.go' -print | xargs gofmt -l); \
 	if [ -n "$$UNFORMATTED" ]; then \
 		echo "The following files are not formatted:"; \
 		echo "$$UNFORMATTED"; \

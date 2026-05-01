@@ -399,6 +399,57 @@ var playbooks = map[string]Playbook{
 		DocsURL:  "https://docs.payram.com/troubleshooting/migrations",
 		DataRisk: DataRiskPossible,
 	},
+
+	"STALE_BACKING_UP": {
+		Code:        "STALE_BACKING_UP",
+		Severity:    SeverityRetryable,
+		Title:       "Stale Backup State Detected",
+		UserMessage: "The updater was interrupted during the backup phase. No container changes were made. Run 'payram-updater sync' to clear the stale state.",
+		SSHSteps: []string{
+			"1. Confirm the container is still running and healthy: payram-updater inspect",
+			"2. If health checks pass, clear the stale state: payram-updater sync",
+			"3. Verify the system is healthy again: payram-updater inspect",
+			"4. If the container is not running, start it: docker start <container_name>",
+			"5. If the container remains unhealthy, check logs: docker logs <container_name> --tail 100",
+		},
+		DocsURL:  "https://docs.payram.com/recovery",
+		DataRisk: DataRiskNone,
+	},
+
+	"STALE_EXECUTING": {
+		Code:        "STALE_EXECUTING",
+		Severity:    SeverityManual,
+		Title:       "Stale Execution State Detected",
+		UserMessage: "The updater was interrupted while replacing the container. Verify what version is currently running before clearing state.",
+		SSHSteps: []string{
+			"1. Check what container is running: docker ps | grep <image_repo>",
+			"2. Run diagnostics: payram-updater inspect",
+			"3. If the container is running and healthy, sync state: payram-updater sync",
+			"4. If the container is missing or unhealthy, check logs: docker logs <container_name> --tail 200",
+			"5. If the old container is gone and the new one is broken, restore from backup:",
+			"   - List backups: payram-updater backup list",
+			"   - Restore: payram-updater backup restore --file <backup_path> --yes",
+		},
+		DocsURL:  "https://docs.payram.com/recovery",
+		DataRisk: DataRiskPossible,
+	},
+
+	"STALE_VERIFYING": {
+		Code:        "STALE_VERIFYING",
+		Severity:    SeverityManual,
+		Title:       "Stale Verification State Detected",
+		UserMessage: "The updater was interrupted during post-upgrade verification. The new container may have started. Verify health before clearing state.",
+		SSHSteps: []string{
+			"1. Run diagnostics: payram-updater inspect",
+			"2. If health checks pass, the upgrade likely succeeded — sync state: payram-updater sync",
+			"3. If health checks fail, check container logs: docker logs <container_name> --tail 200",
+			"4. If the container is unhealthy, restore from backup:",
+			"   - List backups: payram-updater backup list",
+			"   - Restore: payram-updater backup restore --file <backup_path> --yes",
+		},
+		DocsURL:  "https://docs.payram.com/recovery",
+		DataRisk: DataRiskPossible,
+	},
 }
 
 // unknownPlaybook is returned when a failure code is not recognized.

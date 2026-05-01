@@ -59,7 +59,7 @@ type PlanResponse struct {
 type RunRequest struct {
 	Mode            string `json:"mode"`
 	RequestedTarget string `json:"requestedTarget"`
-	Source          string `json:"source"` // Origin of request, defaults to "UNKNOWN"
+	Source          string `json:"source"`         // Origin of request, defaults to "UNKNOWN"
 	CurrentVersion  string `json:"currentVersion"` // running version of the core container; enables breakpoint crossing detection
 }
 
@@ -582,6 +582,7 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 			jobID, mode, req.RequestedTarget, plan.ResolvedTarget, source))
 
 		// Launch background execution goroutine
+		s.upgradeWg.Add(1)
 		go s.executeUpgrade(job, plan.Manifest, plan.ArchSupport, plan.SteppingStone)
 		// Return response
 		w.Header().Set("Content-Type", "application/json")

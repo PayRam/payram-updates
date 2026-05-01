@@ -14,18 +14,18 @@ import (
 
 // UpgradePlan represents the result of upgrade planning (read-only validation).
 type UpgradePlan struct {
-	State           jobs.JobState      `json:"state"`
-	Mode            jobs.JobMode       `json:"mode"`
-	RequestedTarget string             `json:"requestedTarget"`
-	ResolvedTarget  string             `json:"resolvedTarget"`
+	State           jobs.JobState `json:"state"`
+	Mode            jobs.JobMode  `json:"mode"`
+	RequestedTarget string        `json:"requestedTarget"`
+	ResolvedTarget  string        `json:"resolvedTarget"`
 	// SteppingStone is set when a breakpoint requires a transparent intermediate hop.
 	// The executor upgrades through SteppingStone first, then continues to ResolvedTarget,
 	// all within a single job. Empty for stop points and when no chaining is needed.
-	SteppingStone   string             `json:"steppingStone,omitempty"`
-	FailureCode     string             `json:"failureCode,omitempty"`
-	Message         string             `json:"message"`
-	Manifest        *manifest.Manifest `json:"manifest,omitempty"`
-	ArchSupport     map[string]string  `json:"-"` // arch variant min versions, not serialized
+	SteppingStone string             `json:"steppingStone,omitempty"`
+	FailureCode   string             `json:"failureCode,omitempty"`
+	Message       string             `json:"message"`
+	Manifest      *manifest.Manifest `json:"manifest,omitempty"`
+	ArchSupport   map[string]string  `json:"-"` // arch variant min versions, not serialized
 
 	// Internal fields (not serialized)
 	policyData *policy.Policy

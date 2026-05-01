@@ -159,15 +159,33 @@ func runRecover() {
 	manifestClient := manifest.NewClient(time.Duration(cfg.FetchTimeoutSeconds) * time.Second)
 	manifestData, _ := manifestClient.Fetch(ctx, cfg.RuntimeManifestURL)
 
+	// Use imagePattern for discovery (default to payramapp/payram if not overridden)
+	imagePattern := "payramapp/payram:"
+	if cfg.ImageRepoOverride != "" {
+		imagePattern = cfg.ImageRepoOverride + ":"
+	}
+
 	resolver := container.NewResolver(cfg.TargetContainerName, cfg.DockerBin, log.Default())
 	resolved, err := resolver.Resolve(manifestData)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Set TARGET_CONTAINER_NAME environment variable or ensure manifest has container_name\n")
-		os.Exit(1)
+		if resErr, ok := err.(*container.ResolutionError); ok && resErr.GetFailureCode() == "CONTAINER_NAME_UNRESOLVED" {
+			discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, log.Default())
+			discovered, discoverErr := discoverer.DiscoverPayramContainer(ctx)
+			if discoverErr != nil {
+				fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Set TARGET_CONTAINER_NAME environment variable or ensure manifest has container_name\n")
+				os.Exit(1)
+			}
+			fmt.Printf("Target container discovered as: %s\n\n", discovered.Name)
+			resolved = &container.ResolvedContainer{Name: discovered.Name}
+		} else {
+			fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Set TARGET_CONTAINER_NAME environment variable or ensure manifest has container_name\n")
+			os.Exit(1)
+		}
 	}
 	containerName := resolved.Name
-	fmt.Printf("Target container resolved as: %s\\n\\n", containerName)
+	fmt.Printf("Target container resolved as: %s\n\n", containerName)
 
 	// Determine CoreBaseURL: if not provided, discover it dynamically
 	coreBaseURL := discoverCoreBaseURLOrDefault(ctx, cfg)
@@ -238,12 +256,30 @@ func runSync() {
 	manifestClient := manifest.NewClient(time.Duration(cfg.FetchTimeoutSeconds) * time.Second)
 	manifestData, _ := manifestClient.Fetch(ctx, cfg.RuntimeManifestURL)
 
+	// Use imagePattern for discovery (default to payramapp/payram if not overridden)
+	imagePattern := "payramapp/payram:"
+	if cfg.ImageRepoOverride != "" {
+		imagePattern = cfg.ImageRepoOverride + ":"
+	}
+
 	// Resolve container name
 	resolver := container.NewResolver(cfg.TargetContainerName, cfg.DockerBin, log.Default())
 	resolved, err := resolver.Resolve(manifestData)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
-		os.Exit(1)
+		if resErr, ok := err.(*container.ResolutionError); ok && resErr.GetFailureCode() == "CONTAINER_NAME_UNRESOLVED" {
+			discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, log.Default())
+			discovered, discoverErr := discoverer.DiscoverPayramContainer(ctx)
+			if discoverErr != nil {
+				fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Set TARGET_CONTAINER_NAME environment variable or ensure manifest has container_name\n")
+				os.Exit(1)
+			}
+			fmt.Printf("Target container discovered as: %s\n\n", discovered.Name)
+			resolved = &container.ResolvedContainer{Name: discovered.Name}
+		} else {
+			fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	containerName := resolved.Name
 	fmt.Printf("Target container resolved as: %s\n\n", containerName)

@@ -99,13 +99,13 @@ func TestPlanUpgrade_BreakpointCapping(t *testing.T) {
 	}
 
 	tests := []struct {
-		name               string
-		currentVersion     string // empty = caller did not provide it
-		requestedTarget    string
-		wantState          jobs.JobState
-		wantFailureCode    string
-		wantResolved       string
-		wantSteppingStone  string // non-empty when a two-hop chain is expected
+		name              string
+		currentVersion    string // empty = caller did not provide it
+		requestedTarget   string
+		wantState         jobs.JobState
+		wantFailureCode   string
+		wantResolved      string
+		wantSteppingStone string // non-empty when a two-hop chain is expected
 	}{
 		// --- below stepping stone: chain through stepping stone to breakpoint in one job ---
 		{
@@ -539,6 +539,7 @@ func TestHandleUpgradeRun_CurrentVersionWiredThrough(t *testing.T) {
 	}
 	tmpDir := t.TempDir()
 	srv := &Server{config: cfg, jobStore: jobs.NewStore(tmpDir)}
+	t.Cleanup(func() { srv.upgradeWg.Wait() })
 
 	// 1.7.9 → 1.9.9 with breakpoint at 1.8.0: at stepping stone → redirected to 1.8.0, job created.
 	body := strings.NewReader(`{"requestedTarget":"1.9.9","currentVersion":"1.7.9"}`)
