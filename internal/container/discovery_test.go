@@ -191,7 +191,7 @@ fi
 	}
 }
 
-// TestDiscoverPayramContainer_OnlyLatestTag tests error when only latest tag exists.
+// TestDiscoverPayramContainer_OnlyLatestTag tests that a container with only a "latest" tag is returned as a fallback.
 func TestDiscoverPayramContainer_OnlyLatestTag(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
@@ -209,19 +209,18 @@ fi
 	logger := &mockLogger{}
 	discoverer := NewDiscoverer(dockerScript, "", logger)
 
-	_, err := discoverer.DiscoverPayramContainer(context.Background())
-	if err == nil {
-		t.Fatal("Expected error when only latest tag, got nil")
+	container, err := discoverer.DiscoverPayramContainer(context.Background())
+	if err != nil {
+		t.Fatalf("Expected no error for latest-only container, got: %v", err)
 	}
 
-	// Should fail because latest is skipped and no other containers exist
-	discoveryErr, ok := err.(*DiscoveryError)
-	if !ok {
-		t.Fatalf("Expected DiscoveryError, got %T", err)
+	// Should return the latest-tagged container as a fallback
+	if container.ImageTag != "latest" {
+		t.Errorf("Expected tag 'latest', got '%s'", container.ImageTag)
 	}
 
-	if discoveryErr.FailureCode != "PAYRAM_CONTAINER_NOT_FOUND" {
-		t.Errorf("Expected PAYRAM_CONTAINER_NOT_FOUND, got '%s'", discoveryErr.FailureCode)
+	if container.Name != "payram" {
+		t.Errorf("Expected name 'payram', got '%s'", container.Name)
 	}
 }
 
