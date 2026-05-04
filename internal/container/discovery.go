@@ -118,12 +118,6 @@ func (d *Discoverer) DiscoverPayramContainer(ctx context.Context) (*DiscoveredCo
 
 		tag := parts[1]
 
-		// Skip "latest" tag - only accept semantic versions
-		if tag == "latest" {
-			d.logger.Printf("Skipping container with 'latest' tag: %s", entry.Names)
-			continue
-		}
-
 		candidates = append(candidates, DiscoveredContainer{
 			ID:        entry.ID,
 			Name:      strings.TrimPrefix(entry.Names, "/"), // Docker prefixes names with /
@@ -177,10 +171,18 @@ func selectHighestVersion(candidates []DiscoveredContainer) (*DiscoveredContaine
 
 	var versioned []versionedCandidate
 
-	for _, candidate := range candidates {
+	var latestFallback *DiscoveredContainer
+	for i, candidate := range candidates {
+		if candidate.ImageTag == "latest" {
+			// Keep as fallback if no semver candidates are found
+			if latestFallback == nil {
+				latestFallback = &candidates[i]
+			}
+			continue
+		}
 		v, err := version.NewVersion(candidate.ImageTag)
 		if err != nil {
-			// Skip containers with non-semantic version tags
+			// Skip containers with non-parseable version tags
 			continue
 		}
 
@@ -191,6 +193,10 @@ func selectHighestVersion(candidates []DiscoveredContainer) (*DiscoveredContaine
 	}
 
 	if len(versioned) == 0 {
+		if latestFallback != nil {
+			// Only a "latest"-tagged container was found; return it directly.
+			return latestFallback, nil
+		}
 		return nil, &DiscoveryError{
 			FailureCode: "PAYRAM_VERSION_PARSE_FAILED",
 			Message:     "No Payram containers have valid semantic version tags",
