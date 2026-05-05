@@ -33,15 +33,15 @@ setup: ## Install dependencies and tools
 ##@ Development
 
 .PHONY: fmt
-fmt: ## Format all Go source files
+fmt: ## Format all Go source files (skips gitignored paths)
 	@echo "Formatting Go files..."
-	@$(GO) fmt ./...
+	@git ls-files --cached --others --exclude-standard '*.go' | xargs -r gofmt -w
 	@echo "Formatting complete!"
 
 .PHONY: fmt-check
-fmt-check: ## Check if all Go files are formatted
+fmt-check: ## Check if all Go files are formatted (skips gitignored paths)
 	@echo "Checking Go formatting..."
-	@UNFORMATTED=$$(find . \( -path './data' -o -path './vendor' \) -prune -o -name '*.go' -print | xargs gofmt -l); \
+	@UNFORMATTED=$$(git ls-files --cached --others --exclude-standard '*.go' | xargs -r gofmt -l); \
 	if [ -n "$$UNFORMATTED" ]; then \
 		echo "The following files are not formatted:"; \
 		echo "$$UNFORMATTED"; \

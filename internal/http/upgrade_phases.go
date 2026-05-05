@@ -752,22 +752,44 @@ func (s *Server) replaceContainer(ctx context.Context, job *jobs.Job, containerN
 
 // verifyUpgrade checks health endpoint and version match.
 // Returns false if verification fails (job is already marked failed).
+//
+// Strategy: poll the health endpoint every 2s until status == "ok", sharing a
+// single deadline of HEALTH_CHECK_TIMEOUT_SECONDS (default 120s). Remaining
+// seconds are logged on each attempt so the job log is informative.
 func (s *Server) verifyUpgrade(ctx context.Context, job *jobs.Job, containerName, imageTag, policyInitVersion string) bool {
 	job.Message = "Verifying health endpoint"
 	job.UpdatedAt = time.Now().UTC()
 	s.jobStore.Save(job)
 
 	useLegacyHealth := s.shouldUseLegacyForTarget(policyInitVersion, baseVersionTag(imageTag))
-	if useLegacyHealth {
-		s.jobStore.AppendLog("Verifying legacy health endpoint (6 retries, 2s apart)...")
-	} else {
-		s.jobStore.AppendLog("Verifying /api/v1/health endpoint (6 retries, 2s apart)...")
+
+	timeoutSeconds := s.config.HealthCheckTimeoutSeconds
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 120
 	}
 
-	// Health check with retries
+	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
+	if useLegacyHealth {
+		s.jobStore.AppendLog(fmt.Sprintf("Polling legacy health endpoint (timeout: %ds)...", timeoutSeconds))
+	} else {
+		s.jobStore.AppendLog(fmt.Sprintf("Polling /api/v1/health endpoint (timeout: %ds)...", timeoutSeconds))
+	}
+
 	healthOK := false
-	for attempt := 1; attempt <= 6; attempt++ {
-		healthCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	attempt := 0
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+
+		attempt++
+		pollTimeout := 3 * time.Second
+		if remaining < pollTimeout {
+			pollTimeout = remaining
+		}
+
+		healthCtx, cancel := context.WithTimeout(ctx, pollTimeout)
 		var healthResp *coreclient.HealthResponse
 		var err error
 		if useLegacyHealth {
@@ -780,46 +802,36 @@ func (s *Server) verifyUpgrade(ctx context.Context, job *jobs.Job, containerName
 		}
 		cancel()
 
-		// Require status == "ok"
-		// If db field is present, it must also be "ok"
 		if err == nil && healthResp.Status == "ok" {
-			// Validate db field only if present
 			if healthResp.DB != "" && healthResp.DB != "ok" {
-				s.jobStore.AppendLog(fmt.Sprintf("Health check attempt %d: status ok but db=%s (retrying...)", attempt, healthResp.DB))
-				if attempt < 6 {
-					time.Sleep(2 * time.Second)
-				}
-				continue
-			}
-			// Success: status is ok, and db is either not present or is ok
-			if healthResp.DB != "" {
-				s.jobStore.AppendLog(fmt.Sprintf("Health check passed on attempt %d (status=%s, db=%s)", attempt, healthResp.Status, healthResp.DB))
+				s.jobStore.AppendLog(fmt.Sprintf("Health attempt %d: status ok but db=%s (retrying, %.0fs remaining)", attempt, healthResp.DB, time.Until(deadline).Seconds()))
 			} else {
-				s.jobStore.AppendLog(fmt.Sprintf("Health check passed on attempt %d (status=%s)", attempt, healthResp.Status))
+				if healthResp.DB != "" {
+					s.jobStore.AppendLog(fmt.Sprintf("Health passed on attempt %d (status=%s, db=%s)", attempt, healthResp.Status, healthResp.DB))
+				} else {
+					s.jobStore.AppendLog(fmt.Sprintf("Health passed on attempt %d (status=%s)", attempt, healthResp.Status))
+				}
+				healthOK = true
+				break
 			}
-			healthOK = true
-			break
+		} else {
+			s.jobStore.AppendLog(fmt.Sprintf("Health attempt %d failed: %v (%.0fs remaining)", attempt, err, time.Until(deadline).Seconds()))
 		}
 
-		if attempt < 6 {
-			s.jobStore.AppendLog(fmt.Sprintf("Health check attempt %d failed: %v (retrying...)", attempt, err))
-			time.Sleep(2 * time.Second)
-		} else {
-			s.jobStore.AppendLog(fmt.Sprintf("Health check attempt %d failed: %v", attempt, err))
-		}
+		time.Sleep(2 * time.Second)
 	}
 
 	if !healthOK {
 		job.State = jobs.JobStateFailed
 		job.FailureCode = "HEALTHCHECK_FAILED"
-		job.Message = "Health check failed after 6 attempts"
+		job.Message = fmt.Sprintf("Health check failed after %ds", timeoutSeconds)
 		job.UpdatedAt = time.Now().UTC()
 		s.jobStore.Save(job)
 		s.jobStore.AppendLog(fmt.Sprintf("FAILED: %s - %s (manual recovery required)", job.FailureCode, job.Message))
 		return false
 	}
 
-	// Version verification
+	// --- Version verification ---
 	job.Message = "Verifying version"
 	job.UpdatedAt = time.Now().UTC()
 	s.jobStore.Save(job)
