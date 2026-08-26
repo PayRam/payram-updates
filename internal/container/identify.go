@@ -4,16 +4,16 @@ package container
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 )
 
 const (
-	// PayramCoreWelcomeMessage is the string that identifies Payram Core on the root endpoint
-	PayramCoreWelcomeMessage = "Welcome to Payram Core"
+	// HealthPath is the endpoint used to identify Payram Core on a port.
+	HealthPath = "/api/v1/health"
 
 	// PortIdentificationTimeout is the timeout for checking each port
 	PortIdentificationTimeout = 3 * time.Second
@@ -63,11 +63,11 @@ func NewPortIdentifier(logger Logger) *PortIdentifier {
 //
 // Process:
 // 1. Iterates through all exposed host ports from RuntimeState
-// 2. Sends HTTP GET request to http://localhost:<port>/
-// 3. Checks if response contains "Welcome to Payram Core"
+// 2. Sends a GET request to <scheme>://127.0.0.1:<port>/api/v1/health
+// 3. Checks the response is 200 with a JSON body containing a "status" field
 // 4. Returns the first port that matches
 //
-// Returns PAYRAM_CORE_PORT_NOT_FOUND error if no port responds with the welcome message.
+// Returns PAYRAM_CORE_PORT_NOT_FOUND error if no port responds as Payram Core.
 func (p *PortIdentifier) IdentifyPayramCorePort(ctx context.Context, state *RuntimeState) (*IdentifiedPort, error) {
 	if state == nil {
 		return nil, fmt.Errorf("runtime state is nil")
@@ -110,30 +110,34 @@ func (p *PortIdentifier) IdentifyPayramCorePort(ctx context.Context, state *Runt
 	}
 
 	// No port matched
-	p.logger.Printf("No port responded with Payram Core welcome message")
+	p.logger.Printf("No port responded as Payram Core health")
 	return nil, &IdentificationError{
 		FailureCode: "PAYRAM_CORE_PORT_NOT_FOUND",
-		Message:     fmt.Sprintf("No port responded with '%s' message", PayramCoreWelcomeMessage),
+		Message:     fmt.Sprintf("No port responded on %s", HealthPath),
 	}
 }
 
 // checkPort checks if a specific port is running Payram Core.
-// It tries HTTP first, then HTTPS (with TLS verification disabled for localhost).
+// It tries HTTPS first, then HTTP (with TLS verification disabled for localhost).
+// HTTPS is tried first because new installs serve the API over HTTPS and
+// redirect plain HTTP to it.
 // Returns the working scheme ("http" or "https") and true if found.
 func (p *PortIdentifier) checkPort(ctx context.Context, hostPort string) (string, bool) {
-	if p.checkScheme(ctx, "http", hostPort, p.httpClient) {
-		return "http", true
-	}
 	if p.checkScheme(ctx, "https", hostPort, p.httpsClient) {
 		return "https", true
+	}
+	if p.checkScheme(ctx, "http", hostPort, p.httpClient) {
+		return "http", true
 	}
 	return "", false
 }
 
-// checkScheme performs a single HTTP/HTTPS probe against the root path and
-// returns true if the response contains the Payram Core welcome message.
+// checkScheme probes the Payram Core health endpoint on the given scheme+port
+// and returns true if it responds with 200 and a JSON body containing a
+// "status" field. This identifies Payram Core across all versions, since the
+// health endpoint is served on the same port as the rest of the API.
 func (p *PortIdentifier) checkScheme(ctx context.Context, scheme, hostPort string, client *http.Client) bool {
-	url := fmt.Sprintf("%s://localhost:%s/", scheme, hostPort)
+	url := fmt.Sprintf("%s://127.0.0.1:%s%s", scheme, hostPort, HealthPath)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -148,6 +152,11 @@ func (p *PortIdentifier) checkScheme(ctx context.Context, scheme, hostPort strin
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		p.logger.Printf("Port %s - %s health returned status %d", hostPort, scheme, resp.StatusCode)
+		return false
+	}
+
 	// Read response body (limit to 10KB to prevent memory issues)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024))
 	if err != nil {
@@ -155,12 +164,15 @@ func (p *PortIdentifier) checkScheme(ctx context.Context, scheme, hostPort strin
 		return false
 	}
 
-	if strings.Contains(string(body), PayramCoreWelcomeMessage) {
-		p.logger.Printf("Port %s - found Payram Core welcome message via %s", hostPort, scheme)
+	var probe struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &probe); err == nil && probe.Status != "" {
+		p.logger.Printf("Port %s - identified Payram Core health via %s", hostPort, scheme)
 		return true
 	}
 
-	p.logger.Printf("Port %s - %s response does not contain welcome message", hostPort, scheme)
+	p.logger.Printf("Port %s - %s response is not a Payram Core health response", hostPort, scheme)
 	return false
 }
 

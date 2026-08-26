@@ -9,14 +9,19 @@ import (
 	"time"
 )
 
+// healthOK is a standard Payram Core health response body.
+const healthOK = `{"status":"ok","db":"ok","version":"3.5.0"}`
+
 // TestIdentifyPayramCorePort_Success tests successful port identification.
 func TestIdentifyPayramCorePort_Success(t *testing.T) {
-	// Create test HTTP server that responds with welcome message
+	// Create test HTTP server that responds on the health endpoint.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" && r.Method == "GET" {
+		if r.URL.Path == HealthPath && r.Method == "GET" {
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, "<html><body><h1>%s</h1></body></html>", PayramCoreWelcomeMessage)
+			fmt.Fprint(w, healthOK)
+			return
 		}
+		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer server.Close()
 
@@ -63,7 +68,7 @@ func TestIdentifyPayramCorePort_Success(t *testing.T) {
 
 // TestIdentifyPayramCorePort_MultiplePorts tests identification with multiple ports.
 func TestIdentifyPayramCorePort_MultiplePorts(t *testing.T) {
-	// Create wrong server (doesn't respond with welcome message)
+	// Create wrong server (doesn't respond with a health payload)
 	wrongServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "This is not Payram Core")
@@ -73,7 +78,7 @@ func TestIdentifyPayramCorePort_MultiplePorts(t *testing.T) {
 	// Create correct server
 	correctServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, PayramCoreWelcomeMessage)
+		fmt.Fprint(w, healthOK)
 	}))
 	defer correctServer.Close()
 
@@ -102,9 +107,9 @@ func TestIdentifyPayramCorePort_MultiplePorts(t *testing.T) {
 	}
 }
 
-// TestIdentifyPayramCorePort_NoMatchingPort tests when no port has the welcome message.
+// TestIdentifyPayramCorePort_NoMatchingPort tests when no port serves health.
 func TestIdentifyPayramCorePort_NoMatchingPort(t *testing.T) {
-	// Create server without welcome message
+	// Create server that isn't Payram Core
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "Some other service")
@@ -181,7 +186,7 @@ func TestIdentifyPayramCorePort_ContextCancellation(t *testing.T) {
 	// Create server that delays response
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(5 * time.Second)
-		fmt.Fprint(w, PayramCoreWelcomeMessage)
+		fmt.Fprint(w, healthOK)
 	}))
 	defer server.Close()
 
@@ -220,7 +225,7 @@ func TestIdentifyPayramCorePort_ContextCancellation(t *testing.T) {
 func TestIdentifyPayramCorePort_NonTCPPort(t *testing.T) {
 	// Create server for TCP port
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, PayramCoreWelcomeMessage)
+		fmt.Fprint(w, healthOK)
 	}))
 	defer server.Close()
 
@@ -248,10 +253,10 @@ func TestIdentifyPayramCorePort_NonTCPPort(t *testing.T) {
 
 // TestIdentifyPayramCorePort_HTTPError tests when port returns HTTP error.
 func TestIdentifyPayramCorePort_HTTPError(t *testing.T) {
-	// Create server that returns 500 error
+	// Create server that returns 500 error even on the health path
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprint(w, "Internal Server Error")
+		fmt.Fprint(w, healthOK)
 	}))
 	defer server.Close()
 
@@ -271,7 +276,7 @@ func TestIdentifyPayramCorePort_HTTPError(t *testing.T) {
 		t.Fatal("Expected error, got nil")
 	}
 
-	// Should fail because response doesn't contain welcome message
+	// Should fail because a non-200 response is not accepted
 	identErr, ok := err.(*IdentificationError)
 	if !ok {
 		t.Fatalf("Expected IdentificationError, got %T", err)
@@ -282,23 +287,12 @@ func TestIdentifyPayramCorePort_HTTPError(t *testing.T) {
 	}
 }
 
-// TestIdentifyPayramCorePort_PartialMatch tests when message is part of larger response.
-func TestIdentifyPayramCorePort_PartialMatch(t *testing.T) {
-	// Create server with welcome message embedded in HTML
+// TestIdentifyPayramCorePort_ExtraHealthFields tests that a health response with
+// extra fields is still accepted (lenient JSON parsing).
+func TestIdentifyPayramCorePort_ExtraHealthFields(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `
-<!DOCTYPE html>
-<html>
-<head><title>Payram</title></head>
-<body>
-  <div class="header">
-    <h1>%s</h1>
-    <p>Version 1.0.0</p>
-  </div>
-</body>
-</html>
-`, PayramCoreWelcomeMessage)
+		fmt.Fprint(w, `{"status":"ok","db":"ok","version":"3.5.0","workers":{"redis-server":"FATAL"}}`)
 	}))
 	defer server.Close()
 
@@ -326,7 +320,7 @@ func TestIdentifyPayramCorePort_PartialMatch(t *testing.T) {
 // TestIdentifyPayramCorePort_EmptyHostPort tests skipping empty host port.
 func TestIdentifyPayramCorePort_EmptyHostPort(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, PayramCoreWelcomeMessage)
+		fmt.Fprint(w, healthOK)
 	}))
 	defer server.Close()
 
@@ -361,34 +355,40 @@ func TestCheckPort(t *testing.T) {
 		shouldMatch  bool
 	}{
 		{
-			name:         "exact match",
-			responseBody: PayramCoreWelcomeMessage,
+			name:         "valid health json",
+			responseBody: `{"status":"ok"}`,
 			responseCode: http.StatusOK,
 			shouldMatch:  true,
 		},
 		{
-			name:         "case sensitive - should not match",
-			responseBody: "welcome to payram core",
-			responseCode: http.StatusOK,
-			shouldMatch:  false,
-		},
-		{
-			name:         "substring match",
-			responseBody: fmt.Sprintf("Hello! %s is running.", PayramCoreWelcomeMessage),
+			name:         "health json with extra fields",
+			responseBody: healthOK,
 			responseCode: http.StatusOK,
 			shouldMatch:  true,
 		},
 		{
-			name:         "no match",
+			name:         "non-json body",
 			responseBody: "Different service",
 			responseCode: http.StatusOK,
 			shouldMatch:  false,
 		},
 		{
-			name:         "404 with message",
-			responseBody: PayramCoreWelcomeMessage,
-			responseCode: http.StatusNotFound,
-			shouldMatch:  true, // Still matches if message is present
+			name:         "json without status field",
+			responseBody: `{"foo":"bar"}`,
+			responseCode: http.StatusOK,
+			shouldMatch:  false,
+		},
+		{
+			name:         "json with empty status",
+			responseBody: `{"status":""}`,
+			responseCode: http.StatusOK,
+			shouldMatch:  false,
+		},
+		{
+			name:         "non-200 with valid health json",
+			responseBody: `{"status":"ok"}`,
+			responseCode: http.StatusInternalServerError,
+			shouldMatch:  false,
 		},
 	}
 
@@ -481,24 +481,16 @@ func TestIdentifiedPortStructure(t *testing.T) {
 	}
 }
 
-// TestPayramCoreWelcomeMessage validates the constant.
-func TestPayramCoreWelcomeMessage(t *testing.T) {
-	expected := "Welcome to Payram Core"
-	if PayramCoreWelcomeMessage != expected {
-		t.Errorf("Expected '%s', got '%s'", expected, PayramCoreWelcomeMessage)
-	}
-}
-
 // TestIdentifyPayramCorePort_FirstMatchWins tests that first matching port is returned.
 func TestIdentifyPayramCorePort_FirstMatchWins(t *testing.T) {
-	// Create two servers both with welcome message
+	// Create two servers both serving health
 	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, PayramCoreWelcomeMessage)
+		fmt.Fprint(w, healthOK)
 	}))
 	defer server1.Close()
 
 	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, PayramCoreWelcomeMessage)
+		fmt.Fprint(w, healthOK)
 	}))
 	defer server2.Close()
 
@@ -532,7 +524,7 @@ func TestIdentifyPayramCorePort_HTTPSFallback(t *testing.T) {
 	// httptest.NewTLSServer starts an HTTPS server with a self-signed certificate
 	// whose SAN covers 127.0.0.1, matching how the real container behaves.
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, PayramCoreWelcomeMessage)
+		fmt.Fprint(w, healthOK)
 	}))
 	defer server.Close()
 
@@ -565,7 +557,7 @@ func TestIdentifyPayramCorePort_HTTPSFallback(t *testing.T) {
 // populated in the returned IdentifiedPort.
 func TestIdentifyPayramCorePort_HTTPSchemeReturned(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, PayramCoreWelcomeMessage)
+		fmt.Fprint(w, healthOK)
 	}))
 	defer server.Close()
 
@@ -593,7 +585,7 @@ func TestIdentifyPayramCorePort_HTTPSchemeReturned(t *testing.T) {
 // Benchmark port identification
 func BenchmarkIdentifyPayramCorePort(b *testing.B) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, PayramCoreWelcomeMessage)
+		fmt.Fprint(w, healthOK)
 	}))
 	defer server.Close()
 
