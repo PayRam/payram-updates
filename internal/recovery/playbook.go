@@ -228,8 +228,8 @@ var playbooks = map[string]Playbook{
 		UserMessage: "Pre-upgrade database backup failed. The upgrade was safely aborted before any changes.",
 		SSHSteps: []string{
 			"1. Check disk space: df -h (pg_dump needs space for dump file)",
-			"2. Verify PostgreSQL is running: pg_isready -h localhost",
-			"3. Test pg_dump manually: pg_dump -Fc -h localhost -U payram -d payram -f /tmp/test.dump",
+			"2. Verify PostgreSQL is running: docker exec <container_name> pg_isready (external database: pg_isready -h <db_host>)",
+			"3. Test pg_dump manually: docker exec <container_name> pg_dump -Fc -U payram -d payram -f /tmp/test.dump",
 			"4. Check backup directory permissions: ls -la /var/lib/payram/backups",
 			"5. Check PostgreSQL logs for errors",
 			"6. Retry the upgrade once resolved (no manual recovery needed)",
@@ -245,8 +245,8 @@ var playbooks = map[string]Playbook{
 		UserMessage: "Backup failed after stopping non-DB programs. Services were restarted. Resolve backup issues and retry.",
 		SSHSteps: []string{
 			"1. Confirm container is running: docker ps | grep <container_name>",
-			"2. Verify PostgreSQL is reachable: pg_isready -h localhost",
-			"3. Test pg_dump manually: pg_dump -Fc -h localhost -U payram -d payram -f /tmp/test.dump",
+			"2. Verify PostgreSQL is reachable: docker exec <container_name> pg_isready (external database: pg_isready -h <db_host>)",
+			"3. Test pg_dump manually: docker exec <container_name> pg_dump -Fc -U payram -d payram -f /tmp/test.dump",
 			"4. Check backup directory permissions: ls -la /var/lib/payram/backups",
 			"5. Retry the upgrade once backup succeeds",
 		},

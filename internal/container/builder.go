@@ -27,7 +27,7 @@ WHAT CHANGES:
   - Image tag only (e.g., payramapp/payram:1.8.0 → payramapp/payram:1.9.0)
 
 WHAT NEVER CHANGES:
-  - Ports (host:container mappings)
+  - Ports (host:container mappings), except the bundled database's (below)
   - Mounts (volumes and bind mounts)
   - Environment variables (especially secrets)
   - Network configuration
@@ -40,6 +40,14 @@ a secret is not an upgrade - it's a destructive reinstallation. This module
 ensures upgrades are truly non-destructive operations that only change the
 application code, not the runtime environment.
 */
+
+// databaseContainerPort is the bundled PostgreSQL's port inside the container,
+// the one runtime setting an upgrade does not carry over. Installs made before
+// 28 May 2026 published it on every interface, where older images accepted the
+// shared default database password from anywhere. Nothing outside the container
+// needs it: backups and restores run through docker exec. setup_payram.sh drops
+// it on updates too.
+const databaseContainerPort = "5432"
 
 // DockerRunBuilder constructs docker run arguments from runtime state and manifest.
 type DockerRunBuilder struct {
@@ -114,8 +122,15 @@ func (b *DockerRunBuilder) BuildUpgradeArgs(
 	args = append(args, "--restart", restartPolicy)
 	b.logger.Printf("Restart policy: %s (preserved from runtime)", restartPolicy)
 
-	// Ports (RECONCILED: runtime + manifest)
+	// Ports (RECONCILED: runtime + manifest), without the database's
+	published := 0
 	for _, port := range reconciled.Ports {
+		if port.ContainerPort == databaseContainerPort {
+			b.logger.Printf("Not publishing %s:%s/%s: the PayRam database is only reachable from inside the container",
+				port.HostPort, port.ContainerPort, port.Protocol)
+			continue
+		}
+		published++
 		// Format: hostIP:hostPort:containerPort/protocol
 		// If hostIP is empty or 0.0.0.0, omit it
 		var portMapping string
@@ -126,8 +141,8 @@ func (b *DockerRunBuilder) BuildUpgradeArgs(
 		}
 		args = append(args, "-p", portMapping)
 	}
-	b.logger.Printf("Ports: %d total (%d from runtime, %d added from manifest)",
-		len(reconciled.Ports), len(runtimeState.Ports), reconciled.AddedPorts)
+	b.logger.Printf("Ports: %d published (%d from runtime, %d added from manifest)",
+		published, len(runtimeState.Ports), reconciled.AddedPorts)
 
 	// Mounts (RECONCILED: runtime + manifest)
 	// VALIDATION: Skip any mount with empty source or destination to prevent
