@@ -12,7 +12,6 @@ import (
 
 	"github.com/payram/payram-updater/internal/config"
 	"github.com/payram/payram-updater/internal/container"
-	"github.com/payram/payram-updater/internal/jobs"
 )
 
 // discoverCoreBaseURLOrDefault discovers the Payram Core base URL dynamically.
@@ -145,15 +144,7 @@ func getPort() int {
 			}
 		}
 		// Default port
-		return 2359
+		return 2567
 	}
 	return cfg.Port
-}
-
-func isJobActive(job *jobs.Job) bool {
-	return job.State == jobs.JobStatePolicyFetching ||
-		job.State == jobs.JobStateManifestFetching ||
-		job.State == jobs.JobStateExecuting ||
-		job.State == jobs.JobStateVerifying ||
-		job.State == jobs.JobStateBackingUp
 }

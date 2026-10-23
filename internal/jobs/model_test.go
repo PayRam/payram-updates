@@ -122,3 +122,18 @@ func TestJobFailedState(t *testing.T) {
 		t.Errorf("expected Message %q, got %q", "Failed to fetch policy", job.Message)
 	}
 }
+
+func TestJobIsActive(t *testing.T) {
+	active := []JobState{JobStatePolicyFetching, JobStateManifestFetching, JobStateBackingUp, JobStateExecuting, JobStateVerifying}
+	inactive := []JobState{JobStateIdle, JobStateReady, JobStateFailed}
+	for _, state := range active {
+		if !(&Job{State: state}).IsActive() {
+			t.Errorf("%s should be active", state)
+		}
+	}
+	for _, state := range inactive {
+		if (&Job{State: state}).IsActive() {
+			t.Errorf("%s should not be active", state)
+		}
+	}
+}

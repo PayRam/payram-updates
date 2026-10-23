@@ -209,15 +209,6 @@ func (s *Server) HandleHistory() http.HandlerFunc {
 	}
 }
 
-// isJobActive returns true if the job is in an active state.
-func isJobActive(job *jobs.Job) bool {
-	// Active states are those that indicate ongoing work
-	return job.State == jobs.JobStatePolicyFetching ||
-		job.State == jobs.JobStateManifestFetching ||
-		job.State == jobs.JobStateExecuting ||
-		job.State == jobs.JobStateVerifying
-}
-
 // HandleUpgradeLast returns a handler for the /upgrade/last endpoint.
 // Returns only the last job state without recovery playbook.
 func (s *Server) HandleUpgradeLast() http.HandlerFunc {
@@ -518,7 +509,7 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 			return
 		}
 
-		if existingJob != nil && isJobActive(existingJob) {
+		if existingJob != nil && existingJob.IsActive() {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]string{

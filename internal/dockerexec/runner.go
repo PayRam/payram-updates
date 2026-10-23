@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 )
 
@@ -227,9 +228,42 @@ func (r *Runner) logf(format string, args ...interface{}) {
 	}
 }
 
-// logCommand logs the docker command being executed.
+// logCommand logs the docker command being executed, with secret values hidden.
 func (r *Runner) logCommand(args []string) {
 	if r.Logger != nil {
-		r.Logger.Printf("Executing: %s %s", r.DockerBin, strings.Join(args, " "))
+		r.Logger.Printf("Executing: %s %s", r.DockerBin, strings.Join(RedactArgs(args), " "))
 	}
+}
+
+// inlinePassword matches a password passed inside a shell string, such as
+// `PGPASSWORD=secret pg_dump ...`.
+var inlinePassword = regexp.MustCompile(`(?i)\b(PGPASSWORD|PASSWORD)=\S+`)
+
+// RedactArgs returns a copy of docker arguments that is safe to log: every
+// environment value (`-e KEY=VALUE`, `--env KEY=VALUE`, `--env=KEY=VALUE`) and
+// every inline PGPASSWORD=... becomes `***`. The container's environment holds
+// AES_KEY (the hot-wallet encryption key) and the database password, so a
+// docker command line must never reach a log, the journal or the dashboard as is.
+func RedactArgs(args []string) []string {
+	redacted := make([]string, len(args))
+	for i, arg := range args {
+		switch {
+		case i > 0 && (args[i-1] == "-e" || args[i-1] == "--env"):
+			redacted[i] = redactEnvValue(arg)
+		case strings.HasPrefix(arg, "--env="):
+			redacted[i] = "--env=" + redactEnvValue(strings.TrimPrefix(arg, "--env="))
+		default:
+			redacted[i] = inlinePassword.ReplaceAllString(arg, "$1=***")
+		}
+	}
+	return redacted
+}
+
+// redactEnvValue turns KEY=VALUE into KEY=***. A bare KEY (docker copies the
+// value from its own environment) carries no secret and is kept.
+func redactEnvValue(env string) string {
+	if key, _, ok := strings.Cut(env, "="); ok {
+		return key + "=***"
+	}
+	return env
 }

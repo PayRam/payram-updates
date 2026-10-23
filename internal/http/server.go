@@ -344,7 +344,7 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 		return
 	}
 	if existingJob != nil {
-		if isJobActive(existingJob) {
+		if existingJob.IsActive() {
 			logger.Infof("Server", "runAutoUpdateOnce", "Auto update: active job %s in state %s, skipping", existingJob.JobID, existingJob.State)
 			return
 		}
@@ -401,7 +401,7 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 
 	// Re-check for active job to avoid race
 	existingJob, err = s.jobStore.LoadLatest()
-	if err == nil && existingJob != nil && isJobActive(existingJob) {
+	if err == nil && existingJob != nil && existingJob.IsActive() {
 		logger.Infof("Server", "runAutoUpdateOnce", "Auto update: active job %s in state %s, skipping", existingJob.JobID, existingJob.State)
 		return
 	}

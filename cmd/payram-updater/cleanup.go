@@ -38,7 +38,7 @@ func runCleanup() {
 
 	// Block cleanup if a job is active
 	jobStore := jobs.NewStore(cfg.StateDir)
-	if job, err := jobStore.LoadLatest(); err == nil && job != nil && isJobActive(job) {
+	if job, err := jobStore.LoadLatest(); err == nil && job != nil && job.IsActive() {
 		fmt.Fprintln(os.Stderr, "Active job in progress. Cleanup is blocked.")
 		os.Exit(1)
 	}

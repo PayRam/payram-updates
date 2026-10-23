@@ -378,3 +378,30 @@ func TestContext_Integration(t *testing.T) {
 	var _ func(context.Context, []string) error = runner.Run
 	var _ func(context.Context, string) (bool, error) = runner.InspectRunning
 }
+
+func TestRedactArgs_HidesEnvironmentValuesAndPasswords(t *testing.T) {
+	args := []string{
+		"run", "-d", "--name", "payram",
+		"-e", "AES_KEY=0123456789abcdef",
+		"--env", "POSTGRES_PASSWORD=hunter2",
+		"--env=SSL_CERT_PATH=/etc/letsencrypt/live/x",
+		"-e", "PASSTHROUGH",
+		"exec", "payram", "sh", "-c", "PGPASSWORD=s3cret pg_dump -U payram",
+		"payramapp/payram:3.10.0",
+	}
+	got := strings.Join(RedactArgs(args), " ")
+
+	for _, secret := range []string{"0123456789abcdef", "hunter2", "/etc/letsencrypt", "s3cret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("redacted args still contain %q: %s", secret, got)
+		}
+	}
+	for _, kept := range []string{"AES_KEY=***", "POSTGRES_PASSWORD=***", "--env=SSL_CERT_PATH=***", "-e PASSTHROUGH", "PGPASSWORD=*** pg_dump", "payramapp/payram:3.10.0"} {
+		if !strings.Contains(got, kept) {
+			t.Fatalf("redacted args lost %q: %s", kept, got)
+		}
+	}
+	if args[5] != "AES_KEY=0123456789abcdef" {
+		t.Fatal("RedactArgs must not modify its input")
+	}
+}
