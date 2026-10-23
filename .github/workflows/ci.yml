@@ -17,6 +17,9 @@ jobs:
     name: format, vet, test, vulnerabilities, installer
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash # -eo pipefail
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,6 +61,24 @@ jobs:
 
       - name: Installer lint (shellcheck)
         run: shellcheck --severity=warning setup_payram_updater.sh
+
+      # The installer writes the unit and the env file itself (it is piped
+      # from curl and cannot read other files), so the copies for packagers
+      # and developers must not drift from it.
+      - name: Packaging files match the installer
+        env:
+          PAYRAM_UPDATER_SETUP_LIBRARY_ONLY: "true"
+        run: |
+          bash -c 'source ./setup_payram_updater.sh && systemd_unit_content' |
+            diff -u - packaging/systemd/payram-updater.service
+          for example in packaging/examples/updater.env.example .env.example; do
+            while IFS= read -r line; do
+              if ! grep -qxF -- "$line" "$example"; then
+                echo "::error file=$example::missing the installer default: $line"
+                exit 1
+              fi
+            done < <(bash -c 'source ./setup_payram_updater.sh && env_template')
+          done
 
       - name: Release build
         run: make build-release check-release VERSION="ci-${GITHUB_SHA::12}"

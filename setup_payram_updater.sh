@@ -817,6 +817,9 @@ install_binary() {
 
 systemd_unit_content() {
   cat <<'EOF'
+# The PayRam Updater service, as installed by setup_payram_updater.sh (same as
+# packaging/systemd/payram-updater.service). The installer rewrites this file
+# on every run: put local changes in a drop-in (systemctl edit payram-updater).
 [Unit]
 Description=Payram Updater Service
 Documentation=https://github.com/PayRam/payram-updates
