@@ -65,7 +65,7 @@ func (s *Server) runUpgrade(ctx context.Context, job *jobs.Job, plan *UpgradePla
 
 	coreURL, how, err := container.FindCoreBaseURL(ctx, s.config.DockerBin, containerName, s.config.CoreBaseURL, logger.StdLogger())
 	if err != nil {
-		s.failBeforeChange(job, "PAYRAM_API_NOT_FOUND", fmt.Sprintf("The updater could not find how to reach PayRam: %v", err))
+		s.failBeforeChange(job, "PAYRAM_CORE_PORT_NOT_FOUND", fmt.Sprintf("The updater could not find how to reach PayRam: %v", err))
 		return
 	}
 	job.CoreBaseURL = coreURL
@@ -838,7 +838,7 @@ func checkNewPortsFree(current *container.RuntimeState, spec *container.Containe
 		}
 		listener, err := net.Listen("tcp", net.JoinHostPort(hostIP, hostPort))
 		if err != nil {
-			return &switchover.StepError{Code: "PORT_IN_USE", Message: fmt.Sprintf("Port %s is already used by another program on this server, and the new version needs it", hostPort)}
+			return &switchover.StepError{Code: "PORT_CONFLICT", Message: fmt.Sprintf("Port %s is already used by another program on this server, and the new version needs it", hostPort)}
 		}
 		listener.Close()
 	}

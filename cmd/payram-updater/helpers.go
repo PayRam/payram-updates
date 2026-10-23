@@ -14,12 +14,6 @@ import (
 	"github.com/payram/payram-updater/internal/container"
 )
 
-// discoverCoreBaseURLOrDefault discovers the Payram Core base URL dynamically.
-// Priority: 1) CORE_BASE_URL env 2) TARGET_CONTAINER_NAME 3) the running PayRam container
-func discoverCoreBaseURLOrDefault(ctx context.Context, cfg *config.Config) string {
-	return discoverCoreBaseURLWithContainer(ctx, cfg, "")
-}
-
 // discoverCoreBaseURLWithContainer returns the PayRam API address, the same way
 // the daemon finds it (container.FindCoreBaseURL). It returns "" (with a
 // warning) when PayRam's container cannot be found; callers then report that

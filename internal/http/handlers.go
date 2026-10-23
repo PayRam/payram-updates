@@ -145,11 +145,14 @@ func (s *Server) HandleUpgradeStatus() http.HandlerFunc {
 			}
 		}
 
-		// Build response with recovery playbook if job failed
+		// Build response with recovery playbook if job failed, or if it is
+		// still marked active but its updater stopped saving progress.
 		response := UpgradeStatusResponse{Job: job}
 		if job.State == jobs.JobStateFailed && job.FailureCode != "" {
-			ctx := s.buildPlaybookContext(job.BackupPath)
-			playbook := recovery.RenderPlaybook(job.FailureCode, ctx)
+			playbook := recovery.RenderJobPlaybook(job, s.buildPlaybookContext(job))
+			response.RecoveryPlaybook = &playbook
+		} else if recovery.IsStale(job, time.Now()) {
+			playbook := recovery.RenderPlaybook(recovery.StalePlaybookCode(job.State), s.buildPlaybookContext(job).WithJob(job))
 			response.RecoveryPlaybook = &playbook
 		}
 
@@ -277,7 +280,7 @@ func (s *Server) HandleUpgradePlaybook() http.HandlerFunc {
 			return
 		}
 
-		playbook := recovery.RenderPlaybook(job.FailureCode, s.buildPlaybookContext(job.BackupPath))
+		playbook := recovery.RenderJobPlaybook(job, s.buildPlaybookContext(job))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -615,56 +618,28 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 	}
 }
 
-// buildPlaybookContext constructs a PlaybookContext by discovering runtime information.
-// It attempts to discover the running Payram container and extract dynamic values.
-// Falls back to empty values if discovery fails (placeholders will remain in playbook).
-func (s *Server) buildPlaybookContext(backupPath string) recovery.PlaybookContext {
+// buildPlaybookContext fills the values a playbook's steps name. The job's
+// own record (container, address, backup) wins; only what it lacks is
+// looked up.
+func (s *Server) buildPlaybookContext(job *jobs.Job) recovery.PlaybookContext {
 	ctx := recovery.PlaybookContext{
-		BackupPath: backupPath,
-		ImageRepo:  "payramapp/payram", // default
+		ImageRepo: "payramapp/payram",
+		BackupDir: s.config.Backup.Dir,
 	}
-
-	// Determine image pattern for discovery
-	imagePattern := "payramapp/payram:"
 	if s.config.ImageRepoOverride != "" {
-		imagePattern = s.config.ImageRepoOverride + ":"
 		ctx.ImageRepo = s.config.ImageRepoOverride
 	}
-
-	// Try to discover running container. Prefer explicit name (handles non-semver tags).
-	if s.config.TargetContainerName != "" {
-		ctx.ContainerName = s.config.TargetContainerName
-	} else {
-		discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, logger.StdLogger())
-		discovered, err := discoverer.DiscoverPayramContainer(context.Background())
-		if err != nil {
-			// Container not found or discovery failed - return partial context
-			// Placeholders will remain in the playbook
-			return ctx
-		}
-		ctx.ContainerName = discovered.Name
+	if job != nil {
+		ctx = ctx.WithJob(job)
 	}
 
-	// The address the last update used, else the one PayRam answers at now.
-	baseURL := ""
-	if job, err := s.jobStore.LoadLatest(); err == nil && job != nil {
-		baseURL = job.CoreBaseURL
-	}
-	if baseURL == "" {
-		baseURL = s.currentCoreBaseURL(context.Background(), ctx.ContainerName)
-	}
-	if baseURL != "" {
-		// Extract port from base URL (e.g., "https://127.0.0.1:443")
-		ctx.BaseURL = baseURL
-
-		// Simple port extraction from URL
-		for i := len(baseURL) - 1; i >= 0; i-- {
-			if baseURL[i] == ':' {
-				ctx.HTTPPort = baseURL[i+1:]
-				break
-			}
+	if ctx.ContainerName == "" {
+		if name, err := s.discoverContainerName(context.Background()); err == nil {
+			ctx.ContainerName = name
 		}
 	}
-
+	if ctx.BaseURL == "" && ctx.ContainerName != "" {
+		ctx.BaseURL = s.currentCoreBaseURL(context.Background(), ctx.ContainerName)
+	}
 	return ctx
 }

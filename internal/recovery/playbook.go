@@ -675,6 +675,39 @@ var playbooks = map[string]Playbook{
 		PayRamState: PayRamUnchanged,
 	},
 
+	"STATE_SAVE_FAILED": {
+		Code:        "STATE_SAVE_FAILED",
+		Severity:    SeverityManual,
+		Title:       "Updater Could Not Save Its Progress",
+		UserMessage: msgUnchanged + "The updater could not write to its state folder, so it stopped before changing anything (it never changes PayRam's container without recording what it did).",
+		SSHSteps: numbered(
+			stepCheckHealth,
+			"Check free space and the updater's state folder (read-only): df -h /var/lib/payram-updater; ls -ld /var/lib/payram-updater",
+			"Free space if the disk is full (keep PayRam's images and data folders), then restart the updater: sudo systemctl restart payram-updater",
+			stepRetry,
+			stepSendLogs,
+		),
+		DocsURL:     "https://docs.payram.com/troubleshooting/configuration",
+		DataRisk:    DataRiskNone,
+		PayRamState: PayRamUnchanged,
+	},
+
+	"INTERNAL_ERROR": {
+		Code:        "INTERNAL_ERROR",
+		Severity:    SeverityManual,
+		Title:       "Updater Error",
+		UserMessage: "PayRam was put back on the version it had before, unless the message above says otherwise; the updater hit an internal error and stopped the update. Your data is safe: the updater never deletes payment data.",
+		SSHSteps: numbered(
+			stepCheckHealth,
+			stepListContainers,
+			stepStartPrevious,
+			stepContactSupport,
+		),
+		DocsURL:     "https://docs.payram.com/troubleshooting/health",
+		DataRisk:    DataRiskNone,
+		PayRamState: PayRamUncertain,
+	},
+
 	"PAYRAM_CORE_PORT_NOT_FOUND": {
 		Code:        "PAYRAM_CORE_PORT_NOT_FOUND",
 		Severity:    SeverityManual,

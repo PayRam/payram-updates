@@ -31,6 +31,13 @@ func emittedFailureCodes(t *testing.T) []string {
 	patterns := []*regexp.Regexp{
 		regexp.MustCompile(`\b(?:FailureCode|CauseCode)\s*(?::|=)\s*"([A-Z][A-Z0-9_]+)"`),
 		regexp.MustCompile(`\bFailure[A-Z][A-Za-z]*\s*=\s*"([A-Z][A-Z0-9_]+)"`),
+		// switchover.StepError{Code: "..."}: the step's code becomes the
+		// job's FailureCode or CauseCode.
+		regexp.MustCompile(`StepError\{Code:\s*"([A-Z][A-Z0-9_]+)"`),
+		// The engine's helpers that end a job: failBeforeChange(job, "X", ...),
+		// finishFailed(job, "X", ...), putPayramBack(ctx, sw, job, "X", ...).
+		regexp.MustCompile(`\b(?:failBeforeChange|finishFailed)\(\s*job,\s*"([A-Z][A-Z0-9_]+)"`),
+		regexp.MustCompile(`\bputPayramBack\([^,]+,[^,]+,[^,]+,\s*"([A-Z][A-Z0-9_]+)"`),
 	}
 	seen := map[string]bool{}
 	for _, dir := range []string{"internal", "cmd"} {
