@@ -226,24 +226,6 @@ func TestSplitPortMapping(t *testing.T) {
 	}
 }
 
-func TestImageRefParts(t *testing.T) {
-	cases := []struct{ image, repo, tag string }{
-		{"payramapp/payram:3.9.0", "payramapp/payram", "3.9.0"},
-		{"payramapp/payram:3.9.0-arm64", "payramapp/payram", "3.9.0-arm64"},
-		{"localhost:5000/payram:3.10.0", "localhost:5000/payram", "3.10.0"},
-		{"localhost:5000/payram", "localhost:5000/payram", ""},
-		{"payramapp/payram@sha256:abc", "payramapp/payram", ""},
-	}
-	for _, tc := range cases {
-		if got := imageRepoOf(tc.image); got != tc.repo {
-			t.Errorf("imageRepoOf(%q) = %q, want %q", tc.image, got, tc.repo)
-		}
-		if got := imageTagOf(tc.image); got != tc.tag {
-			t.Errorf("imageTagOf(%q) = %q, want %q", tc.image, got, tc.tag)
-		}
-	}
-}
-
 func TestStartHeartbeat_KeepsTheSavedJobFresh(t *testing.T) {
 	store := jobs.NewStore(t.TempDir())
 	job := jobs.NewJob("j", jobs.JobModeDashboard, "3.10.0")

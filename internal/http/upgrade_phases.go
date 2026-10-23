@@ -125,7 +125,7 @@ func (s *Server) prepareHop(ctx context.Context, job *jobs.Job, containerName st
 		s.failBeforeChange(job, "RUNTIME_INSPECTION_FAILED", fmt.Sprintf("Could not read the PayRam container's settings: %v", err))
 		return nil, nil, "", false
 	}
-	if repo := imageRepoOf(runtimeState.Image); !s.isAllowedImageRepo(repo) {
+	if repo, _ := container.SplitImage(runtimeState.Image); !s.isAllowedImageRepo(repo) {
 		s.failBeforeChange(job, jobs.FailureTargetNotAllowed, fmt.Sprintf("Container %s runs %s, which is not a PayRam image; the updater only replaces PayRam containers", containerName, runtimeState.Image))
 		return nil, nil, "", false
 	}
@@ -347,6 +347,11 @@ func (p coreProbe) Version(ctx context.Context) (string, error) {
 	resp, err := p.client.Version(ctx)
 	if err != nil {
 		return "", err
+	}
+	if !isReleaseVersion(resp.Version) {
+		// A build that reports a branch name ("main"): its image label says
+		// which release it is.
+		return corecompat.VersionFromLabels(ctx, p.dockerBin, p.container)
 	}
 	return resp.Version, nil
 }
@@ -572,18 +577,6 @@ func (s *Server) supervisorctlStatus(ctx context.Context, containerName string) 
 	return "", fmt.Errorf("supervisorctl status failed: %w: %s", err, outputStr)
 }
 
-func parseSupervisorStatus(output string) map[string]string {
-	status := make(map[string]string)
-	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		status[fields[0]] = fields[1]
-	}
-	return status
-}
-
 func (s *Server) supervisorctlStop(ctx context.Context, containerName string, programs []string) error {
 	if len(programs) == 0 {
 		return nil
@@ -645,34 +638,12 @@ func (s *Server) quiesceForBackup(ctx context.Context, job *jobs.Job, containerN
 		return false, &switchover.StepError{Code: "SUPERVISORCTL_FAILED", Message: fmt.Sprintf("Could not read PayRam's program list: %v", err)}
 	}
 
-	status := parseSupervisorStatus(statusOutput)
-	excludeSet := make(map[string]struct{}, len(s.config.SupervisorExclude))
-	for _, name := range s.config.SupervisorExclude {
-		excludeSet[name] = struct{}{}
-	}
-	includeSet := make(map[string]struct{}, len(s.config.SupervisorInclude))
-	for _, name := range s.config.SupervisorInclude {
-		includeSet[name] = struct{}{}
-	}
-
-	var running []string
-	for name, state := range status {
-		if len(includeSet) > 0 {
-			if _, ok := includeSet[name]; !ok {
-				continue
-			}
-		} else if _, ok := excludeSet[name]; ok {
-			continue
-		}
-		if state == "RUNNING" || state == "STARTING" {
-			running = append(running, name)
-		}
-	}
+	programs, _ := backup.ParseSupervisorStatus(statusOutput)
+	running := backup.AppPrograms(programs, s.config.SupervisorInclude, s.config.SupervisorExclude, "RUNNING", "STARTING")
 	if len(running) == 0 {
 		s.jobStore.AppendLog("No running PayRam programs need stopping for the backup")
 		return true, nil
 	}
-	sort.Strings(running)
 
 	job.QuiescedPrograms = running
 	job.SwitchStage = jobs.SwitchStageQuiesced
@@ -690,6 +661,13 @@ func (s *Server) quiesceForBackup(ctx context.Context, job *jobs.Job, containerN
 // backUpBeforeSwitch takes the pre-update backup with PayRam's programs
 // stopped. On failure the caller's restore starts the programs again.
 func (s *Server) backUpBeforeSwitch(ctx context.Context, job *jobs.Job, containerName, imageTag string) error {
+	// Check the backup can be taken before stopping anything: a missing
+	// pg_dump or wrong credentials must not cost the merchant any downtime.
+	s.jobStore.AppendLog("Checking that the database backup can be taken...")
+	if err := s.containerBackupExec.CheckBackupReady(ctx, containerName); err != nil {
+		return &switchover.StepError{Code: "BACKUP_FAILED", Message: fmt.Sprintf("The database backup cannot be taken (%v)", err)}
+	}
+
 	usedSupervisor, err := s.quiesceForBackup(ctx, job, containerName)
 	if err != nil {
 		return err
@@ -778,6 +756,11 @@ func (s *Server) takePreUpgradeBackup(ctx context.Context, job *jobs.Job, contai
 		}
 
 		s.jobStore.AppendLog(fmt.Sprintf("Backup attempt %d/%d failed: %s - %s", attempt, attempts, backupResult.FailureCode, backupResult.ErrorMessage))
+		if !backupResult.Retryable {
+			// A timeout, a missing tool or wrong credentials fail the same
+			// way again; retrying would only keep PayRam stopped longer.
+			break
+		}
 		if attempt < attempts {
 			time.Sleep(2 * time.Second)
 		}
@@ -882,7 +865,7 @@ func (s *Server) finalizeUpgrade(ctx context.Context, job *jobs.Job, imageRepo, 
 	s.jobStore.AppendLog(fmt.Sprintf("SUCCESS: Upgrade to %s completed successfully", imageTag))
 
 	keep := []string{imageTag}
-	if previous := imageTagOf(job.PreviousImage); previous != "" {
+	if _, previous := container.SplitImage(job.PreviousImage); previous != "" {
 		keep = append(keep, previous)
 	}
 	pruneCtx, cancelPrune := context.WithTimeout(ctx, 30*time.Second)
@@ -892,27 +875,4 @@ func (s *Server) finalizeUpgrade(ctx context.Context, job *jobs.Job, imageRepo, 
 	} else {
 		s.jobStore.AppendLog(fmt.Sprintf("Pruned old Payram images (kept %s)", strings.Join(keep, ", ")))
 	}
-}
-
-// imageRepoOf returns "payramapp/payram" for "payramapp/payram:3.9.0" (or
-// "...@sha256:...").
-func imageRepoOf(image string) string {
-	if at := strings.Index(image, "@"); at >= 0 {
-		image = image[:at]
-	}
-	if colon := strings.LastIndex(image, ":"); colon > strings.LastIndex(image, "/") {
-		image = image[:colon]
-	}
-	return image
-}
-
-// imageTagOf returns "3.9.0" for "payramapp/payram:3.9.0", "" without a tag.
-func imageTagOf(image string) string {
-	if strings.Contains(image, "@") {
-		return ""
-	}
-	if colon := strings.LastIndex(image, ":"); colon > strings.LastIndex(image, "/") {
-		return image[colon+1:]
-	}
-	return ""
 }

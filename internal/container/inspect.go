@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -210,6 +211,21 @@ func (i *Inspector) ExtractRuntimeState(ctx context.Context, containerNameOrID s
 		len(state.Ports), len(state.Mounts), len(state.Env), len(state.Networks))
 
 	return state, nil
+}
+
+// SplitImage splits an image reference into repository and tag:
+// "payramapp/payram:3.9.0" → ("payramapp/payram", "3.9.0"),
+// "localhost:5000/payram:3.10.0" → ("localhost:5000/payram", "3.10.0").
+// A digest reference ("...@sha256:...") or a reference without a tag gives an
+// empty tag.
+func SplitImage(image string) (repo, tag string) {
+	if at := strings.Index(image, "@"); at >= 0 {
+		return image[:at], ""
+	}
+	if colon := strings.LastIndex(image, ":"); colon > strings.LastIndex(image, "/") {
+		return image[:colon], image[colon+1:]
+	}
+	return image, ""
 }
 
 // parseImageTag extracts the tag from an image name.

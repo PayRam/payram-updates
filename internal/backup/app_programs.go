@@ -37,7 +37,7 @@ func (m *Manager) stopAppPrograms(ctx context.Context, container string) (func()
 	}
 
 	status, err := m.runSupervisorctl(ctx, container, "status")
-	programs, parsed := parseSupervisorStatus(status)
+	programs, parsed := ParseSupervisorStatus(status)
 	if err != nil && !parsed {
 		// supervisorctl exits 3 when some program is not RUNNING; that output
 		// still parses. Anything else means it is not usable here.
@@ -45,16 +45,7 @@ func (m *Manager) stopAppPrograms(ctx context.Context, container string) (func()
 		return nothing, nil
 	}
 
-	var toStop []string
-	for name, state := range programs {
-		if m.keepsRunning(name) {
-			continue
-		}
-		if state == "RUNNING" || state == "STARTING" {
-			toStop = append(toStop, name)
-		}
-	}
-	sort.Strings(toStop)
+	toStop := AppPrograms(programs, nil, m.Config.SupervisorExclude, "RUNNING", "STARTING")
 	if len(toStop) == 0 {
 		m.Logger.Printf("No PayRam programs are running in %s; nothing to stop", container)
 		return nothing, nil
@@ -81,18 +72,35 @@ func (m *Manager) stopAppPrograms(ctx context.Context, container string) (func()
 	return startAgain, nil
 }
 
-// keepsRunning reports whether a supervisord program stays up during a
-// restore: PostgreSQL itself, and anything in Config.SupervisorExclude.
-func (m *Manager) keepsRunning(program string) bool {
-	if strings.Contains(strings.ToLower(program), "postgres") {
-		return true
+// AppPrograms returns, sorted, the PayRam programs among a parsed
+// `supervisorctl status` that are in one of states. PostgreSQL is never one
+// of them (an update or a restore must keep the database up), nor is any
+// name in exclude; when include is non-empty only those names count. The
+// update engine and the restore both decide what to stop with it.
+func AppPrograms(programs map[string]string, include, exclude []string, states ...string) []string {
+	wanted := make(map[string]bool, len(states))
+	for _, state := range states {
+		wanted[state] = true
 	}
-	for _, name := range m.Config.SupervisorExclude {
-		if name == program {
-			return true
+	excluded := make(map[string]bool, len(exclude))
+	for _, name := range exclude {
+		excluded[name] = true
+	}
+	included := make(map[string]bool, len(include))
+	for _, name := range include {
+		included[name] = true
+	}
+	var names []string
+	for name, state := range programs {
+		switch {
+		case strings.Contains(strings.ToLower(name), "postgres"), excluded[name]:
+		case len(included) > 0 && !included[name]:
+		case wanted[state]:
+			names = append(names, name)
 		}
 	}
-	return false
+	sort.Strings(names)
+	return names
 }
 
 // runSupervisorctl runs supervisorctl inside the container and returns its
@@ -114,9 +122,9 @@ func (m *Manager) runSupervisorctl(ctx context.Context, container string, args .
 	return output, nil
 }
 
-// parseSupervisorStatus reads `supervisorctl status` lines ("name STATE
+// ParseSupervisorStatus reads `supervisorctl status` lines ("name STATE
 // ..."). parsed is false when no line looks like a program status.
-func parseSupervisorStatus(output string) (programs map[string]string, parsed bool) {
+func ParseSupervisorStatus(output string) (programs map[string]string, parsed bool) {
 	programs = make(map[string]string)
 	for _, line := range strings.Split(output, "\n") {
 		fields := strings.Fields(line)

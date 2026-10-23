@@ -666,3 +666,18 @@ func findMount(mounts []Mount, destination string) *Mount {
 	}
 	return nil
 }
+
+func TestSplitImage(t *testing.T) {
+	cases := []struct{ image, repo, tag string }{
+		{"payramapp/payram:3.9.0", "payramapp/payram", "3.9.0"},
+		{"payramapp/payram:3.9.0-arm64", "payramapp/payram", "3.9.0-arm64"},
+		{"localhost:5000/payram:3.10.0", "localhost:5000/payram", "3.10.0"},
+		{"localhost:5000/payram", "localhost:5000/payram", ""},
+		{"payramapp/payram@sha256:abc", "payramapp/payram", ""},
+	}
+	for _, tc := range cases {
+		if repo, tag := SplitImage(tc.image); repo != tc.repo || tag != tc.tag {
+			t.Errorf("SplitImage(%q) = %q, %q; want %q, %q", tc.image, repo, tag, tc.repo, tc.tag)
+		}
+	}
+}

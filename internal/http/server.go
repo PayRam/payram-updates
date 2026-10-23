@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	goversion "github.com/hashicorp/go-version"
 	"github.com/payram/payram-updater/internal/backup"
 	"github.com/payram/payram-updater/internal/config"
 	"github.com/payram/payram-updater/internal/container"
@@ -106,6 +107,10 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 		PGPassword:          cfg.Backup.PGPassword,
 		ImagePattern:        imagePattern,
 		TargetContainerName: cfg.TargetContainerName,
+		// Pruning never deletes the backup of the latest failed update.
+		StateDir:          cfg.StateDir,
+		DockerBin:         cfg.DockerBin,
+		SupervisorExclude: cfg.SupervisorExclude,
 	}
 	backupMgr := backup.NewManager(backupCfg, &backup.RealExecutor{}, logger.StdLogger())
 
@@ -549,7 +554,9 @@ func (s *Server) resolveCoreVersion(ctx context.Context, containerName, initVers
 func (s *Server) resolveCoreVersionAt(ctx context.Context, baseURL, containerName, initVersion string) (string, bool, error) {
 	if baseURL != "" {
 		versionResp, err := coreclient.NewClient(baseURL).Version(ctx)
-		if err == nil && versionResp != nil && versionResp.Version != "" {
+		// Some builds report a branch name ("main") instead of a version;
+		// the image label is right for those.
+		if err == nil && versionResp != nil && isReleaseVersion(versionResp.Version) {
 			legacy, legacyErr := corecompat.IsBeforeInit(versionResp.Version, initVersion)
 			if legacyErr != nil {
 				logger.Error("Server", "resolveCoreVersion", legacyErr)
@@ -601,6 +608,13 @@ func (s *Server) rememberCoreBaseURL(url string) {
 	s.coreURLMu.Lock()
 	defer s.coreURLMu.Unlock()
 	s.coreURL, s.coreURLAt = url, time.Now()
+}
+
+// isReleaseVersion reports whether v looks like a release version (3.10.0,
+// v3.10.0, 3.10.0-arm64) rather than a branch name.
+func isReleaseVersion(v string) bool {
+	_, err := goversion.NewVersion(baseVersionTag(strings.TrimPrefix(strings.TrimSpace(v), "v")))
+	return err == nil
 }
 
 func (s *Server) shouldUseLegacyForTarget(initVersion, targetVersion string) bool {

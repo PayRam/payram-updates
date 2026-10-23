@@ -20,10 +20,8 @@ import (
 	"github.com/payram/payram-updater/internal/backup"
 	"github.com/payram/payram-updater/internal/config"
 	"github.com/payram/payram-updater/internal/container"
-	"github.com/payram/payram-updater/internal/dockerexec"
 	"github.com/payram/payram-updater/internal/history"
 	"github.com/payram/payram-updater/internal/jobs"
-	"github.com/payram/payram-updater/internal/manifest"
 )
 
 // databaseReadyTimeout bounds the wait for the database after a container
@@ -171,103 +169,6 @@ func printJSONError(message string) {
 		"error":   message,
 	}, "", "  ")
 	fmt.Println(string(jsonOut))
-}
-
-// performContainerRollback rolls back the Payram container to a previous version.
-// This function:
-// 1. Discovers the current running container
-// 2. Extracts its runtime state
-// 3. Stops and removes the current container
-// 4. Runs a new container with the previous version using the existing docker run builder
-// 5. Verifies the container is running
-func performContainerRollback(ctx context.Context, targetVersion string) error {
-	// Load configuration
-	cfg, err := config.Load()
-	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
-	}
-
-	// Discover running container. Prefer explicit name (handles non-semver tags).
-	imagePattern := "payramapp/payram:"
-	if cfg.ImageRepoOverride != "" {
-		imagePattern = cfg.ImageRepoOverride + ":"
-	}
-
-	var containerName string
-	if cfg.TargetContainerName != "" {
-		containerName = cfg.TargetContainerName
-		log.Printf("Using explicit container name: %s", containerName)
-	} else {
-		discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, log.Default())
-		discovered, err := discoverer.DiscoverPayramContainer(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to discover running container: %w", err)
-		}
-		containerName = discovered.Name
-		log.Printf("Discovered container: %s (current version: %s)", containerName, discovered.ImageTag)
-	}
-
-	// Extract runtime state from current container
-	inspector := container.NewInspector(cfg.DockerBin, log.Default())
-	runtimeState, err := inspector.ExtractRuntimeState(ctx, containerName)
-	if err != nil {
-		return fmt.Errorf("failed to extract runtime state: %w", err)
-	}
-	log.Printf("Extracted runtime state: %d ports, %d mounts, %d env vars",
-		len(runtimeState.Ports), len(runtimeState.Mounts), len(runtimeState.Env))
-
-	// Create a minimal manifest for rollback
-	// The manifest is used only to specify the target version
-	// The runtime state preserves all actual configuration
-	manifestData := &manifest.Manifest{
-		Image: manifest.Image{
-			Repo: strings.Split(runtimeState.Image, ":")[0],
-		},
-		Defaults: manifest.Defaults{
-			ContainerName: runtimeState.Name,
-			RestartPolicy: runtimeState.RestartPolicy.Name,
-		},
-	}
-
-	// Build docker run arguments using the container builder
-	builder := container.NewDockerRunBuilder(log.Default())
-	dockerArgs, err := builder.BuildUpgradeArgs(runtimeState, manifestData, targetVersion)
-	if err != nil {
-		return fmt.Errorf("failed to build docker run args: %w", err)
-	}
-
-	// Stop and remove current container
-	log.Printf("Stopping container: %s", containerName)
-	runner := &dockerexec.Runner{DockerBin: cfg.DockerBin, Logger: log.Default()}
-	if err := runner.Stop(ctx, containerName); err != nil {
-		return fmt.Errorf("failed to stop container: %w", err)
-	}
-
-	log.Printf("Removing container: %s", containerName)
-	if err := runner.Remove(ctx, containerName); err != nil {
-		return fmt.Errorf("failed to remove container: %w", err)
-	}
-
-	// Run new container with previous version
-	log.Printf("Starting container with rollback version: %s", targetVersion)
-	if err := runner.Run(ctx, dockerArgs); err != nil {
-		return fmt.Errorf("failed to run container: %w", err)
-	}
-
-	// Wait for container to start
-	time.Sleep(5 * time.Second)
-
-	// Verify the container is running
-	isRunning, err := runner.InspectRunning(ctx, containerName)
-	if err != nil {
-		return fmt.Errorf("failed to check container status: %w", err)
-	}
-	if !isRunning {
-		return fmt.Errorf("container is not running after rollback")
-	}
-
-	log.Printf("Container rollback completed successfully")
-	return nil
 }
 
 // restoreMode is what a restore replaces.
@@ -527,6 +428,16 @@ func runBackupRestore(mgr *backup.Manager, cfg *config.Config) {
 	}
 
 	var safetyBackupPath string
+	var rollback *containerRollback
+	// revertRollback undoes a container rollback whose database restore did
+	// not happen: the database still matches the newer version, so the newer
+	// container goes back and PayRam keeps running consistently.
+	revertRollback := func(cause error) {
+		if revertErr := rollback.Revert(ctx); revertErr != nil {
+			fail(fmt.Errorf("%v\nDatabase NOT restored, and PayRam could not be switched back to the newer version: %v", cause, revertErr))
+		}
+		fail(fmt.Errorf("%v\nDatabase NOT restored; PayRam was switched back to the version it ran before this restore and is running", cause))
+	}
 	if fullRecovery {
 		// The safety backup comes first: once the container is rolled back the
 		// database still holds the newer version's data, and this is its copy.
@@ -542,33 +453,34 @@ func runBackupRestore(mgr *backup.Manager, cfg *config.Config) {
 		opts.SkipSafetyBackup = true
 
 		fmt.Fprintf(os.Stderr, "\nRolling PayRam back to %s before restoring the database...\n", item.FromVersion)
-		if err := performContainerRollback(ctx, item.FromVersion); err != nil {
+		var err error
+		rollback, err = beginContainerRollback(ctx, cfg, item.FromVersion)
+		if err != nil {
 			fail(fmt.Errorf("container rollback failed: %v\nDatabase NOT restored", err))
 		}
 		fmt.Fprintf(os.Stderr, "Container rolled back to version %s\n", item.FromVersion)
+		opts.ContainerName = rollback.ContainerName()
 
-		rollbackContainer, err := discoverPayramContainer(ctx, cfg)
-		if err != nil {
-			fail(fmt.Errorf("failed to discover the rolled-back container: %v. PayRam was rolled back to %s but the database was NOT restored", err, item.FromVersion))
-		}
-		opts.ContainerName = rollbackContainer
-
-		fmt.Fprintf(os.Stderr, "Waiting for the database in %s to accept connections (up to %s)...\n", rollbackContainer, databaseReadyTimeout)
-		if err := mgr.WaitForDatabase(ctx, rollbackContainer, databaseReadyTimeout); err != nil {
-			fail(fmt.Errorf("the database did not become ready: %v. PayRam was rolled back to %s but the database was NOT restored", err, item.FromVersion))
+		fmt.Fprintf(os.Stderr, "Waiting for the database in %s to accept connections (up to %s)...\n", opts.ContainerName, databaseReadyTimeout)
+		if err := mgr.WaitForDatabase(ctx, opts.ContainerName, databaseReadyTimeout); err != nil {
+			revertRollback(fmt.Errorf("the database did not become ready: %v", err))
 		}
 	}
 
 	fmt.Fprintln(os.Stderr, "\nRestoring database from backup (one transaction: any error leaves the database unchanged)...")
 	result, err := mgr.RestoreBackup(ctx, item.File, opts)
 	if err != nil {
-		if fullRecovery {
-			err = fmt.Errorf("%w\nPayRam was rolled back to %s but its database was NOT restored", err, item.FromVersion)
-		}
 		if safetyBackupPath != "" {
 			err = fmt.Errorf("%w\nThe database as it was before this attempt is saved in %s", err, safetyBackupPath)
 		}
+		if rollback != nil {
+			// The restore is all-or-nothing: the database is unchanged.
+			revertRollback(err)
+		}
 		fail(err)
+	}
+	if rollback != nil {
+		rollback.Commit(ctx)
 	}
 	if result.SafetyBackupPath != "" {
 		safetyBackupPath = result.SafetyBackupPath

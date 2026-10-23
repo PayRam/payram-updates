@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/payram/payram-updater/internal/backup"
+	"github.com/payram/payram-updater/internal/container"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/logger"
 )
@@ -61,6 +61,14 @@ func (s *Server) repairInterruptedUpgrade(ctx context.Context) {
 		return
 	}
 	defer release()
+	// A CLI restore may have held the lock and finished its own switch
+	// meanwhile: work from the job as it is now.
+	// (If that restore died mid-switch, its job is the one to repair.)
+	fresh, err := s.jobStore.LoadLatest()
+	if err != nil || fresh == nil || !fresh.IsActive() {
+		return
+	}
+	job = fresh
 	stopHeartbeat := s.startHeartbeat()
 	defer stopHeartbeat()
 
@@ -79,7 +87,8 @@ func (s *Server) repairInterruptedUpgrade(ctx context.Context) {
 			if _, err := sw.WaitHealthy(work, job.ContainerName, probe, target); err == nil {
 				s.jobStore.AppendLog(fmt.Sprintf("%s is up and healthy; finishing the update", target))
 				sw.Finish(work, job)
-				s.finalizeUpgrade(work, job, imageRepoOf(state.Image), imageTagOf(state.Image))
+				repo, tag := container.SplitImage(state.Image)
+				s.finalizeUpgrade(work, job, repo, tag)
 				return
 			}
 		}
@@ -194,18 +203,8 @@ func (s *Server) stoppedPrograms(ctx context.Context, containerName string) []st
 	if err != nil {
 		return nil
 	}
-	excluded := map[string]bool{}
-	for _, name := range s.config.SupervisorExclude {
-		excluded[name] = true
-	}
-	var stopped []string
-	for name, state := range parseSupervisorStatus(output) {
-		if !excluded[name] && (state == "STOPPED" || state == "EXITED") {
-			stopped = append(stopped, name)
-		}
-	}
-	sort.Strings(stopped)
-	return stopped
+	programs, _ := backup.ParseSupervisorStatus(output)
+	return backup.AppPrograms(programs, s.config.SupervisorInclude, s.config.SupervisorExclude, "STOPPED", "EXITED")
 }
 
 func backupPathOrUnknown(path string) string {

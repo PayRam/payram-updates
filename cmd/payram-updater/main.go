@@ -102,7 +102,7 @@ LOGS FLAGS:
 BACKUP SUBCOMMANDS:
   backup create           Create a new database backup manually
   backup list             List all available backups
-  backup restore --file   Restore from a backup (requires --yes to confirm)
+  backup restore --file   Restore from a backup (asks before changing anything; --mode db-only|full --yes skips the questions)
 
 BACKUP FLAGS:
   --file string    Path to backup file (for restore)
@@ -133,7 +133,7 @@ EXAMPLES:
   payram-updater sync
   payram-updater backup create
   payram-updater backup list
-  payram-updater backup restore --file /path/to/backup.dump --yes
+  payram-updater backup restore --file /path/to/backup.dump
 
   payram-updater cleanup state
   payram-updater cleanup backups --yes

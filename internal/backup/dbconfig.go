@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/payram/payram-updater/internal/dockerexec"
 )
 
 const (
@@ -87,22 +89,13 @@ func (d *DockerInspector) CheckDaemon(ctx context.Context) error {
 	return nil
 }
 
-// isDockerNotFound reports whether docker output says the container does
-// not exist. The daemon says "No such container", Docker Desktop's CLI
-// "error: no such object", so case is ignored (same rule as
-// dockerexec.IsNotFound).
-func isDockerNotFound(output string) bool {
-	lower := strings.ToLower(output)
-	return strings.Contains(lower, "no such container") || strings.Contains(lower, "no such object")
-}
-
 // ContainerExists checks if a container exists (running or stopped). Any
 // docker failure other than "no such container" is returned as an error, so
 // a daemon problem is not mistaken for a missing container.
 func (d *DockerInspector) ContainerExists(ctx context.Context, container string) (bool, error) {
 	output, err := d.Executor.Execute(ctx, d.DockerBin, []string{"inspect", container}, nil)
 	if err != nil {
-		if isDockerNotFound(string(output)) {
+		if dockerexec.IsNotFound(string(output)) {
 			return false, nil
 		}
 		return false, fmt.Errorf("docker inspect %s failed: %w: %s", container, err, strings.TrimSpace(string(output)))
@@ -116,7 +109,7 @@ func (d *DockerInspector) ContainerRunning(ctx context.Context, container string
 		[]string{"inspect", "--format", "{{.State.Running}}", container}, nil)
 	if err != nil {
 		outputStr := string(output)
-		if isDockerNotFound(outputStr) {
+		if dockerexec.IsNotFound(outputStr) {
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to inspect container: %w: %s", err, strings.TrimSpace(outputStr))
@@ -131,7 +124,7 @@ func (d *DockerInspector) GetContainerEnv(ctx context.Context, container string)
 		[]string{"inspect", "--format", "{{json .Config.Env}}", container}, nil)
 	if err != nil {
 		outputStr := string(output)
-		if isDockerNotFound(outputStr) {
+		if dockerexec.IsNotFound(outputStr) {
 			return nil, fmt.Errorf("container not found: %s", container)
 		}
 		return nil, fmt.Errorf("failed to inspect container: %w: %s", err, outputStr)
