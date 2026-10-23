@@ -135,6 +135,20 @@ payram-updater run --to 1.7.8
 
 ## Recovery & Troubleshooting
 
+An update never deletes payment data, and whatever fails, the updater's aim is
+that PayRam ends up running. The new version is started next to the running
+one; if it fails its checks, the updater switches back to the previous version
+on its own. Before anything else after a failed update, check whether PayRam
+answers:
+
+```bash
+curl -sk https://127.0.0.1/api/v1/health   # HTTPS installs
+curl -s http://127.0.0.1/api/v1/health     # HTTP-only installs
+```
+
+A reply containing `"status":"ok"` means PayRam is running: nothing needs
+restoring.
+
 ### Diagnose system health
 ```bash
 payram-updater inspect
@@ -145,19 +159,59 @@ This shows:
 - Detected issues and their severity
 - Recovery recommendations
 
-### Attempt automatic recovery
+### Check what needs recovering
 ```bash
 payram-updater recover
 ```
 
-This will attempt to recover from a failed upgrade automatically. Some failures (like database migration errors) require manual intervention for safety.
+Reads the last update and tells you what, if anything, to do. It only reads:
+it never stops, removes or restarts a container. When PayRam was not changed
+or was already put back, it confirms PayRam's container is running and says
+so; when a person has to look, it prints the recovery steps.
 
 ### View recovery guidance
 ```bash
 curl http://127.0.0.1:2567/upgrade/playbook
 ```
 
-Shows detailed recovery steps for the current failure.
+Shows detailed recovery steps for the current failure. Every playbook starts
+with read-only checks. Restoring a backup is only ever offered as the last
+step, to do only if PayRam support asks you to: it removes every payment,
+deposit and payout recorded after the backup was taken.
+
+### What a failed update means
+
+| Code | Is PayRam running? | What to do |
+|------|--------------------|------------|
+| `UPGRADE_ROLLED_BACK` | Yes, on the version it had before. The new version failed (the cause is shown) and the updater switched back. The database was not restored, so payments recorded during the update are kept. | Nothing to recover. Send the updater logs to PayRam support, then retry later. |
+| `ROLLBACK_FAILED` | Maybe not. The new version failed and switching back failed too. | Follow the playbook: it shows how to start `<name>-previous`, the version that ran before. Do not restore a backup unless support asks. |
+| `UPGRADE_INTERRUPTED` | Yes. The updater stopped mid-update (restart, crash, reboot) and put PayRam back when it came up. | Retry the update. |
+| `DOCKER_CREATE_FAILED`, `TARGET_NOT_ALLOWED`, `DOCKER_PULL_FAILED`, `BACKUP_FAILED`, `BACKUP_TIMEOUT`, `DISK_SPACE_LOW`, `POLICY_FETCH_FAILED`, `MANIFEST_FETCH_FAILED`, ... | Yes, unchanged: the update stopped before PayRam was touched. | Fix the cause shown in the playbook and retry. |
+| `HEALTHCHECK_FAILED`, `VERSION_MISMATCH`, `DOCKER_ERROR` (from older updater versions) | Often yes: check first. Updater v0.2.3 reports `HEALTHCHECK_FAILED` on every install that publishes only ports 80/443, even when PayRam is healthy. | Run the health check above. If it replies ok, run `payram-updater sync` and you are done. |
+
+During an update the updater saves its progress at least every 30 seconds. If
+`payram-updater status` shows an update in progress whose `updatedAt` has not
+changed for more than 5 minutes, the updater has stopped working on it: restart
+it with `sudo systemctl restart payram-updater`. When it starts, it puts PayRam
+back on its own. `payram-updater sync` refuses to run while an update is in
+progress or interrupted.
+
+### Freeing disk space safely
+
+The updater keeps the previous PayRam container and its image so it can switch
+back. To free space, use `docker image prune` (untagged layers only) and
+`docker builder prune`, and check `sudo du -sh /var/lib/payram/backups
+/var/log/journal`. Do not run `docker system prune`, `docker container prune`
+or any prune with `-a`: they delete what a switch-back needs.
+
+### Database commands
+
+PayRam's bundled database is never published on the host. Run database
+commands inside the container, for example:
+
+```bash
+docker exec payram sh -c 'pg_isready -U "${POSTGRES_USER:-${POSTGRES_USERNAME:-payram}}" -d "${POSTGRES_DB:-${POSTGRES_DATABASE:-payram}}"'
+```
 
 ## Database Backups
 
@@ -309,4 +363,4 @@ sudo systemctl daemon-reload
 For issues or questions:
 - Check logs: `sudo journalctl -u payram-updater -f`
 - Run diagnostics: `payram-updater inspect`
-- Contact: [sales@payram.com](mailto:sales@payram.com)
+- Contact PayRam support: Telegram [t.me/PayRamChat](https://t.me/PayRamChat) or [support@payram.com](mailto:support@payram.com). Attach `payram-updater status`, `payram-updater logs` and `sudo journalctl -u payram-updater --since "6 hours ago" --no-pager`.
