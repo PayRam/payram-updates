@@ -820,3 +820,100 @@ func TestBuildUpgradeArgs_DropsDatabasePort(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildCreateArgs_RecreatesTheContainerFaithfully covers the settings an
+// update must carry over exactly, built for `docker create` under a new name.
+func TestBuildCreateArgs_RecreatesTheContainerFaithfully(t *testing.T) {
+	state := &RuntimeState{
+		Name:          "/payram",
+		Image:         "payramapp/payram:3.9.0",
+		ImageTag:      "3.9.0",
+		RestartPolicy: RestartPolicy{Name: "unless-stopped"},
+		NetworkMode:   "payramnet",
+		Networks: []NetworkConfig{
+			{NetworkName: "payramnet"},
+			{NetworkName: "monitoring"},
+		},
+		Ports: []PortMapping{
+			{HostIP: "0.0.0.0", HostPort: "443", ContainerPort: "443", Protocol: "tcp"},
+			{HostIP: "127.0.0.1", HostPort: "8080", ContainerPort: "8080", Protocol: "tcp"},
+			{HostIP: "::1", HostPort: "8443", ContainerPort: "8443", Protocol: "tcp"},
+		},
+		Mounts: []Mount{
+			{Type: "volume", Name: "payram-postgres-data", Source: "/var/lib/docker/volumes/payram-postgres-data/_data", Destination: "/var/lib/payram/db"},
+			{Type: "bind", Source: "/root/payram/log", Destination: "/var/log", Mode: "rw"},
+		},
+		Env: []string{
+			"AES_KEY=secret",
+			"PATH=/usr/lib/postgresql/17/bin:/usr/local/bin:/usr/bin",
+			"POSTGRES_USER=payram",
+		},
+		ImageEnv: []string{"PATH=/usr/lib/postgresql/17/bin:/usr/local/bin:/usr/bin"},
+	}
+	m := &manifest.Manifest{Image: manifest.Image{Repo: "payramapp/payram"}}
+
+	builder := NewDockerRunBuilder(&mockLogger{})
+	spec, err := builder.BuildContainerSpec(state, m, "3.10.0")
+	if err != nil {
+		t.Fatalf("BuildContainerSpec: %v", err)
+	}
+	args := strings.Join(builder.BuildCreateArgs(spec, "payram-next"), " ")
+
+	for _, want := range []string{
+		"create --name payram-next ",
+		"--restart unless-stopped",
+		"-p 443:443/tcp",
+		"-p 127.0.0.1:8080:8080/tcp",
+		"-p [::1]:8443:8443/tcp",
+		"-v payram-postgres-data:/var/lib/payram/db",
+		"-v /root/payram/log:/var/log:rw",
+		"-e AES_KEY=secret",
+		"-e POSTGRES_USER=payram",
+		"--network payramnet",
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("create args missing %q:\n%s", want, args)
+		}
+	}
+	if strings.Contains(args, "PATH=") {
+		t.Errorf("the old image's default PATH must be left to the new image:\n%s", args)
+	}
+	if strings.Contains(args, "/var/lib/docker/volumes") {
+		t.Errorf("a named volume must be mounted by name, not by its host path:\n%s", args)
+	}
+	if !strings.HasSuffix(args, " payramapp/payram:3.10.0") {
+		t.Errorf("image must be last: %s", args)
+	}
+	if len(spec.ExtraNetworks) != 1 || spec.ExtraNetworks[0] != "monitoring" {
+		t.Errorf("extra networks = %v, want [monitoring]", spec.ExtraNetworks)
+	}
+
+	run, err := builder.BuildUpgradeArgs(state, m, "3.10.0")
+	if err != nil {
+		t.Fatalf("BuildUpgradeArgs: %v", err)
+	}
+	if got := strings.Join(run[:4], " "); got != "run -d --name payram" {
+		t.Errorf("run args start = %q, want run -d --name payram", got)
+	}
+}
+
+// TestBuildContainerSpec_HostNetworkKeepsHostMode: a host-network container
+// must not be rebuilt on the bridge with published ports.
+func TestBuildContainerSpec_HostNetworkKeepsHostMode(t *testing.T) {
+	state := &RuntimeState{
+		Name:        "payram",
+		NetworkMode: "host",
+		Networks:    []NetworkConfig{{NetworkName: "host"}},
+		Ports:       []PortMapping{{HostPort: "80", ContainerPort: "80", Protocol: "tcp"}},
+	}
+	m := &manifest.Manifest{Image: manifest.Image{Repo: "payramapp/payram"}}
+
+	spec, err := NewDockerRunBuilder(&mockLogger{}).BuildContainerSpec(state, m, "3.10.0")
+	if err != nil {
+		t.Fatalf("BuildContainerSpec: %v", err)
+	}
+	args := strings.Join(spec.Options, " ")
+	if !strings.Contains(args, "--network host") || strings.Contains(args, "-p ") {
+		t.Errorf("host network container rebuilt wrongly: %s", args)
+	}
+}

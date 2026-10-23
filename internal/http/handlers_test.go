@@ -677,6 +677,7 @@ func TestHandleUpgradeRun_Success(t *testing.T) {
 		RuntimeManifestURL:  manifestServer.URL,
 		FetchTimeoutSeconds: 5,
 		DockerBin:           "echo", // Mock docker with echo
+		StateDir:            tmpDir, // history goes to the temp dir, not the source tree
 	}
 	jobStore := jobs.NewStore(tmpDir)
 	server := New(cfg, jobStore)

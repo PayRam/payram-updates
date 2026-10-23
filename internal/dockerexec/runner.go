@@ -17,6 +17,20 @@ type Logger interface {
 type Runner struct {
 	DockerBin string
 	Logger    Logger
+	// StopTimeoutSeconds is how long `docker stop` waits before killing the
+	// container. Zero keeps Docker's default (10s), which is too short for the
+	// bundled Postgres to shut down cleanly.
+	StopTimeoutSeconds int
+}
+
+// ContainerState is what an update needs to know about one container.
+type ContainerState struct {
+	Exists       bool
+	Running      bool
+	Status       string // created, running, restarting, exited, ...
+	RestartCount int
+	Image        string // image reference the container was created from
+	ExitCode     int
 }
 
 // Pull pulls a Docker image.
@@ -37,7 +51,11 @@ func (r *Runner) Pull(ctx context.Context, image string) error {
 // Stop stops a running Docker container.
 // Idempotent: returns no error if the container is not running.
 func (r *Runner) Stop(ctx context.Context, container string) error {
-	args := []string{"stop", container}
+	args := []string{"stop"}
+	if r.StopTimeoutSeconds > 0 {
+		args = append(args, "-t", fmt.Sprintf("%d", r.StopTimeoutSeconds))
+	}
+	args = append(args, container)
 	r.logCommand(args)
 
 	cmd := exec.CommandContext(ctx, r.DockerBin, args...)
@@ -130,6 +148,78 @@ func (r *Runner) Run(ctx context.Context, args []string) error {
 	return nil
 }
 
+// Rename renames a container.
+func (r *Runner) Rename(ctx context.Context, from, to string) error {
+	args := []string{"rename", from, to}
+	r.logCommand(args)
+
+	cmd := exec.CommandContext(ctx, r.DockerBin, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker rename %s %s failed: %w: %s", from, to, err, strings.TrimSpace(string(output)))
+	}
+	r.logf("Renamed container %s to %s", from, to)
+	return nil
+}
+
+// UpdateRestartPolicy changes a container's restart policy in place.
+func (r *Runner) UpdateRestartPolicy(ctx context.Context, container, policy string) error {
+	args := []string{"update", "--restart", policy, container}
+	r.logCommand(args)
+
+	cmd := exec.CommandContext(ctx, r.DockerBin, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker update --restart %s %s failed: %w: %s", policy, container, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// ConnectNetwork attaches a container to an additional network.
+func (r *Runner) ConnectNetwork(ctx context.Context, network, container string) error {
+	args := []string{"network", "connect", network, container}
+	r.logCommand(args)
+
+	cmd := exec.CommandContext(ctx, r.DockerBin, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker network connect %s %s failed: %w: %s", network, container, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// State reports whether a container exists and how it is doing. A missing
+// container is not an error: State returns Exists=false.
+func (r *Runner) State(ctx context.Context, container string) (ContainerState, error) {
+	args := []string{"inspect", "-f", "{{.State.Running}}|{{.State.Status}}|{{.RestartCount}}|{{.Config.Image}}|{{.State.ExitCode}}", container}
+	cmd := exec.CommandContext(ctx, r.DockerBin, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		outputStr := string(output)
+		if strings.Contains(outputStr, "No such object") || strings.Contains(outputStr, "No such container") {
+			return ContainerState{}, nil
+		}
+		return ContainerState{}, fmt.Errorf("docker inspect %s failed: %w: %s", container, err, strings.TrimSpace(outputStr))
+	}
+	return parseContainerState(strings.TrimSpace(string(output)))
+}
+
+func parseContainerState(line string) (ContainerState, error) {
+	fields := strings.Split(line, "|")
+	if len(fields) != 5 {
+		return ContainerState{}, fmt.Errorf("unexpected docker inspect output: %q", line)
+	}
+	state := ContainerState{
+		Exists:  true,
+		Running: fields[0] == "true",
+		Status:  fields[1],
+		Image:   fields[3],
+	}
+	fmt.Sscanf(fields[2], "%d", &state.RestartCount)
+	fmt.Sscanf(fields[4], "%d", &state.ExitCode)
+	return state, nil
+}
+
 // InspectRunning checks if a container is currently running.
 // Returns true if running, false if not running or doesn't exist.
 func (r *Runner) InspectRunning(ctx context.Context, container string) (bool, error) {
@@ -157,15 +247,16 @@ func (r *Runner) InspectRunning(ctx context.Context, container string) (bool, er
 }
 
 // PrunePayramImages removes old Payram images for the given repo.
-// It keeps the current tag and any tags used by running containers.
+// It keeps every tag in keepTags (the running version and the one an update
+// would switch back to) and any image used by an existing container.
 // Best-effort: returns error only if listing images or containers fails.
-func (r *Runner) PrunePayramImages(ctx context.Context, imageRepo string, keepTag string) error {
+func (r *Runner) PrunePayramImages(ctx context.Context, imageRepo string, keepTags ...string) error {
 	if strings.TrimSpace(imageRepo) == "" {
 		return fmt.Errorf("image repo is required for pruning")
 	}
 
-	// Collect images used by running containers
-	psArgs := []string{"ps", "--format", "{{.Image}}"}
+	// Collect images used by any container, stopped ones included
+	psArgs := []string{"ps", "-a", "--format", "{{.Image}}"}
 	r.logCommand(psArgs)
 	psCmd := exec.CommandContext(ctx, r.DockerBin, psArgs...)
 	psOutput, err := psCmd.CombinedOutput()
@@ -189,14 +280,19 @@ func (r *Runner) PrunePayramImages(ctx context.Context, imageRepo string, keepTa
 		return fmt.Errorf("docker images failed: %w: %s", err, string(listOutput))
 	}
 
-	currentRef := fmt.Sprintf("%s:%s", imageRepo, keepTag)
+	keepRefs := map[string]struct{}{}
+	for _, tag := range keepTags {
+		if tag != "" {
+			keepRefs[fmt.Sprintf("%s:%s", imageRepo, tag)] = struct{}{}
+		}
+	}
 	for _, ref := range strings.Split(strings.TrimSpace(string(listOutput)), "\n") {
 		ref = strings.TrimSpace(ref)
 		if ref == "" {
 			continue
 		}
-		// Skip current tag and any running images
-		if ref == currentRef {
+		// Skip kept tags and any image a container still uses
+		if _, ok := keepRefs[ref]; ok {
 			continue
 		}
 		if _, ok := runningImages[ref]; ok {

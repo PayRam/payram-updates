@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -442,6 +443,7 @@ func TestExtractPorts(t *testing.T) {
 func TestExtractMounts(t *testing.T) {
 	dockerMounts := []struct {
 		Type        string `json:"Type"`
+		Name        string `json:"Name"`
 		Source      string `json:"Source"`
 		Destination string `json:"Destination"`
 		Mode        string `json:"Mode"`
@@ -449,7 +451,8 @@ func TestExtractMounts(t *testing.T) {
 	}{
 		{
 			Type:        "volume",
-			Source:      "data-vol",
+			Name:        "data-vol",
+			Source:      "/var/lib/docker/volumes/data-vol/_data",
 			Destination: "/data",
 			Mode:        "",
 			RW:          true,
@@ -472,6 +475,9 @@ func TestExtractMounts(t *testing.T) {
 	if mounts[0].Type != "volume" {
 		t.Errorf("Expected type 'volume', got '%s'", mounts[0].Type)
 	}
+	if mounts[0].Name != "data-vol" {
+		t.Errorf("Expected volume name 'data-vol', got '%s'", mounts[0].Name)
+	}
 
 	if mounts[1].Mode != "ro" {
 		t.Errorf("Expected mode 'ro', got '%s'", mounts[1].Mode)
@@ -492,7 +498,7 @@ func TestExtractNetworks(t *testing.T) {
 		},
 	}
 
-	networks := extractNetworks(dockerNetworks)
+	networks := extractNetworks(dockerNetworks, "bridge")
 
 	if len(networks) != 1 {
 		t.Fatalf("Expected 1 network, got %d", len(networks))
@@ -504,6 +510,32 @@ func TestExtractNetworks(t *testing.T) {
 
 	if networks[0].IPAddress != "172.17.0.2" {
 		t.Errorf("Expected IP '172.17.0.2', got '%s'", networks[0].IPAddress)
+	}
+}
+
+// TestExtractNetworks_PrimaryFirstThenByName: Go map order is random, so the
+// primary network must always come first and the rest in a stable order.
+func TestExtractNetworks_PrimaryFirstThenByName(t *testing.T) {
+	dockerNetworks := map[string]struct {
+		IPAddress  string `json:"IPAddress"`
+		Gateway    string `json:"Gateway"`
+		MacAddress string `json:"MacAddress"`
+	}{
+		"zeta":      {IPAddress: "10.0.3.2"},
+		"bridge":    {IPAddress: "172.17.0.2"},
+		"payramnet": {IPAddress: "10.0.1.2"},
+		"alpha":     {IPAddress: "10.0.2.2"},
+	}
+
+	for i := 0; i < 20; i++ {
+		networks := extractNetworks(dockerNetworks, "payramnet")
+		var names []string
+		for _, n := range networks {
+			names = append(names, n.NetworkName)
+		}
+		if got := strings.Join(names, ","); got != "payramnet,alpha,bridge,zeta" {
+			t.Fatalf("network order = %s, want payramnet,alpha,bridge,zeta", got)
+		}
 	}
 }
 

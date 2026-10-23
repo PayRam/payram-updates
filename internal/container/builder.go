@@ -2,6 +2,7 @@ package container
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/payram/payram-updater/internal/logger"
 	"github.com/payram/payram-updater/internal/manifest"
@@ -62,7 +63,8 @@ func NewDockerRunBuilder(logSink Logger) *DockerRunBuilder {
 	return &DockerRunBuilder{logger: logSink}
 }
 
-// BuildUpgradeArgs constructs docker run arguments for an upgrade.
+// BuildUpgradeArgs constructs `docker run -d --name <name> ...` arguments for
+// an upgrade.
 //
 // ALGORITHM:
 //  1. Extract runtime state from running container (docker inspect)
@@ -86,14 +88,51 @@ func (b *DockerRunBuilder) BuildUpgradeArgs(
 	if runtimeState == nil {
 		return nil, fmt.Errorf("runtime state is required (cannot infer configuration)")
 	}
+	spec, err := b.BuildContainerSpec(runtimeState, manifest, newImageTag)
+	if err != nil {
+		return nil, err
+	}
+	return append([]string{"run", "-d", "--name", ContainerName(runtimeState.Name)}, spec.Options...), nil
+}
+
+// ContainerSpec is everything needed to recreate a container under any name:
+// the options for `docker create`/`docker run` (ending with the image), and
+// the networks to attach after creation (docker can only attach one at create).
+type ContainerSpec struct {
+	Options       []string
+	ExtraNetworks []string
+	Image         string
+}
+
+// BuildCreateArgs constructs `docker create --name <name> ...` arguments, so
+// the new version's container can be created (and its image, mounts and
+// network checked) while the current one keeps running.
+func (b *DockerRunBuilder) BuildCreateArgs(spec *ContainerSpec, name string) []string {
+	return append([]string{"create", "--name", name}, spec.Options...)
+}
+
+// BuildContainerSpec reconciles the runtime state with the manifest and builds
+// the container options. The only intended change is the image tag; the
+// bundled database's port is the one setting deliberately not carried over.
+func (b *DockerRunBuilder) BuildContainerSpec(
+	runtimeState *RuntimeState,
+	manifest *manifest.Manifest,
+	newImageTag string,
+) (*ContainerSpec, error) {
+	if runtimeState == nil {
+		return nil, fmt.Errorf("runtime state is required (cannot infer configuration)")
+	}
 	if manifest == nil {
 		return nil, fmt.Errorf("manifest is required")
 	}
 	if newImageTag == "" {
 		return nil, fmt.Errorf("new image tag is required")
 	}
+	if runtimeState.Name == "" {
+		return nil, fmt.Errorf("container name missing from runtime state (cannot proceed)")
+	}
 
-	b.logger.Printf("Building docker run args for upgrade to %s", newImageTag)
+	b.logger.Printf("Building container settings for upgrade to %s", newImageTag)
 
 	// Step 1: Reconcile runtime state with manifest requirements
 	reconciler := NewReconciler(b.logger)
@@ -107,39 +146,29 @@ func (b *DockerRunBuilder) BuildUpgradeArgs(
 		len(reconciled.Mounts), reconciled.AddedMounts,
 		len(reconciled.Env), reconciled.AddedEnvs)
 
-	// Step 2: Build docker run arguments
-	args := []string{"run", "-d"}
-
-	// Container name (PRESERVED from runtime state)
-	if runtimeState.Name == "" {
-		return nil, fmt.Errorf("container name missing from runtime state (cannot proceed)")
-	}
-	args = append(args, "--name", runtimeState.Name)
-	b.logger.Printf("Container name: %s (preserved from runtime)", runtimeState.Name)
+	var args []string
 
 	// Restart policy (PRESERVED from runtime state)
-	restartPolicy := formatRestartPolicy(runtimeState.RestartPolicy)
+	restartPolicy := FormatRestartPolicy(runtimeState.RestartPolicy)
 	args = append(args, "--restart", restartPolicy)
 	b.logger.Printf("Restart policy: %s (preserved from runtime)", restartPolicy)
+
+	// Network mode first: a host-network container publishes no ports.
+	hostNetwork := runtimeState.NetworkMode == "host"
 
 	// Ports (RECONCILED: runtime + manifest), without the database's
 	published := 0
 	for _, port := range reconciled.Ports {
+		if hostNetwork {
+			break
+		}
 		if port.ContainerPort == databaseContainerPort {
 			b.logger.Printf("Not publishing %s:%s/%s: the PayRam database is only reachable from inside the container",
 				port.HostPort, port.ContainerPort, port.Protocol)
 			continue
 		}
 		published++
-		// Format: hostIP:hostPort:containerPort/protocol
-		// If hostIP is empty or 0.0.0.0, omit it
-		var portMapping string
-		if port.HostIP == "" || port.HostIP == "0.0.0.0" {
-			portMapping = fmt.Sprintf("%s:%s/%s", port.HostPort, port.ContainerPort, port.Protocol)
-		} else {
-			portMapping = fmt.Sprintf("%s:%s:%s/%s", port.HostIP, port.HostPort, port.ContainerPort, port.Protocol)
-		}
-		args = append(args, "-p", portMapping)
+		args = append(args, "-p", formatPortMapping(port))
 	}
 	b.logger.Printf("Ports: %d published (%d from runtime, %d added from manifest)",
 		published, len(runtimeState.Ports), reconciled.AddedPorts)
@@ -177,20 +206,23 @@ func (b *DockerRunBuilder) BuildUpgradeArgs(
 				continue
 			}
 			mountSpec = fmt.Sprintf("%s:%s", mount.Source, mount.Destination)
-			if mount.Mode != "" {
-				mountSpec = fmt.Sprintf("%s:%s", mountSpec, mount.Mode)
-			}
 		} else {
-			// Volume: volumeName:destination[:mode]
-			// If source is empty, Docker will generate a volume name
-			if mount.Source == "" {
+			// Volume: name:destination. Use the volume's NAME, not the host
+			// path Docker keeps it at: mounting that path would turn the
+			// volume into a bind mount (and on Docker Desktop the path only
+			// exists inside Docker's VM).
+			volume := mount.Name
+			if volume == "" {
+				volume = mount.Source
+			}
+			if volume == "" {
 				mountSpec = mount.Destination
 			} else {
-				mountSpec = fmt.Sprintf("%s:%s", mount.Source, mount.Destination)
+				mountSpec = fmt.Sprintf("%s:%s", volume, mount.Destination)
 			}
-			if mount.Mode != "" {
-				mountSpec = fmt.Sprintf("%s:%s", mountSpec, mount.Mode)
-			}
+		}
+		if mount.Mode != "" {
+			mountSpec = fmt.Sprintf("%s:%s", mountSpec, mount.Mode)
 		}
 		args = append(args, "-v", mountSpec)
 		validMounts++
@@ -198,26 +230,47 @@ func (b *DockerRunBuilder) BuildUpgradeArgs(
 	b.logger.Printf("Mounts: %d valid, %d skipped (%d total from reconciliation, %d from runtime, %d added from manifest)",
 		validMounts, skippedMounts, len(reconciled.Mounts), len(runtimeState.Mounts), reconciled.AddedMounts)
 
-	// Environment variables (RECONCILED: runtime + manifest)
-	for _, env := range reconciled.Env {
-		args = append(args, "-e", env)
+	// Environment variables (RECONCILED: runtime + manifest), minus the old
+	// image's own defaults so the new image's defaults apply.
+	imageDefaults := make(map[string]bool, len(runtimeState.ImageEnv))
+	for _, env := range runtimeState.ImageEnv {
+		imageDefaults[env] = true
 	}
-	b.logger.Printf("Environment variables: %d total (%d from runtime, %d added from manifest)",
-		len(reconciled.Env), len(runtimeState.Env), reconciled.AddedEnvs)
+	passedEnv := 0
+	for _, env := range reconciled.Env {
+		if imageDefaults[env] {
+			continue
+		}
+		args = append(args, "-e", env)
+		passedEnv++
+	}
+	b.logger.Printf("Environment variables: %d passed (%d from runtime, %d added from manifest, %d left to the new image's defaults)",
+		passedEnv, len(runtimeState.Env), reconciled.AddedEnvs, len(reconciled.Env)-passedEnv)
 
-	// Networks (PRESERVED from runtime state)
-	// Note: Docker run only supports connecting to ONE network at creation time.
-	// Additional networks must be connected after container creation.
-	// For simplicity, we'll connect to the first network (usually the default).
-	if len(runtimeState.Networks) > 0 {
-		primaryNetwork := runtimeState.Networks[0]
-		if primaryNetwork.NetworkName != "bridge" && primaryNetwork.NetworkName != "host" && primaryNetwork.NetworkName != "none" {
-			args = append(args, "--network", primaryNetwork.NetworkName)
-			b.logger.Printf("Network: %s (preserved from runtime)", primaryNetwork.NetworkName)
-			if len(runtimeState.Networks) > 1 {
-				b.logger.Printf("Warning: container was connected to %d networks. Only primary network will be preserved.", len(runtimeState.Networks))
+	// Networks (PRESERVED from runtime state). docker create attaches one
+	// network; the others are connected right after.
+	var extraNetworks []string
+	switch mode := runtimeState.NetworkMode; {
+	case mode == "host" || mode == "none" || strings.HasPrefix(mode, "container:"):
+		args = append(args, "--network", mode)
+		b.logger.Printf("Network mode: %s (preserved from runtime)", mode)
+	default:
+		primary := mode
+		if primary == "" && len(runtimeState.Networks) > 0 {
+			primary = runtimeState.Networks[0].NetworkName
+		}
+		if primary == "" || primary == "default" {
+			primary = "bridge"
+		}
+		if primary != "bridge" {
+			args = append(args, "--network", primary)
+		}
+		for _, network := range runtimeState.Networks {
+			if network.NetworkName != primary {
+				extraNetworks = append(extraNetworks, network.NetworkName)
 			}
 		}
+		b.logger.Printf("Network: %s (preserved from runtime), %d more to connect after create", primary, len(extraNetworks))
 	}
 
 	// Image with new tag (ONLY CHANGE)
@@ -225,11 +278,29 @@ func (b *DockerRunBuilder) BuildUpgradeArgs(
 	args = append(args, newImage)
 	b.logger.Printf("Image: %s (UPGRADED from %s)", newImage, runtimeState.Image)
 
-	return args, nil
+	return &ContainerSpec{Options: args, ExtraNetworks: extraNetworks, Image: newImage}, nil
 }
 
-// formatRestartPolicy converts RestartPolicy struct to docker restart policy string.
-func formatRestartPolicy(policy RestartPolicy) string {
+// ContainerName returns a container name without docker inspect's leading "/".
+func ContainerName(name string) string {
+	return strings.TrimPrefix(name, "/")
+}
+
+// formatPortMapping renders hostIP:hostPort:containerPort/protocol, omitting an
+// all-interfaces host IP and bracketing IPv6 host IPs ("[::1]:80:80/tcp").
+func formatPortMapping(port PortMapping) string {
+	switch {
+	case port.HostIP == "" || port.HostIP == "0.0.0.0" || port.HostIP == "::":
+		return fmt.Sprintf("%s:%s/%s", port.HostPort, port.ContainerPort, port.Protocol)
+	case strings.Contains(port.HostIP, ":"):
+		return fmt.Sprintf("[%s]:%s:%s/%s", port.HostIP, port.HostPort, port.ContainerPort, port.Protocol)
+	default:
+		return fmt.Sprintf("%s:%s:%s/%s", port.HostIP, port.HostPort, port.ContainerPort, port.Protocol)
+	}
+}
+
+// FormatRestartPolicy converts RestartPolicy struct to docker restart policy string.
+func FormatRestartPolicy(policy RestartPolicy) string {
 	if policy.Name == "" {
 		return "no"
 	}

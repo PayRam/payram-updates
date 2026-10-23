@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
 	"time"
 )
 
@@ -30,6 +31,17 @@ type RuntimeState struct {
 	// Environment variables
 	Env []string
 
+	// ImageEnv is the environment baked into the image the container was
+	// created from (its Dockerfile ENV lines). Docker copies these into the
+	// container's Env, so they are told apart here: an update must take the
+	// new image's defaults, not pin the old image's (e.g. a PATH that names an
+	// older Postgres). Empty when the image could not be inspected.
+	ImageEnv []string
+
+	// NetworkMode is HostConfig.NetworkMode: "bridge", "host", "none", a
+	// user-defined network name, or "container:<id>".
+	NetworkMode string
+
 	// Image labels
 	Labels map[string]string
 
@@ -51,7 +63,8 @@ type PortMapping struct {
 // Mount represents a volume or bind mount.
 type Mount struct {
 	Type        string // "bind" or "volume"
-	Source      string // Host path or volume name
+	Name        string // Volume name (volumes only)
+	Source      string // Host path (for a volume: where Docker keeps it)
 	Destination string // Container path
 	Mode        string // Mount options (e.g., "rw", "ro")
 	RW          bool   // Read-write flag
@@ -96,6 +109,7 @@ type dockerInspectOutput struct {
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	HostConfig struct {
+		NetworkMode   string `json:"NetworkMode"`
 		RestartPolicy struct {
 			Name              string `json:"Name"`
 			MaximumRetryCount int    `json:"MaximumRetryCount"`
@@ -107,6 +121,7 @@ type dockerInspectOutput struct {
 	} `json:"HostConfig"`
 	Mounts []struct {
 		Type        string `json:"Type"`
+		Name        string `json:"Name"`
 		Source      string `json:"Source"`
 		Destination string `json:"Destination"`
 		Mode        string `json:"Mode"`
@@ -178,7 +193,12 @@ func (i *Inspector) ExtractRuntimeState(ctx context.Context, containerNameOrID s
 	state.Mounts = extractMounts(data.Mounts)
 
 	// Extract networks
-	state.Networks = extractNetworks(data.NetworkSettings.Networks)
+	state.NetworkMode = data.HostConfig.NetworkMode
+	state.Networks = extractNetworks(data.NetworkSettings.Networks, data.HostConfig.NetworkMode)
+
+	// Best effort: the image's own environment, to tell its defaults apart
+	// from settings made for this container.
+	state.ImageEnv = i.imageEnv(cmdCtx, data.Image)
 
 	// Extract restart policy
 	state.RestartPolicy = RestartPolicy{
@@ -252,6 +272,7 @@ func extractPorts(portBindings map[string][]struct {
 // extractMounts converts Docker mounts to Mount structs.
 func extractMounts(dockerMounts []struct {
 	Type        string `json:"Type"`
+	Name        string `json:"Name"`
 	Source      string `json:"Source"`
 	Destination string `json:"Destination"`
 	Mode        string `json:"Mode"`
@@ -262,6 +283,7 @@ func extractMounts(dockerMounts []struct {
 	for i, m := range dockerMounts {
 		mounts[i] = Mount{
 			Type:        m.Type,
+			Name:        m.Name,
 			Source:      m.Source,
 			Destination: m.Destination,
 			Mode:        m.Mode,
@@ -272,12 +294,14 @@ func extractMounts(dockerMounts []struct {
 	return mounts
 }
 
-// extractNetworks converts Docker networks to NetworkConfig structs.
+// extractNetworks converts Docker networks to NetworkConfig structs, the
+// container's primary network (HostConfig.NetworkMode) first and the rest by
+// name, so every caller sees the same order (Go map order is random).
 func extractNetworks(dockerNetworks map[string]struct {
 	IPAddress  string `json:"IPAddress"`
 	Gateway    string `json:"Gateway"`
 	MacAddress string `json:"MacAddress"`
-}) []NetworkConfig {
+}, primary string) []NetworkConfig {
 	var networks []NetworkConfig
 
 	for name, net := range dockerNetworks {
@@ -289,5 +313,28 @@ func extractNetworks(dockerNetworks map[string]struct {
 		})
 	}
 
+	sort.Slice(networks, func(a, b int) bool {
+		if (networks[a].NetworkName == primary) != (networks[b].NetworkName == primary) {
+			return networks[a].NetworkName == primary
+		}
+		return networks[a].NetworkName < networks[b].NetworkName
+	})
 	return networks
+}
+
+// imageEnv returns the Config.Env of an image, or nil if it cannot be read.
+func (i *Inspector) imageEnv(ctx context.Context, imageID string) []string {
+	if imageID == "" {
+		return nil
+	}
+	output, err := exec.CommandContext(ctx, i.dockerBin, "image", "inspect", "--format", "{{json .Config.Env}}", imageID).Output()
+	if err != nil {
+		i.logger.Printf("Could not read the image's default environment (%v); keeping every container setting", err)
+		return nil
+	}
+	var env []string
+	if err := json.Unmarshal(output, &env); err != nil {
+		return nil
+	}
+	return env
 }
