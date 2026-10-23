@@ -1,27 +1,32 @@
+# The PayRam Updater service, as installed by setup_payram_updater.sh (same as
+# packaging/systemd/payram-updater.service). The installer rewrites this file
+# on every run: put local changes in a drop-in (systemctl edit payram-updater).
 [Unit]
 Description=Payram Updater Service
-Documentation=https://github.com/payram/payram-updater
-After=network-online.target
-Wants=network-online.target
+Documentation=https://github.com/PayRam/payram-updates
+After=docker.service network-online.target
+Wants=docker.service network-online.target
 
 [Service]
 Type=simple
 User=root
 Group=root
 EnvironmentFile=/etc/payram/updater.env
-ExecStart=/usr/local/bin/payram-updater
+ExecStart=/usr/local/bin/payram-updater serve
 Restart=always
 RestartSec=10
+# On stop, SIGTERM goes to the updater only, not to the docker commands it is
+# running, and it gets up to 15 minutes to finish or roll back an update in
+# progress before anything is killed.
+KillMode=mixed
+TimeoutStopSec=900
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=payram-updater
 
-# Security hardening
+# No PrivateTmp/ProtectSystem: they fail on OpenVZ/LXC hosts, and the updater
+# needs the Docker socket, its state dir and the backup dir.
 NoNewPrivileges=false
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/payram /var/log/payram
 
 [Install]
 WantedBy=multi-user.target

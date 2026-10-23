@@ -5,6 +5,10 @@ import (
 	"os"
 )
 
+// version is the release this binary was built from. Release builds set it
+// with -ldflags "-X main.version=<tag>"; local builds report "dev".
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		// Default command is "serve"
@@ -20,6 +24,8 @@ func main() {
 	}
 
 	switch command {
+	case "version", "--version":
+		fmt.Println(version)
 	case "init":
 		runInit()
 	case "serve":
@@ -70,6 +76,7 @@ COMMANDS:
   sync             Sync internal state after external upgrade
   backup           Manage database backups (create, list, restore)
 	cleanup          Cleanup local state or backups (requires confirmation)
+  version          Print the updater version
   help             Show this help message
 
 DRY-RUN FLAGS:
@@ -130,6 +137,7 @@ EXAMPLES:
 
   payram-updater cleanup state
   payram-updater cleanup backups --yes
+  payram-updater version
 
 CONFIG:
   Configuration is loaded from environment variables first,

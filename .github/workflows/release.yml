@@ -5,34 +5,44 @@ on:
     types: [published]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  # The same checks every pull request runs (format, vet, race tests,
+  # govulncheck, installer lint), on the exact tagged commit. Nothing is
+  # built or uploaded unless they pass.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   build-and-upload:
+    needs: ci
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
+      # Static (CGO_ENABLED=0), -trimpath, version stamped with the tag, plus
+      # per-binary .sha256 files (read by older installers) and SHA256SUMS.
       - name: Build release binaries
-        run: make build-release
+        run: make build-release VERSION="$RELEASE_TAG"
 
-      - name: Generate checksums
-        run: |
-          cd bin/release
-          sha256sum payram-updater-linux-amd64 > payram-updater-linux-amd64.sha256
-          sha256sum payram-updater-linux-arm64 > payram-updater-linux-arm64.sha256
-          sha256sum payram-updater-darwin-amd64 > payram-updater-darwin-amd64.sha256
-          sha256sum payram-updater-darwin-arm64 > payram-updater-darwin-arm64.sha256
+      - name: Check release binaries
+        run: make check-release VERSION="$RELEASE_TAG"
 
       - name: Upload release assets
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          fail_on_unmatched_files: true
           files: |
             bin/release/payram-updater-linux-amd64
             bin/release/payram-updater-linux-arm64
@@ -42,3 +52,23 @@ jobs:
             bin/release/payram-updater-linux-arm64.sha256
             bin/release/payram-updater-darwin-amd64.sha256
             bin/release/payram-updater-darwin-arm64.sha256
+            bin/release/SHA256SUMS
+
+  # The installer installs whatever GitHub calls the latest release. If the
+  # checks or the build fail, that release has no binaries and every new
+  # install would fail on download. Turning it back into a draft makes the
+  # previous good release "latest" again until this one is fixed.
+  unpublish-on-failure:
+    needs: [ci, build-and-upload]
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Turn the release back into a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=true
+          echo "::error::Release $RELEASE_TAG failed its checks or build and is a draft again. Fix it, then publish it again."
