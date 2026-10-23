@@ -516,7 +516,7 @@ func TestHandleUpgradePlan_Success(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"image": map[string]interface{}{
-				"repo": "ghcr.io/payram/runtime",
+				"repo": "payramapp/payram",
 			},
 			"defaults": map[string]interface{}{
 				"container_name": "payram-core",
@@ -562,8 +562,8 @@ func TestHandleUpgradePlan_Success(t *testing.T) {
 	if planResp.RequestedTarget != "v1.7.0" {
 		t.Errorf("expected requestedTarget v1.7.0, got %s", planResp.RequestedTarget)
 	}
-	if planResp.ImageRepo != "ghcr.io/payram/runtime" {
-		t.Errorf("expected imageRepo ghcr.io/payram/runtime, got %s", planResp.ImageRepo)
+	if planResp.ImageRepo != "payramapp/payram" {
+		t.Errorf("expected imageRepo payramapp/payram, got %s", planResp.ImageRepo)
 	}
 	if planResp.ContainerName != "payram-core" {
 		t.Errorf("expected containerName payram-core, got %s", planResp.ContainerName)
@@ -662,7 +662,7 @@ func TestHandleUpgradeRun_Success(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"image": map[string]interface{}{
-				"repo": "ghcr.io/payram/runtime",
+				"repo": "payramapp/payram",
 			},
 			"defaults": map[string]interface{}{
 				"containerName": "payram-core",

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewStore(t *testing.T) {
@@ -212,5 +213,57 @@ func TestStore_JSONFormatting(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "  ") {
 		t.Error("expected formatted JSON with indentation")
+	}
+}
+
+func TestStore_TouchMovesUpdatedAtOnly(t *testing.T) {
+	store := NewStore(t.TempDir())
+	job := NewJob("job-1", JobModeDashboard, "3.10.0")
+	job.State = JobStateBackingUp
+	job.Message = "Creating database backup"
+	job.UpdatedAt = job.UpdatedAt.Add(-10 * time.Minute)
+	if err := store.Save(job); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Touch(); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	loaded, err := store.LoadLatest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(loaded.UpdatedAt) > time.Minute {
+		t.Fatalf("UpdatedAt not moved: %s", loaded.UpdatedAt)
+	}
+	if loaded.State != JobStateBackingUp || loaded.Message != job.Message {
+		t.Fatalf("Touch changed the job: %+v", loaded)
+	}
+}
+
+func TestStore_FilesAreRootOnly(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := store.Save(NewJob("job-1", JobModeDashboard, "3.10.0")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendLog("line"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(dir, "jobs", "latest", "status.json"),
+		filepath.Join(dir, "jobs", "latest", "logs.txt"),
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm != 0600 {
+			t.Errorf("%s mode = %o, want 600", path, perm)
+		}
+	}
+	info, _ := os.Stat(filepath.Join(dir, "jobs", "latest"))
+	if perm := info.Mode().Perm(); perm != 0700 {
+		t.Errorf("job dir mode = %o, want 700", perm)
 	}
 }

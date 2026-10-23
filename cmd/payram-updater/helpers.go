@@ -15,81 +15,49 @@ import (
 )
 
 // discoverCoreBaseURLOrDefault discovers the Payram Core base URL dynamically.
-// Priority: 1) CORE_BASE_URL env 2) TARGET_CONTAINER_NAME port discovery 3) semver-based discovery 4) fallback
+// Priority: 1) CORE_BASE_URL env 2) TARGET_CONTAINER_NAME 3) the running PayRam container
 func discoverCoreBaseURLOrDefault(ctx context.Context, cfg *config.Config) string {
 	return discoverCoreBaseURLWithContainer(ctx, cfg, "")
 }
 
-// discoverCoreBaseURLWithContainer discovers the Payram Core base URL with optional container name override.
+// discoverCoreBaseURLWithContainer returns the PayRam API address, the same way
+// the daemon finds it (container.FindCoreBaseURL). It returns "" (with a
+// warning) when PayRam's container cannot be found; callers then report that
+// PayRam is not reachable instead of probing a guessed port.
 func discoverCoreBaseURLWithContainer(ctx context.Context, cfg *config.Config, containerNameOverride string) string {
-	// 1. Use explicit CORE_BASE_URL if set
 	if cfg.CoreBaseURL != "" {
 		return cfg.CoreBaseURL
 	}
 
 	// Use a null logger to suppress discovery logs for CLI commands
 	nullLogger := log.New(io.Discard, "", 0)
-	inspector := container.NewInspector(cfg.DockerBin, nullLogger)
-	identifier := container.NewPortIdentifier(nullLogger)
 
-	// 2. Use provided container name override (from already-resolved context)
-	if containerNameOverride != "" {
-		runtimeState, err := inspector.ExtractRuntimeState(ctx, containerNameOverride)
-		if err == nil {
-			identifiedPort, err := identifier.IdentifyPayramCorePort(ctx, runtimeState)
-			if err == nil {
-				return fmt.Sprintf("%s://127.0.0.1:%s", identifiedPort.Scheme, identifiedPort.HostPort)
-			}
+	name := containerNameOverride
+	if name == "" {
+		name = cfg.TargetContainerName
+	}
+	if name == "" {
+		imagePattern := "payramapp/payram:"
+		if cfg.ImageRepoOverride != "" {
+			imagePattern = cfg.ImageRepoOverride + ":"
 		}
-		// Fall through to other methods if this fails
-	}
-
-	// 3. Use TARGET_CONTAINER_NAME if set
-	if cfg.TargetContainerName != "" {
-		runtimeState, err := inspector.ExtractRuntimeState(ctx, cfg.TargetContainerName)
-		if err == nil {
-			identifiedPort, err := identifier.IdentifyPayramCorePort(ctx, runtimeState)
-			if err == nil {
-				return fmt.Sprintf("%s://127.0.0.1:%s", identifiedPort.Scheme, identifiedPort.HostPort)
-			}
+		discovered, err := container.NewDiscoverer(cfg.DockerBin, imagePattern, nullLogger).DiscoverPayramContainer(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: could not find a running PayRam container: %v\n", err)
+			return ""
 		}
-		fmt.Fprintf(os.Stderr, "WARNING: Failed to identify port for container %s\n", cfg.TargetContainerName)
-		fmt.Fprintf(os.Stderr, "Falling back to http://127.0.0.1:8080\n")
-		return "http://127.0.0.1:8080"
+		name = discovered.Name
 	}
 
-	// 4. Fall back to semver-based discovery
-	imagePattern := "payramapp/payram:"
-	if cfg.ImageRepoOverride != "" {
-		imagePattern = cfg.ImageRepoOverride + ":"
-	}
-
-	discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, nullLogger)
-	discovered, err := discoverer.DiscoverPayramContainer(ctx)
+	url, how, err := container.FindCoreBaseURL(ctx, cfg.DockerBin, container.ContainerName(name), "", nullLogger)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: Failed to discover Payram container: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Falling back to http://127.0.0.1:8080\n")
-		return "http://127.0.0.1:8080"
+		fmt.Fprintf(os.Stderr, "WARNING: %v\n", err)
+		return ""
 	}
-
-	// Extract runtime state to get ports
-	runtimeState, err := inspector.ExtractRuntimeState(ctx, discovered.Name)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: Failed to extract runtime state: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Falling back to http://127.0.0.1:8080\n")
-		return "http://127.0.0.1:8080"
+	if how == container.CoreURLGuessed {
+		fmt.Fprintf(os.Stderr, "Note: PayRam is not answering right now; using %s\n", url)
 	}
-
-	// Identify which port serves Payram Core
-	identifiedPort, err := identifier.IdentifyPayramCorePort(ctx, runtimeState)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: Failed to identify Payram Core port: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Falling back to http://127.0.0.1:8080\n")
-		return "http://127.0.0.1:8080"
-	}
-
-	coreBaseURL := fmt.Sprintf("%s://127.0.0.1:%s", identifiedPort.Scheme, identifiedPort.HostPort)
-	return coreBaseURL
+	return url
 }
 
 func promptYesNo(reader *bufio.Reader, prompt string, defaultValue bool) bool {

@@ -5,11 +5,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 )
 
-// Store handles persistence of jobs and logs.
+// Store handles persistence of jobs and logs. Its files are readable by root
+// only: job logs name backup files and container settings.
 type Store struct {
 	stateDir string
+	// mu orders Save and Touch, so a heartbeat can never write back an older
+	// copy of the job over a newer one.
+	mu sync.Mutex
 }
 
 // NewStore creates a new Store with the given state directory.
@@ -41,6 +47,26 @@ func (s *Store) LoadLatest() (*Job, error) {
 
 // Save persists the job to disk atomically.
 func (s *Store) Save(job *Job) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.save(job)
+}
+
+// Touch moves the saved job's UpdatedAt to now without changing anything
+// else. A running update calls it as a heartbeat: an active job whose
+// UpdatedAt is minutes old belongs to an updater that died.
+func (s *Store) Touch() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, err := s.LoadLatest()
+	if err != nil || job == nil {
+		return err
+	}
+	job.UpdatedAt = time.Now().UTC()
+	return s.save(job)
+}
+
+func (s *Store) save(job *Job) error {
 	if err := s.ensureJobDir(); err != nil {
 		return err
 	}
@@ -65,7 +91,7 @@ func (s *Store) AppendLog(line string) error {
 	}
 
 	logsPath := s.logsPath()
-	f, err := os.OpenFile(logsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(logsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
@@ -106,8 +132,17 @@ func (s *Store) logsPath() string {
 // ensureJobDir creates the job directory if it doesn't exist.
 func (s *Store) ensureJobDir() error {
 	jobDir := filepath.Join(s.stateDir, "jobs", "latest")
-	if err := os.MkdirAll(jobDir, 0755); err != nil {
+	if err := os.MkdirAll(jobDir, 0700); err != nil {
 		return fmt.Errorf("failed to create job directory: %w", err)
+	}
+	// Directories made by older versions were world-readable.
+	for _, dir := range []string{filepath.Join(s.stateDir, "jobs"), jobDir} {
+		if err := os.Chmod(dir, 0700); err != nil {
+			return fmt.Errorf("failed to restrict %s: %w", dir, err)
+		}
+	}
+	if err := os.Chmod(s.logsPath(), 0600); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to restrict %s: %w", s.logsPath(), err)
 	}
 	return nil
 }

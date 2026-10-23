@@ -15,6 +15,7 @@ import (
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/logger"
 	"github.com/payram/payram-updater/internal/manifest"
+	"github.com/payram/payram-updater/internal/network"
 	"github.com/payram/payram-updater/internal/recovery"
 )
 
@@ -79,13 +80,20 @@ func parseJobMode(value string) (jobs.JobMode, error) {
 	}
 }
 
-func resolveMode(requestedMode, source string) (jobs.JobMode, error) {
-	if strings.EqualFold(strings.TrimSpace(source), "CLI") {
+// resolveMode decides a request's mode. MANUAL skips the release policy's
+// gates, so only the CLI on this machine may ask for it: a request that
+// arrives from the PayRam container (or anywhere else) is always DASHBOARD,
+// whatever its body says.
+func resolveMode(requestedMode, source string, fromThisMachine bool) (jobs.JobMode, error) {
+	if fromThisMachine && strings.EqualFold(strings.TrimSpace(source), "CLI") {
 		return parseJobMode(requestedMode)
 	}
 
 	return jobs.JobModeDashboard, nil
 }
+
+// maxRequestBody bounds a plan/run request body; both are a few fields.
+const maxRequestBody = 64 << 10
 
 // RunResponse represents the response for POST /upgrade/run.
 type RunResponse struct {
@@ -357,7 +365,7 @@ func (s *Server) HandleUpgradeInspect() http.HandlerFunc {
 			s.jobStore,
 			s.dockerRunner.DockerBin,
 			containerName,
-			s.coreClient.BaseURL, // Use resolved BaseURL from coreClient (handles auto-discovery)
+			s.currentCoreBaseURL(ctx, containerName),
 			s.config.PolicyURL,
 			s.config.RuntimeManifestURL,
 			s.config.DebugVersionMode,
@@ -383,12 +391,12 @@ func (s *Server) HandleUpgradePlan() http.HandlerFunc {
 
 		// Parse request body
 		var req PlanRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody)).Decode(&req); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
 
-		mode, err := resolveMode(req.Mode, req.Source)
+		mode, err := resolveMode(req.Mode, req.Source, network.IsLoopbackRequest(r))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -478,12 +486,12 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 
 		// Parse request body
 		var req RunRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody)).Decode(&req); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
 
-		mode, err := resolveMode(req.Mode, req.Source)
+		mode, err := resolveMode(req.Mode, req.Source, network.IsLoopbackRequest(r))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -501,15 +509,31 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 			source = "UNKNOWN"
 		}
 
-		// Check for active job (concurrency check)
-		existingJob, err := s.jobStore.LoadLatest()
-		if err != nil {
-			logger.Error("Server", "HandleUpgradeRun", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
+		// One update at a time: the slot is claimed before anything else and
+		// held until the job ends (released below if no job is started).
+		if err := s.claimUpgradeSlot(); err != nil {
+			response := map[string]string{
+				"error":   "An active job already exists",
+				"message": fmt.Sprintf("%s; wait for it to finish or check its status", sentence(err.Error())),
+			}
+			if existingJob, loadErr := s.jobStore.LoadLatest(); loadErr == nil && existingJob != nil {
+				response["jobId"] = existingJob.JobID
+				response["state"] = string(existingJob.State)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(response)
 			return
 		}
-
-		if existingJob != nil && existingJob.IsActive() {
+		started := false
+		defer func() {
+			if !started {
+				s.releaseUpgradeSlot()
+			}
+		}()
+		// A job still marked active on disk belongs to an updater that
+		// stopped; the startup repair finishes it. Until then, refuse.
+		if existingJob, err := s.jobStore.LoadLatest(); err == nil && existingJob != nil && existingJob.IsActive() {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]string{
@@ -557,8 +581,8 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 		jobID := fmt.Sprintf("job-%d", time.Now().UnixNano())
 		job := jobs.NewJob(jobID, mode, req.RequestedTarget)
 		job.ResolvedTarget = plan.ResolvedTarget
-		job.State = jobs.JobStateReady
-		job.Message = "Upgrade job created"
+		job.State = jobs.JobStateExecuting
+		job.Message = "Preparing the update"
 		job.UpdatedAt = time.Now().UTC()
 
 		// Save job
@@ -572,20 +596,22 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 		s.jobStore.AppendLog(fmt.Sprintf("Starting upgrade job %s: mode=%s target=%s (resolved: %s) source=%s",
 			jobID, mode, req.RequestedTarget, plan.ResolvedTarget, source))
 
-		// Launch background execution goroutine
-		s.upgradeWg.Add(1)
-		go s.executeUpgrade(job, plan.Manifest, plan.ArchSupport, plan.SteppingStone)
-		// Return response
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(RunResponse{
+		// The reply is built before the job starts: from then on the job
+		// belongs to the update goroutine.
+		response := RunResponse{
 			JobID:           job.JobID,
 			State:           string(job.State),
 			Mode:            string(job.Mode),
 			RequestedTarget: job.RequestedTarget,
 			ResolvedTarget:  job.ResolvedTarget,
 			Message:         "Upgrade job started",
-		})
+		}
+		started = true
+		s.startUpgrade(job, plan)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
 	}
 }
 
@@ -619,11 +645,16 @@ func (s *Server) buildPlaybookContext(backupPath string) recovery.PlaybookContex
 		ctx.ContainerName = discovered.Name
 	}
 
-	// Try to use the core client's base URL for port extraction
-	// The coreClient was initialized with discovered port in New()
-	if s.coreClient != nil {
-		// Extract port from base URL (e.g., "http://127.0.0.1:8080")
-		baseURL := s.coreClient.BaseURL
+	// The address the last update used, else the one PayRam answers at now.
+	baseURL := ""
+	if job, err := s.jobStore.LoadLatest(); err == nil && job != nil {
+		baseURL = job.CoreBaseURL
+	}
+	if baseURL == "" {
+		baseURL = s.currentCoreBaseURL(context.Background(), ctx.ContainerName)
+	}
+	if baseURL != "" {
+		// Extract port from base URL (e.g., "https://127.0.0.1:443")
 		ctx.BaseURL = baseURL
 
 		// Simple port extraction from URL

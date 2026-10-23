@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -184,4 +185,58 @@ type IdentificationError struct {
 
 func (e *IdentificationError) Error() string {
 	return fmt.Sprintf("%s: %s", e.FailureCode, e.Message)
+}
+
+// How a PayRam API address was found (see FindCoreBaseURL).
+const (
+	CoreURLConfigured = "configured" // CORE_BASE_URL
+	CoreURLAnswered   = "answered"   // a published port answered like PayRam
+	CoreURLGuessed    = "guessed"    // nothing answered; picked from the published ports
+)
+
+// FindCoreBaseURL returns the address the updater uses to reach the PayRam
+// API in the given container:
+//  1. configured, when CORE_BASE_URL is set;
+//  2. the published port that answers /api/v1/health like PayRam;
+//  3. when nothing answers (PayRam is down or still starting), the most
+//     likely published port: 443 or 8443 over https, else 80 or 8080 over http.
+//
+// It fails only when the container cannot be inspected or publishes none of
+// those ports. A host-network container is probed on 443, 80 and 8080.
+func FindCoreBaseURL(ctx context.Context, dockerBin, containerName, configured string, logger Logger) (string, string, error) {
+	if configured != "" {
+		return configured, CoreURLConfigured, nil
+	}
+
+	state, err := NewInspector(dockerBin, logger).ExtractRuntimeState(ctx, containerName)
+	if err != nil {
+		return "", "", fmt.Errorf("could not inspect container %s: %w", containerName, err)
+	}
+	if state.NetworkMode == "host" && len(state.Ports) == 0 {
+		for _, port := range []string{"443", "80", "8080"} {
+			state.Ports = append(state.Ports, PortMapping{HostPort: port, ContainerPort: port, Protocol: "tcp"})
+		}
+	}
+
+	if identified, err := NewPortIdentifier(logger).IdentifyPayramCorePort(ctx, state); err == nil {
+		return fmt.Sprintf("%s://127.0.0.1:%s", identified.Scheme, identified.HostPort), CoreURLAnswered, nil
+	}
+
+	for _, guess := range []struct{ containerPort, scheme string }{
+		{"443", "https"}, {"8443", "https"}, {"80", "http"}, {"8080", "http"},
+	} {
+		for _, port := range state.Ports {
+			if port.ContainerPort == guess.containerPort && port.HostPort != "" && (port.Protocol == "" || port.Protocol == "tcp") {
+				host := "127.0.0.1"
+				if port.HostIP != "" && port.HostIP != "0.0.0.0" && port.HostIP != "::" {
+					host = port.HostIP
+					if strings.Contains(host, ":") {
+						host = "[" + host + "]"
+					}
+				}
+				return fmt.Sprintf("%s://%s:%s", guess.scheme, host, port.HostPort), CoreURLGuessed, nil
+			}
+		}
+	}
+	return "", "", fmt.Errorf("container %s publishes none of the ports PayRam answers on (443, 8443, 80, 8080); set CORE_BASE_URL in /etc/payram/updater.env", containerName)
 }

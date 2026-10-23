@@ -47,7 +47,7 @@ type Config struct {
 	AutoUpdateEnabled         bool
 	AutoUpdateInterval        int // Hours
 	BackupTimeoutSeconds      int // Timeout for pre-upgrade backup operations (default 600s)
-	HealthCheckTimeoutSeconds int // Total deadline for post-upgrade health verification (default 120s)
+	HealthCheckTimeoutSeconds int // How long a new version gets to answer its health check (default 600s; it migrates first)
 	SupervisorExclude         []string
 	SupervisorInclude         []string
 	Backup                    BackupConfig
@@ -80,15 +80,18 @@ func Load() (*Config, error) {
 		}
 	}
 
-	// Build config from environment variables (OS env vars have highest priority)
+	// Build config from environment variables (OS env vars have highest priority).
+	// EXECUTION_MODE defaults to execute, what every install runs; dry-run is a
+	// testing mode that must be asked for (a missing key used to make dashboard
+	// updates silently do nothing).
 	cfg := &Config{
 		Port:                      getEnvInt("UPDATER_PORT", 2567),
 		PolicyURL:                 os.Getenv("POLICY_URL"),
 		RuntimeManifestURL:        os.Getenv("RUNTIME_MANIFEST_URL"),
 		FetchTimeoutSeconds:       getEnvInt("FETCH_TIMEOUT_SECONDS", 10),
 		StateDir:                  getEnvString("STATE_DIR", "/var/lib/payram-updater"),
-		CoreBaseURL:               os.Getenv("CORE_BASE_URL"), // Optional: will be discovered if not provided
-		ExecutionMode:             getEnvString("EXECUTION_MODE", "dry-run"),
+		CoreBaseURL:               strings.TrimRight(os.Getenv("CORE_BASE_URL"), "/"), // Optional: discovered per job when empty
+		ExecutionMode:             getEnvString("EXECUTION_MODE", "execute"),
 		DockerBin:                 getEnvString("DOCKER_BIN", "docker"),
 		TargetContainerName:       os.Getenv("TARGET_CONTAINER_NAME"), // Optional: no default
 		ImageRepoOverride:         os.Getenv("IMAGE_REPO_OVERRIDE"),   // Optional: for testing (e.g., "payram-dummy")
@@ -96,11 +99,11 @@ func Load() (*Config, error) {
 		AutoUpdateEnabled:         DefaultAutoUpdateEnabled,
 		AutoUpdateInterval:        DefaultAutoUpdateIntervalHours,
 		BackupTimeoutSeconds:      getEnvInt("BACKUP_TIMEOUT_SECONDS", 600),
-		HealthCheckTimeoutSeconds: getEnvInt("HEALTH_CHECK_TIMEOUT_SECONDS", 120),
+		HealthCheckTimeoutSeconds: getEnvInt("HEALTH_CHECK_TIMEOUT_SECONDS", 600),
 		SupervisorExclude:         parseCSV(getEnvString("SUPERVISOR_EXCLUDE", "postgres,postgresql")),
 		SupervisorInclude:         parseCSV(os.Getenv("SUPERVISOR_INCLUDE")),
 		Backup: BackupConfig{
-			Dir:        getEnvString("BACKUP_DIR", "data/backups"),
+			Dir:        getEnvString("BACKUP_DIR", "/var/lib/payram/backups"),
 			Retention:  getEnvInt("BACKUP_RETENTION", 10),
 			PGHost:     getEnvString("PG_HOST", "127.0.0.1"),
 			PGPort:     getEnvInt("PG_PORT", 5432),
@@ -121,6 +124,10 @@ func Load() (*Config, error) {
 	// Validate EXECUTION_MODE
 	if cfg.ExecutionMode != "dry-run" && cfg.ExecutionMode != "execute" {
 		return nil, fmt.Errorf("EXECUTION_MODE must be 'dry-run' or 'execute', got '%s'", cfg.ExecutionMode)
+	}
+
+	if cfg.CoreBaseURL != "" && !strings.HasPrefix(cfg.CoreBaseURL, "http://") && !strings.HasPrefix(cfg.CoreBaseURL, "https://") {
+		return nil, fmt.Errorf("CORE_BASE_URL must start with http:// or https://, got '%s'", cfg.CoreBaseURL)
 	}
 
 	if cfg.AutoUpdateEnabled && cfg.AutoUpdateInterval < 1 {

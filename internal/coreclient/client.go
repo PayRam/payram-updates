@@ -35,6 +35,9 @@ type Client struct {
 type HealthResponse struct {
 	Status string `json:"status"`
 	DB     string `json:"db,omitempty"`
+	// Workers maps each PayRam worker (supervisor program) to its state,
+	// e.g. "eth-listener": "RUNNING". Reported for information only.
+	Workers map[string]string `json:"workers,omitempty"`
 }
 
 // VersionResponse represents the response from the /version endpoint.

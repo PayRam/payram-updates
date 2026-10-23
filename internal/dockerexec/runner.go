@@ -141,7 +141,11 @@ func (r *Runner) Run(ctx context.Context, args []string) error {
 	cmd := exec.CommandContext(ctx, r.DockerBin, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("docker run failed: %w: %s", err, string(output))
+		subcommand := "run"
+		if len(args) > 0 {
+			subcommand = args[0]
+		}
+		return fmt.Errorf("docker %s failed: %w: %s", subcommand, err, strings.TrimSpace(string(output)))
 	}
 
 	r.logf("Successfully executed docker command")
