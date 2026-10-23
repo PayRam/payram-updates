@@ -3,15 +3,31 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/payram/payram-updater/internal/dbexec"
 )
+
+// Failure codes in BackupResult.FailureCode. They match the recovery
+// playbook entries.
+const (
+	FailureDockerDaemonDown  = "DOCKER_DAEMON_DOWN"
+	FailureDockerError       = "DOCKER_ERROR"
+	FailureContainerNotFound = "CONTAINER_NOT_FOUND"
+	FailureInvalidDBConfig   = "INVALID_DB_CONFIG"
+	FailureBackupFailed      = "BACKUP_FAILED"
+	FailureBackupTimeout     = "BACKUP_TIMEOUT"
+	FailureDiskSpaceLow      = "DISK_SPACE_LOW"
+)
+
+// readinessTimeout bounds CheckBackupReady.
+const readinessTimeout = 2 * time.Minute
 
 // ContainerBackupExecutor handles pg_dump backups with container-sourced credentials.
 // It supports both local (inside container) and external database backups.
@@ -22,6 +38,8 @@ type ContainerBackupExecutor struct {
 	BackupTimeout   time.Duration
 	Logger          Logger
 	DockerInspector *DockerInspector
+	// Runner runs pg_dump, pg_restore and psql; nil means dbexec.OSRunner.
+	Runner dbexec.Runner
 }
 
 // NewContainerBackupExecutor creates a new ContainerBackupExecutor.
@@ -39,6 +57,7 @@ func NewContainerBackupExecutor(dockerBin, pgDumpBin, backupDir string, logger L
 		BackupTimeout:   60 * time.Second,
 		Logger:          logger,
 		DockerInspector: NewDockerInspector(dockerBin, nil),
+		Runner:          dbexec.OSRunner{},
 	}
 }
 
@@ -50,129 +69,127 @@ type BackupResult struct {
 	Size         int64
 	FailureCode  string
 	ErrorMessage string
-	DBConfig     *ContainerDBConfig // For metadata purposes
+	// Retryable is true only when the failure looks transient (the database
+	// was starting up, a connection dropped, a lock was busy) and the same
+	// backup may succeed if tried again. A timeout, a missing pg_dump, bad
+	// database settings or credentials, and a full disk are never retryable:
+	// retrying them only keeps PayRam stopped longer.
+	Retryable bool
+	DBConfig  *ContainerDBConfig // For metadata purposes
+}
+
+func failedBackup(code, message string, retryable bool) *BackupResult {
+	return &BackupResult{Success: false, FailureCode: code, ErrorMessage: message, Retryable: retryable}
+}
+
+func (e *ContainerBackupExecutor) runner() dbexec.Runner {
+	if e.Runner == nil {
+		return dbexec.OSRunner{}
+	}
+	return e.Runner
+}
+
+// resolveDatabase reads the database settings from the PayRam container and
+// picks the executor that reaches the database. It changes nothing.
+func (e *ContainerBackupExecutor) resolveDatabase(ctx context.Context, containerName string) (dbexec.DBContext, dbexec.PGExecutor, *ContainerDBConfig, *BackupResult) {
+	e.Logger.Printf("Checking Docker daemon...")
+	if err := e.DockerInspector.CheckDaemon(ctx); err != nil {
+		return dbexec.DBContext{}, nil, nil, failedBackup(FailureDockerDaemonDown,
+			fmt.Sprintf("Docker daemon is not running: %s. Start Docker (sudo systemctl start docker) and retry.", dbexec.TruncateOutput([]byte(err.Error()))), false)
+	}
+
+	e.Logger.Printf("Checking container %s exists...", containerName)
+	exists, err := e.DockerInspector.ContainerExists(ctx, containerName)
+	if err != nil {
+		return dbexec.DBContext{}, nil, nil, failedBackup(FailureDockerError, fmt.Sprintf("Failed to check container: %v", err), false)
+	}
+	if !exists {
+		return dbexec.DBContext{}, nil, nil, failedBackup(FailureContainerNotFound,
+			fmt.Sprintf("Container %s not found. Check TARGET_CONTAINER_NAME or start PayRam.", containerName), false)
+	}
+
+	e.Logger.Printf("Extracting database configuration from container...")
+	dbConfig, err := e.DockerInspector.GetDBConfig(ctx, containerName)
+	if err != nil {
+		return dbexec.DBContext{}, nil, nil, failedBackup(FailureInvalidDBConfig,
+			fmt.Sprintf("Failed to get database config from container %s: %v. Check its POSTGRES_* environment variables.", containerName, err), false)
+	}
+	e.Logger.Printf("Database config: host=%s, port=%s, database=%s, user=%s",
+		dbConfig.Host, dbConfig.Port, dbConfig.Database, dbConfig.Username)
+
+	db := dbexec.DBContext{
+		Mode:       dbexec.DBModeExternal,
+		CredSource: dbexec.CredFromRunningContainer,
+		Creds: dbexec.DBCreds{
+			Host:     dbConfig.Host,
+			Port:     dbConfig.Port,
+			Database: dbConfig.Database,
+			Username: dbConfig.Username,
+			Password: dbConfig.Password,
+			SSLMode:  dbConfig.SSLMode,
+		},
+		AppContainer: containerName,
+	}
+	if dbConfig.IsLocalDB() {
+		db.Mode = dbexec.DBModeInContainer
+		db.ContainerName = containerName
+		docker := dbexec.NewDockerPGExecutor(e.runner(), e.Logger)
+		docker.DockerBin = e.DockerBin
+		return db, docker, dbConfig, nil
+	}
+	host := dbexec.NewHostPGExecutor(e.runner(), e.Logger)
+	host.UseToolsNextTo(e.PGDumpBin)
+	return db, host, dbConfig, nil
 }
 
 // ExecuteBackup performs a database backup from the specified container.
 // It automatically detects whether the database is local or external and
 // uses the appropriate backup strategy.
 //
+// The backup is a custom-format (compressed) pg_dump, written to a .partial
+// file with mode 0600, read back with pg_restore --list, synced to disk and
+// only then renamed to payram-backup-<ts>-<from>-to-<to>.dump. On failure no
+// file is left behind.
+//
 // Database credentials are extracted from the running container's environment
 // variables (POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DATABASE, POSTGRES_USERNAME,
 // POSTGRES_PASSWORD, POSTGRES_SSLMODE).
 func (e *ContainerBackupExecutor) ExecuteBackup(ctx context.Context, containerName string, meta BackupMeta) *BackupResult {
-	// Create context with timeout
 	ctx, cancel := context.WithTimeout(ctx, e.BackupTimeout)
 	defer cancel()
 
-	// Step 1: Verify Docker daemon is running
-	e.Logger.Printf("Checking Docker daemon...")
-	if err := e.DockerInspector.CheckDaemon(ctx); err != nil {
-		return &BackupResult{
-			Success:      false,
-			FailureCode:  "DOCKER_DAEMON_DOWN",
-			ErrorMessage: fmt.Sprintf("Docker daemon is not running: %v", err),
-		}
+	db, pgExec, dbConfig, failure := e.resolveDatabase(ctx, containerName)
+	if failure != nil {
+		return failure
 	}
 
-	// Step 2: Verify container exists
-	e.Logger.Printf("Checking container %s exists...", containerName)
-	exists, err := e.DockerInspector.ContainerExists(ctx, containerName)
-	if err != nil {
-		return &BackupResult{
-			Success:      false,
-			FailureCode:  "DOCKER_ERROR",
-			ErrorMessage: fmt.Sprintf("Failed to check container: %v", err),
-		}
-	}
-	if !exists {
-		return &BackupResult{
-			Success:      false,
-			FailureCode:  "CONTAINER_NOT_FOUND",
-			ErrorMessage: fmt.Sprintf("Container %s not found", containerName),
-		}
+	if err := secureBackupDir(e.BackupDir, e.Logger); err != nil {
+		return failedBackup(FailureBackupFailed, err.Error(), false)
 	}
 
-	// Step 3: Extract DB config from container
-	e.Logger.Printf("Extracting database configuration from container...")
-	dbConfig, err := e.DockerInspector.GetDBConfig(ctx, containerName)
-	if err != nil {
-		return &BackupResult{
-			Success:      false,
-			FailureCode:  "INVALID_DB_CONFIG",
-			ErrorMessage: fmt.Sprintf("Failed to get database config from container: %v", err),
-		}
-	}
-
-	e.Logger.Printf("Database config: host=%s, port=%s, database=%s, user=%s",
-		dbConfig.Host, dbConfig.Port, dbConfig.Database, dbConfig.Username)
-
-	// Step 4: Ensure backup directory exists
-	if err := os.MkdirAll(e.BackupDir, 0755); err != nil {
-		return &BackupResult{
-			Success:      false,
-			FailureCode:  "BACKUP_FAILED",
-			ErrorMessage: fmt.Sprintf("Failed to create backup directory: %v", err),
-		}
-	}
-
-	// Step 5: Generate backup filename
-	timestamp := time.Now().UTC().Format("20060102-150405")
-	fromVer := sanitizeVersion(meta.FromVersion)
-	toVer := sanitizeVersion(meta.TargetVersion)
-	filename := fmt.Sprintf("payram-backup-%s-%s-to-%s.sql", timestamp, fromVer, toVer)
+	filename := backupFilename(time.Now(), meta)
 	backupPath := filepath.Join(e.BackupDir, filename)
-
-	e.Logger.Printf("Creating backup: %s", backupPath)
-
-	// Step 6: Execute backup based on database location
-	var execErr error
-	if dbConfig.IsLocalDB() {
+	if db.Mode == dbexec.DBModeInContainer {
 		e.Logger.Printf("Database is local - executing pg_dump inside container")
-		execErr = e.executeContainerBackup(ctx, containerName, dbConfig, backupPath)
 	} else {
 		e.Logger.Printf("Database is external - executing pg_dump on host")
-		execErr = e.executeHostBackup(ctx, dbConfig, backupPath)
 	}
+	e.Logger.Printf("Creating backup: %s", backupPath)
 
-	// Check for context timeout
-	if ctx.Err() == context.DeadlineExceeded {
-		// Clean up partial backup file
+	err := pgExec.Dump(ctx, db, backupPath, "dump")
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		os.Remove(backupPath)
-		return &BackupResult{
-			Success:      false,
-			FailureCode:  "BACKUP_TIMEOUT",
-			ErrorMessage: fmt.Sprintf("Backup timed out after %v", e.BackupTimeout),
-		}
+		return failedBackup(FailureBackupTimeout,
+			fmt.Sprintf("Backup timed out after %v. Raise BACKUP_TIMEOUT_SECONDS if the database is large, or check that it is not overloaded.", e.BackupTimeout), false)
+	}
+	if err != nil {
+		code, retryable := classifyBackupError(err)
+		return failedBackup(code, fmt.Sprintf("pg_dump failed: %s", errorMessage(err)), retryable)
 	}
 
-	if execErr != nil {
-		// Clean up partial backup file
-		os.Remove(backupPath)
-		return &BackupResult{
-			Success:      false,
-			FailureCode:  "BACKUP_FAILED",
-			ErrorMessage: fmt.Sprintf("pg_dump failed: %v", execErr),
-		}
-	}
-
-	// Step 7: Validate backup file
 	fileInfo, err := os.Stat(backupPath)
 	if err != nil {
-		return &BackupResult{
-			Success:      false,
-			FailureCode:  "BACKUP_FAILED",
-			ErrorMessage: fmt.Sprintf("Backup file not created: %v", err),
-		}
-	}
-
-	if fileInfo.Size() == 0 {
-		os.Remove(backupPath)
-		return &BackupResult{
-			Success:      false,
-			FailureCode:  "BACKUP_FAILED",
-			ErrorMessage: "Backup file is empty (0 bytes)",
-		}
+		return failedBackup(FailureBackupFailed, fmt.Sprintf("Backup file not created: %v", err), false)
 	}
 
 	e.Logger.Printf("Backup completed successfully: %s (%.2f MB)", filename, float64(fileInfo.Size())/(1024*1024))
@@ -186,115 +203,112 @@ func (e *ContainerBackupExecutor) ExecuteBackup(ctx context.Context, containerNa
 	}
 }
 
-// executeContainerBackup runs pg_dump inside the container and streams output to host.
-func (e *ContainerBackupExecutor) executeContainerBackup(ctx context.Context, containerName string, dbConfig *ContainerDBConfig, backupPath string) error {
-	// Build the pg_dump command to run inside the container
-	// We use plain text format and stream to stdout, then capture to file on host
-	pgDumpCmd := fmt.Sprintf(
-		"pg_dump -h %s -p %s -U %s -d %s --no-owner --no-acl",
-		dbConfig.Host, dbConfig.Port, dbConfig.Username, dbConfig.Database,
-	)
+// CheckBackupReady confirms, before anything is stopped, that a backup of
+// containerName's database can be taken: Docker answers, the container exists
+// and is running, its database settings are readable, pg_dump, pg_restore and
+// psql exist where they will run (inside the container for the bundled
+// database, on the host for an external one), SELECT 1 succeeds and the
+// backup directory is writable. It is read-only. The error says what to fix.
+func (e *ContainerBackupExecutor) CheckBackupReady(ctx context.Context, containerName string) error {
+	ctx, cancel := context.WithTimeout(ctx, readinessTimeout)
+	defer cancel()
 
-	// Build docker exec command
-	args := []string{
-		"exec",
+	db, pgExec, _, failure := e.resolveDatabase(ctx, containerName)
+	if failure != nil {
+		return errors.New(failure.ErrorMessage)
 	}
 
-	// Set password via environment if provided
-	if dbConfig.Password != "" {
-		args = append(args, "-e", fmt.Sprintf("PGPASSWORD=%s", dbConfig.Password))
-	}
-
-	args = append(args, containerName, "sh", "-c", pgDumpCmd)
-
-	e.Logger.Printf("Executing: docker %s", strings.Join(args, " "))
-
-	cmd := exec.CommandContext(ctx, e.DockerBin, args...)
-
-	// Create backup file
-	outFile, err := os.Create(backupPath)
+	running, err := e.DockerInspector.ContainerRunning(ctx, containerName)
 	if err != nil {
-		return fmt.Errorf("failed to create backup file: %w", err)
+		return fmt.Errorf("could not check whether container %s is running: %v", containerName, err)
 	}
-	defer outFile.Close()
-
-	// Capture stdout to file, stderr to buffer
-	cmd.Stdout = outFile
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("failed to get stderr pipe: %w", err)
+	if !running {
+		return fmt.Errorf("container %s is not running, so its database cannot be backed up. Start PayRam (docker start %s) and retry", containerName, containerName)
 	}
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start pg_dump: %w", err)
+	if err := pgExec.CheckTools(ctx, db); err != nil {
+		return errors.New(errorMessage(err))
 	}
 
-	// Read stderr in background
-	stderrBytes, _ := io.ReadAll(stderrPipe)
+	if err := pgExec.Ping(ctx, db); err != nil {
+		return fmt.Errorf("the database did not answer SELECT 1 as user %s: %s. Check that it is running and that the container's POSTGRES_* settings are right",
+			db.Creds.Username, errorMessage(err))
+	}
 
-	err = cmd.Wait()
-	if err != nil {
-		stderrStr := string(stderrBytes)
-		if stderrStr != "" {
-			return fmt.Errorf("%w: %s", err, stderrStr)
-		}
+	if err := checkDirWritable(e.BackupDir); err != nil {
 		return err
 	}
-
-	// Log any stderr warnings (pg_dump sometimes writes warnings to stderr even on success)
-	if len(stderrBytes) > 0 {
-		e.Logger.Printf("pg_dump stderr: %s", string(stderrBytes))
-	}
-
 	return nil
 }
 
-// executeHostBackup runs pg_dump on the host with credentials from the container.
-func (e *ContainerBackupExecutor) executeHostBackup(ctx context.Context, dbConfig *ContainerDBConfig, backupPath string) error {
-	// Convert port to int for validation
-	port, err := strconv.Atoi(dbConfig.Port)
+// checkDirWritable checks that dir, or the nearest directory above it that
+// exists (where it would be created), is writable. It creates nothing.
+func checkDirWritable(dir string) error {
+	if dir == "" {
+		return fmt.Errorf("the backup directory is not configured (BACKUP_DIR)")
+	}
+	path, err := filepath.Abs(dir)
 	if err != nil {
-		return fmt.Errorf("invalid port: %s", dbConfig.Port)
+		return fmt.Errorf("backup directory %s: %v", dir, err)
 	}
-
-	// Build pg_dump arguments
-	args := []string{
-		"-h", dbConfig.Host,
-		"-p", strconv.Itoa(port),
-		"-U", dbConfig.Username,
-		"-d", dbConfig.Database,
-		"--no-owner",
-		"--no-acl",
-		"-f", backupPath,
-	}
-
-	e.Logger.Printf("Executing: %s %s", e.PGDumpBin, strings.Join(args, " "))
-
-	cmd := exec.CommandContext(ctx, e.PGDumpBin, args...)
-
-	// Set environment variables
-	cmd.Env = os.Environ()
-	if dbConfig.Password != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("PGPASSWORD=%s", dbConfig.Password))
-	}
-	if dbConfig.SSLMode != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("PGSSLMODE=%s", dbConfig.SSLMode))
-	}
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		if len(output) > 0 {
-			return fmt.Errorf("%w: %s", err, string(output))
+	for {
+		info, err := os.Stat(path)
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("backup directory %s: %s is not a directory", dir, path)
+			}
+			if err := syscall.Access(path, 0x2 /* W_OK */); err != nil {
+				return fmt.Errorf("backup directory %s is not writable (%s: %v); fix its ownership or permissions", dir, path, err)
+			}
+			return nil
 		}
-		return err
+		parent := filepath.Dir(path)
+		if parent == path {
+			return fmt.Errorf("backup directory %s: no existing parent directory", dir)
+		}
+		path = parent
 	}
+}
 
-	// Log any output (warnings, etc.)
-	if len(output) > 0 {
-		e.Logger.Printf("pg_dump output: %s", string(output))
+// errorMessage is an error's text without a dbexec code prefix.
+func errorMessage(err error) string {
+	var dbErr *dbexec.DBError
+	if errors.As(err, &dbErr) {
+		return dbErr.Message
 	}
+	return err.Error()
+}
 
-	return nil
+// classifyBackupError maps a failed dump to a failure code and whether
+// trying again can help.
+func classifyBackupError(err error) (code string, retryable bool) {
+	var dbErr *dbexec.DBError
+	if errors.As(err, &dbErr) && dbErr.Code == dbexec.ErrCodeToolMissing {
+		return FailureBackupFailed, false
+	}
+	text := strings.ToLower(err.Error())
+	containsAny := func(needles ...string) bool {
+		for _, n := range needles {
+			if strings.Contains(text, n) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case errors.Is(err, syscall.ENOSPC) || containsAny("no space left on device", "disk quota exceeded"):
+		return FailureDiskSpaceLow, false
+	case containsAny("password authentication failed", "authentication failed", "no pg_hba.conf entry",
+		"permission denied", "does not exist", "invalid port"):
+		return FailureInvalidDBConfig, false
+	case containsAny("connection refused", "could not connect", "the database system is starting up",
+		"the database system is in recovery mode", "the database system is shutting down",
+		"server closed the connection unexpectedly", "terminating connection", "connection reset",
+		"deadlock detected", "could not obtain lock", "lock timeout", "could not serialize access",
+		"too many clients", "too many connections", "is restarting"):
+		return FailureBackupFailed, true
+	}
+	return FailureBackupFailed, false
 }
 
 // CheckDockerDaemon is a standalone function to verify the Docker daemon is running.
