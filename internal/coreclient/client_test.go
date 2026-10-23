@@ -381,3 +381,16 @@ func TestVersion_WithExtraFields(t *testing.T) {
 		t.Errorf("expected version '1.2.3', got %s", response.Version)
 	}
 }
+
+func TestHealth_HTMLErrorPageIsNotCopiedIntoTheMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`<!DOCTYPE html><html><head><link rel="stylesheet" href="/_next/static/css/x.css"/></head></html>`))
+	}))
+	defer server.Close()
+
+	_, err := NewClient(server.URL).Health(context.Background())
+	if err == nil || strings.Contains(err.Error(), "<!DOCTYPE") || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("got %v, want a 404 error without the page markup", err)
+	}
+}

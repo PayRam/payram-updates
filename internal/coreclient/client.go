@@ -118,7 +118,7 @@ func (c *Client) doRequest(ctx context.Context, url string, target interface{}) 
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize))
-		return fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("unexpected status code %d%s", resp.StatusCode, describeBody(body))
 	}
 
 	// Limit response size
@@ -156,7 +156,7 @@ func (c *Client) doRequestLenient(ctx context.Context, url string, target interf
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize))
-		return fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("unexpected status code %d%s", resp.StatusCode, describeBody(body))
 	}
 
 	// Limit response size
@@ -172,4 +172,22 @@ func (c *Client) doRequestLenient(ctx context.Context, url string, target interf
 	}
 
 	return nil
+}
+
+// describeBody keeps an error body that helps (a short API message) and
+// drops one that does not: an HTML page means something other than the
+// PayRam API answered (e.g. the dashboard behind nginx), and its markup would
+// fill the merchant-facing message.
+func describeBody(body []byte) string {
+	text := strings.TrimSpace(string(body))
+	switch {
+	case text == "":
+		return ""
+	case strings.HasPrefix(text, "<"):
+		return " (a web page answered, not the PayRam API)"
+	case len(text) > 200:
+		return ": " + text[:200] + "..."
+	default:
+		return ": " + text
+	}
 }
