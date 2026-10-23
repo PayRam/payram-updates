@@ -776,3 +776,47 @@ func TestBuildUpgradeArgs_NoInvalidMountSpecs(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildUpgradeArgs_DropsDatabasePort: an upgrade or rollback must not carry
+// the bundled database's port forward, in any binding form, and keeps the rest.
+func TestBuildUpgradeArgs_DropsDatabasePort(t *testing.T) {
+	state := &RuntimeState{
+		Name:  "payram",
+		Image: "payramapp/payram:3.8.1",
+		Ports: []PortMapping{
+			{HostPort: "80", ContainerPort: "80", Protocol: "tcp"},
+			{HostPort: "5432", ContainerPort: "5432", Protocol: "tcp"},
+			{HostIP: "127.0.0.1", HostPort: "15432", ContainerPort: "5432", Protocol: "tcp"},
+			{HostIP: "::", HostPort: "5432", ContainerPort: "5432", Protocol: "tcp"},
+			{HostPort: "5432", ContainerPort: "6000", Protocol: "tcp"},
+		},
+	}
+	m := &manifest.Manifest{
+		Image: manifest.Image{Repo: "payramapp/payram"},
+		Defaults: manifest.Defaults{
+			ContainerName: "payram",
+			Ports:         []manifest.Port{{Host: 5432, Container: 5432}},
+		},
+	}
+
+	args, err := NewDockerRunBuilder(&mockLogger{}).BuildUpgradeArgs(state, m, "3.10.0")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var published []string
+	for i, a := range args {
+		if a == "-p" && i+1 < len(args) {
+			published = append(published, args[i+1])
+		}
+	}
+	want := []string{"80:80/tcp", "5432:6000/tcp"}
+	if len(published) != len(want) {
+		t.Fatalf("published %v, want %v", published, want)
+	}
+	for i := range want {
+		if published[i] != want[i] {
+			t.Fatalf("published %v, want %v", published, want)
+		}
+	}
+}
