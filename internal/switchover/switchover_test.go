@@ -566,3 +566,16 @@ func TestWaitHealthy_ToleratesRestartsWhileBootingButNotOnceUp(t *testing.T) {
 		t.Fatalf("got %v, want a restart during the stability window to fail", err)
 	}
 }
+
+func TestHealthWindowLeft_ARestartedCheckOnlyWaitsWhatIsLeft(t *testing.T) {
+	w := &Switch{Timing: Timing{HealthTimeout: 10 * time.Minute}}
+	if left := w.HealthWindowLeft(time.Now().Add(-4 * time.Minute)); left < 5*time.Minute+50*time.Second || left > 6*time.Minute {
+		t.Fatalf("4 minutes in: left = %s, want about 6m", left)
+	}
+	if left := w.HealthWindowLeft(time.Now().Add(-30 * time.Minute)); left != time.Minute {
+		t.Fatalf("past the window: left = %s, want the 1m minimum", left)
+	}
+	if left := w.HealthWindowLeft(time.Time{}); left != 10*time.Minute {
+		t.Fatalf("unknown start: left = %s, want the whole window", left)
+	}
+}

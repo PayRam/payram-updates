@@ -84,7 +84,12 @@ func (s *Server) repairInterruptedUpgrade(ctx context.Context) {
 		target := baseVersionTag(job.ResolvedTarget)
 		if state, err := s.dockerRunner.State(work, job.ContainerName); err == nil && state.Running {
 			probe := s.newProbe(job.CoreBaseURL, job.ContainerName, s.shouldUseLegacyForTarget(s.currentPolicyInit, target))
-			if _, err := sw.WaitHealthy(work, job.ContainerName, probe, target); err == nil {
+			// Only what is left of the window: PayRam is down while a
+			// broken new version is being waited for.
+			sw.Timing.HealthTimeout = sw.HealthWindowLeft(job.SwitchedAt)
+			_, err := sw.WaitHealthy(work, job.ContainerName, probe, target)
+			sw.Timing.HealthTimeout = s.switchTiming.HealthTimeout
+			if err == nil {
 				s.jobStore.AppendLog(fmt.Sprintf("%s is up and healthy; finishing the update", target))
 				sw.Finish(work, job)
 				repo, tag := container.SplitImage(state.Image)

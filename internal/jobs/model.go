@@ -90,6 +90,9 @@ type Job struct {
 	PreviousImage         string      `json:"previousImage,omitempty"`
 	PreviousRestartPolicy string      `json:"previousRestartPolicy,omitempty"`
 	QuiescedPrograms      []string    `json:"quiescedPrograms,omitempty"`
+	// SwitchedAt is when the new container was started; the health check's
+	// window runs from here, also for an updater restarted mid-check.
+	SwitchedAt time.Time `json:"switchedAt,omitempty"`
 }
 
 // NewJob creates a new job with the given mode and requested target.

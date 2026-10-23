@@ -241,10 +241,29 @@ func (w *Switch) Cutover(ctx context.Context, job *jobs.Job, currentImage, curre
 		return &StepError{Code: "DOCKER_ERROR", Message: fmt.Sprintf("Could not put the new container in place: %s", shortError(err)), Changed: true}
 	}
 	w.logf("Starting the new version as %s (the old one is kept as %s)", name, previous)
+	job.SwitchedAt = time.Now().UTC()
+	if err := w.save(job); err != nil {
+		w.logf("Warning: %v", err)
+	}
 	if err := w.Docker.Start(ctx, name); err != nil {
 		return &StepError{Code: "DOCKER_ERROR", Message: fmt.Sprintf("The new version's container did not start: %s", shortError(err)), Changed: true}
 	}
 	return nil
+}
+
+// HealthWindowLeft is how much of the health check's window is left for a
+// container started at startedAt, never less than a minute (an updater that
+// restarted mid-check still looks at the new version before deciding).
+func (w *Switch) HealthWindowLeft(startedAt time.Time) time.Duration {
+	window := w.timing().HealthTimeout
+	if startedAt.IsZero() {
+		return window
+	}
+	left := window - time.Since(startedAt)
+	if left < time.Minute {
+		left = time.Minute
+	}
+	return left
 }
 
 // WaitHealthy waits until the container answers its health check, runs
