@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -403,5 +405,34 @@ func TestRedactArgs_HidesEnvironmentValuesAndPasswords(t *testing.T) {
 	}
 	if args[5] != "AES_KEY=0123456789abcdef" {
 		t.Fatal("RedactArgs must not modify its input")
+	}
+}
+
+// TestState_MissingContainerInEveryDockerWording: Docker Desktop 4.x prints
+// "error: no such object: x" for inspect; older engines print "Error: No such
+// object" or "No such container". A missing container is never an error.
+func TestState_MissingContainerInEveryDockerWording(t *testing.T) {
+	for _, wording := range []string{
+		"error: no such object: payram-next",
+		"Error: No such object: payram-next",
+		"Error response from daemon: No such container: payram-next",
+	} {
+		script := filepath.Join(t.TempDir(), "docker")
+		body := "#!/bin/sh\necho '" + wording + "' >&2\nexit 1\n"
+		if err := os.WriteFile(script, []byte(body), 0700); err != nil {
+			t.Fatal(err)
+		}
+		runner := &Runner{DockerBin: script}
+
+		state, err := runner.State(context.Background(), "payram-next")
+		if err != nil || state.Exists {
+			t.Errorf("%q: State = %+v, %v; want Exists=false and no error", wording, state, err)
+		}
+		if err := runner.Remove(context.Background(), "payram-next"); err != nil {
+			t.Errorf("%q: Remove must be idempotent: %v", wording, err)
+		}
+		if err := runner.Stop(context.Background(), "payram-next"); err != nil {
+			t.Errorf("%q: Stop must be idempotent: %v", wording, err)
+		}
 	}
 }

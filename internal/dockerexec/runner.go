@@ -63,7 +63,7 @@ func (r *Runner) Stop(ctx context.Context, container string) error {
 	if err != nil {
 		// Check if error is because container doesn't exist or isn't running
 		outputStr := string(output)
-		if strings.Contains(outputStr, "No such container") ||
+		if IsNotFound(outputStr) ||
 			strings.Contains(outputStr, "is not running") ||
 			strings.Contains(outputStr, "already stopped") {
 			r.logf("Container %s not running (idempotent operation)", container)
@@ -123,7 +123,7 @@ func (r *Runner) Remove(ctx context.Context, container string) error {
 	if err != nil {
 		// Check if error is because container doesn't exist
 		outputStr := string(output)
-		if strings.Contains(outputStr, "No such container") {
+		if IsNotFound(outputStr) {
 			r.logf("Container %s does not exist (idempotent operation)", container)
 			return nil
 		}
@@ -200,7 +200,7 @@ func (r *Runner) State(ctx context.Context, container string) (ContainerState, e
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		outputStr := string(output)
-		if strings.Contains(outputStr, "No such object") || strings.Contains(outputStr, "No such container") {
+		if IsNotFound(outputStr) {
 			return ContainerState{}, nil
 		}
 		return ContainerState{}, fmt.Errorf("docker inspect %s failed: %w: %s", container, err, strings.TrimSpace(outputStr))
@@ -235,8 +235,7 @@ func (r *Runner) InspectRunning(ctx context.Context, container string) (bool, er
 	if err != nil {
 		// Container doesn't exist
 		outputStr := string(output)
-		if strings.Contains(outputStr, "No such object") ||
-			strings.Contains(outputStr, "No such container") {
+		if IsNotFound(outputStr) {
 			r.logf("Container %s does not exist", container)
 			return false, nil
 		}
@@ -319,6 +318,15 @@ func (r *Runner) PrunePayramImages(ctx context.Context, imageRepo string, keepTa
 	}
 
 	return nil
+}
+
+// IsNotFound reports whether docker's output says the container does not
+// exist. Docker's wording differs by version and command ("Error response
+// from daemon: No such container: x", "error: no such object: x"), so the
+// match ignores case.
+func IsNotFound(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "no such container") || strings.Contains(lower, "no such object")
 }
 
 // logf logs a formatted message if a logger is available.

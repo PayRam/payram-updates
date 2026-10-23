@@ -10,6 +10,7 @@ import (
 
 	"github.com/payram/payram-updater/internal/coreclient"
 	"github.com/payram/payram-updater/internal/corecompat"
+	"github.com/payram/payram-updater/internal/dockerexec"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/manifest"
 	"github.com/payram/payram-updater/internal/policy"
@@ -356,7 +357,7 @@ func (i *Inspector) containerStatus(ctx context.Context, name string) (string, b
 	output, err := exec.CommandContext(ctx, i.dockerBin, "inspect", "--format", "{{.State.Status}}", name).CombinedOutput()
 	if err != nil {
 		text := strings.TrimSpace(string(output))
-		if strings.Contains(text, "No such object") || strings.Contains(text, "No such container") {
+		if dockerexec.IsNotFound(text) {
 			return "", false, nil
 		}
 		if text == "" {
