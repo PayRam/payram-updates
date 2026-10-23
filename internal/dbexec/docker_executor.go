@@ -3,158 +3,120 @@ package dbexec
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
+	"time"
 )
 
-// DockerPGExecutor executes PostgreSQL operations inside a Docker container.
+// DockerPGExecutor runs PostgreSQL client tools inside the PayRam container
+// (docker exec), for the database bundled in that container. No host
+// PostgreSQL tools are used.
 type DockerPGExecutor struct {
-	Executor CommandExecutor
-	Logger   Logger
+	// Runner runs docker; nil means OSRunner.
+	Runner    Runner
+	Logger    Logger
+	DockerBin string // defaults to "docker"
 }
 
 // NewDockerPGExecutor creates a new DockerPGExecutor.
-func NewDockerPGExecutor(executor CommandExecutor, logger Logger) *DockerPGExecutor {
+func NewDockerPGExecutor(runner Runner, logger Logger) *DockerPGExecutor {
 	if logger == nil {
 		logger = &noopLogger{}
 	}
-	return &DockerPGExecutor{
-		Executor: executor,
-		Logger:   logger,
+	if runner == nil {
+		runner = OSRunner{}
 	}
+	return &DockerPGExecutor{Runner: runner, Logger: logger, DockerBin: "docker"}
 }
 
-// Dump creates a database backup by running pg_dump inside the container.
+func (e *DockerPGExecutor) checkTarget(db DBContext) error {
+	if db.Mode != DBModeInContainer {
+		return &DBError{
+			Code:    ErrCodeInvalidConfig,
+			Message: "DockerPGExecutor can only be used with in-container databases",
+		}
+	}
+	if db.ContainerName == "" {
+		return &DBError{
+			Code:    ErrCodeContainerNotFound,
+			Message: "container name is required for in-container database operations",
+		}
+	}
+	return nil
+}
+
+// toolCommand builds `docker exec [-i] [-e PGPASSWORD] <container> <tool> ...`.
+// The password travels in the docker client's environment, never in argv.
+func (e *DockerPGExecutor) toolCommand(db DBContext, tool string, withStdin bool, args ...string) Command {
+	argv := []string{"exec"}
+	if withStdin {
+		argv = append(argv, "-i")
+	}
+	if db.Creds.Password != "" {
+		argv = append(argv, "-e", "PGPASSWORD")
+	}
+	argv = append(argv, db.ContainerName, tool)
+	argv = append(argv, args...)
+	return Command{Name: e.dockerBin(), Args: argv, Env: ClientEnv(db.Creds.Password, "")}
+}
+
+func (e *DockerPGExecutor) where(db DBContext) string {
+	return fmt.Sprintf("inside container %s", db.ContainerName)
+}
+
+func (e *DockerPGExecutor) runner() Runner {
+	if e.Runner == nil {
+		return OSRunner{}
+	}
+	return e.Runner
+}
+
+func (e *DockerPGExecutor) logger() Logger {
+	if e.Logger == nil {
+		return &noopLogger{}
+	}
+	return e.Logger
+}
+
+func (e *DockerPGExecutor) dockerBin() string {
+	if e.DockerBin == "" {
+		return "docker"
+	}
+	return e.DockerBin
+}
+
+// Dump implements PGExecutor.
 func (e *DockerPGExecutor) Dump(ctx context.Context, db DBContext, outFile string, format string) error {
-	if db.Mode != DBModeInContainer {
-		return &DBError{
-			Code:    "INVALID_DB_CONFIG",
-			Message: "DockerPGExecutor can only be used with in-container databases",
-		}
-	}
-	if db.ContainerName == "" {
-		return &DBError{
-			Code:    "CONTAINER_NOT_FOUND",
-			Message: "container name is required for in-container database operations",
-		}
-	}
-
-	e.Logger.Printf("[DockerPGExecutor] Executing pg_dump inside container: %s", db.ContainerName)
-	e.Logger.Printf("[DockerPGExecutor] This will use 'docker exec' - NO host pg_dump")
-
-	// Get absolute path for the output file
-	absOutFile, err := filepath.Abs(outFile)
-	if err != nil {
-		return &DBError{
-			Code:    "BACKUP_FAILED",
-			Message: "failed to get absolute path for backup file",
-			Err:     err,
-		}
-	}
-
-	// Build pg_dump command with appropriate format flag
-	formatFlag := "-Fc" // custom format by default
-	if format == "sql" {
-		formatFlag = "-Fp" // plain SQL format
-	}
-
-	// Build the docker exec command
-	// We redirect output to the host file system
-	shellCmd := fmt.Sprintf("docker exec %s pg_dump %s -U %s -d %s > %s",
-		db.ContainerName,
-		formatFlag,
-		db.Creds.Username,
-		db.Creds.Database,
-		absOutFile,
-	)
-
-	e.Logger.Printf("[DockerPGExecutor] Running: docker exec %s pg_dump ...", db.ContainerName)
-
-	output, err := e.Executor.Execute(ctx, "sh", []string{"-c", shellCmd}, nil)
-	if err != nil {
-		return &DBError{
-			Code:    "BACKUP_FAILED",
-			Message: fmt.Sprintf("pg_dump (container) failed: %v: %s", err, string(output)),
-			Err:     err,
-		}
-	}
-
-	// Verify the backup file was created
-	if _, err := os.Stat(absOutFile); os.IsNotExist(err) {
-		return &DBError{
-			Code:    "BACKUP_FAILED",
-			Message: fmt.Sprintf("backup file was not created: %s", absOutFile),
-		}
-	}
-
-	e.Logger.Printf("Backup created successfully: %s", absOutFile)
-	return nil
+	return dumpToFile(ctx, e, db, outFile, format)
 }
 
-// Restore restores a database from a backup by running pg_restore or psql inside the container.
+// VerifyDumpFile implements PGExecutor.
+func (e *DockerPGExecutor) VerifyDumpFile(ctx context.Context, db DBContext, file string, format string) error {
+	if err := e.checkTarget(db); err != nil {
+		return err
+	}
+	return verifyDumpFile(ctx, e, db, file, format)
+}
+
+// Restore implements PGExecutor.
 func (e *DockerPGExecutor) Restore(ctx context.Context, db DBContext, inFile string, format string) error {
-	if db.Mode != DBModeInContainer {
-		return &DBError{
-			Code:    "INVALID_DB_CONFIG",
-			Message: "DockerPGExecutor can only be used with in-container databases",
-		}
-	}
-	if db.ContainerName == "" {
-		return &DBError{
-			Code:    "CONTAINER_NOT_FOUND",
-			Message: "container name is required for in-container database operations",
-		}
-	}
+	return restoreFromFile(ctx, e, db, inFile, format)
+}
 
-	// Get absolute path for the input file
-	absInFile, err := filepath.Abs(inFile)
-	if err != nil {
-		return &DBError{
-			Code:    "RESTORE_FAILED",
-			Message: "failed to get absolute path for backup file",
-			Err:     err,
-		}
-	}
+// DescribeDatabase implements PGExecutor.
+func (e *DockerPGExecutor) DescribeDatabase(ctx context.Context, db DBContext) (DatabaseSummary, error) {
+	return describeDatabase(ctx, e, db)
+}
 
-	// Verify the backup file exists
-	if _, err := os.Stat(absInFile); os.IsNotExist(err) {
-		return &DBError{
-			Code:    "RESTORE_FAILED",
-			Message: fmt.Sprintf("backup file does not exist: %s", absInFile),
-			Err:     err,
-		}
-	}
+// CheckTools implements PGExecutor.
+func (e *DockerPGExecutor) CheckTools(ctx context.Context, db DBContext) error {
+	return checkTools(ctx, e, db)
+}
 
-	var shellCmd string
-	if format == "sql" {
-		e.Logger.Printf("Executing psql inside container: %s", db.ContainerName)
-		shellCmd = fmt.Sprintf("cat %s | docker exec -i %s psql -U %s -d %s",
-			absInFile,
-			db.ContainerName,
-			db.Creds.Username,
-			db.Creds.Database,
-		)
-	} else {
-		e.Logger.Printf("Executing pg_restore inside container: %s", db.ContainerName)
-		shellCmd = fmt.Sprintf("cat %s | docker exec -i %s pg_restore --clean --if-exists --no-owner --no-privileges -U %s -d %s",
-			absInFile,
-			db.ContainerName,
-			db.Creds.Username,
-			db.Creds.Database,
-		)
-	}
+// Ping implements PGExecutor.
+func (e *DockerPGExecutor) Ping(ctx context.Context, db DBContext) error {
+	return ping(ctx, e, db)
+}
 
-	e.Logger.Printf("Running: sh -c %s", shellCmd)
-
-	output, err := e.Executor.Execute(ctx, "sh", []string{"-c", shellCmd}, nil)
-	if err != nil {
-		return &DBError{
-			Code:    "RESTORE_FAILED",
-			Message: fmt.Sprintf("restore (container) failed: %v: %s", err, string(output)),
-			Err:     err,
-		}
-	}
-
-	e.Logger.Printf("Database restored successfully from: %s", absInFile)
-	return nil
+// WaitReady implements PGExecutor.
+func (e *DockerPGExecutor) WaitReady(ctx context.Context, db DBContext, timeout time.Duration) error {
+	return waitReady(ctx, e, db, timeout)
 }

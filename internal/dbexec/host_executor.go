@@ -2,170 +2,149 @@ package dbexec
 
 import (
 	"context"
-	"fmt"
-	"os"
 	"path/filepath"
+	"time"
 )
 
-// HostPGExecutor executes PostgreSQL operations from the host using local pg_* tools.
+// HostPGExecutor runs PostgreSQL client tools on the host, for a database
+// outside the PayRam container.
 type HostPGExecutor struct {
-	Executor     CommandExecutor
+	// Runner runs the tools; nil means OSRunner.
+	Runner       Runner
 	Logger       Logger
 	PGDumpBin    string // path to pg_dump binary (optional, defaults to "pg_dump")
 	PSQLBin      string // path to psql binary (optional, defaults to "psql")
 	PGRestoreBin string // path to pg_restore binary (optional, defaults to "pg_restore")
+	PGIsReadyBin string // path to pg_isready binary (optional, defaults to "pg_isready")
 }
 
 // NewHostPGExecutor creates a new HostPGExecutor.
-func NewHostPGExecutor(executor CommandExecutor, logger Logger) *HostPGExecutor {
+func NewHostPGExecutor(runner Runner, logger Logger) *HostPGExecutor {
 	if logger == nil {
 		logger = &noopLogger{}
 	}
+	if runner == nil {
+		runner = OSRunner{}
+	}
 	return &HostPGExecutor{
-		Executor:     executor,
+		Runner:       runner,
 		Logger:       logger,
 		PGDumpBin:    "pg_dump",
 		PSQLBin:      "psql",
 		PGRestoreBin: "pg_restore",
+		PGIsReadyBin: "pg_isready",
 	}
 }
 
-// Dump creates a database backup by running pg_dump from the host.
+// UseToolsNextTo points every tool at the directory of pgDumpBin, so a
+// configured /usr/lib/postgresql/17/bin/pg_dump brings its own psql and
+// pg_restore. A bare name ("pg_dump") keeps PATH lookup for all of them.
+func (e *HostPGExecutor) UseToolsNextTo(pgDumpBin string) {
+	if pgDumpBin == "" {
+		return
+	}
+	e.PGDumpBin = pgDumpBin
+	if filepath.Base(pgDumpBin) == pgDumpBin {
+		return
+	}
+	dir := filepath.Dir(pgDumpBin)
+	e.PSQLBin = filepath.Join(dir, "psql")
+	e.PGRestoreBin = filepath.Join(dir, "pg_restore")
+	e.PGIsReadyBin = filepath.Join(dir, "pg_isready")
+}
+
+func (e *HostPGExecutor) checkTarget(db DBContext) error {
+	if db.Mode == DBModeInContainer {
+		return &DBError{
+			Code:    ErrCodeInvalidConfig,
+			Message: "HostPGExecutor can only be used with external databases",
+		}
+	}
+	return nil
+}
+
+// toolCommand builds the host invocation of a client tool. The password and
+// SSL mode travel in the environment.
+func (e *HostPGExecutor) toolCommand(db DBContext, tool string, withStdin bool, args ...string) Command {
+	return Command{
+		Name: e.binFor(tool),
+		Args: append([]string(nil), args...),
+		Env:  ClientEnv(db.Creds.Password, db.Creds.SSLMode),
+	}
+}
+
+func (e *HostPGExecutor) binFor(tool string) string {
+	pick := func(configured, fallback string) string {
+		if configured == "" {
+			return fallback
+		}
+		return configured
+	}
+	switch tool {
+	case "pg_dump":
+		return pick(e.PGDumpBin, "pg_dump")
+	case "psql":
+		return pick(e.PSQLBin, "psql")
+	case "pg_restore":
+		return pick(e.PGRestoreBin, "pg_restore")
+	case "pg_isready":
+		return pick(e.PGIsReadyBin, "pg_isready")
+	}
+	return tool
+}
+
+func (e *HostPGExecutor) where(db DBContext) string {
+	return "on this host"
+}
+
+func (e *HostPGExecutor) runner() Runner {
+	if e.Runner == nil {
+		return OSRunner{}
+	}
+	return e.Runner
+}
+
+func (e *HostPGExecutor) logger() Logger {
+	if e.Logger == nil {
+		return &noopLogger{}
+	}
+	return e.Logger
+}
+
+// Dump implements PGExecutor.
 func (e *HostPGExecutor) Dump(ctx context.Context, db DBContext, outFile string, format string) error {
-	if db.Mode == DBModeInContainer {
-		return &DBError{
-			Code:    "INVALID_DB_CONFIG",
-			Message: "HostPGExecutor can only be used with external databases",
-		}
-	}
-
-	e.Logger.Printf("[HostPGExecutor] Executing pg_dump from host to external database: %s:%s", db.Creds.Host, db.Creds.Port)
-	e.Logger.Printf("[HostPGExecutor] This will use host pg_dump binary - NOT docker exec")
-
-	// Get absolute path for the output file
-	absOutFile, err := filepath.Abs(outFile)
-	if err != nil {
-		return &DBError{
-			Code:    "BACKUP_FAILED",
-			Message: "failed to get absolute path for backup file",
-			Err:     err,
-		}
-	}
-
-	// Build pg_dump arguments
-	args := []string{
-		"-h", db.Creds.Host,
-		"-p", db.Creds.Port,
-		"-U", db.Creds.Username,
-		"-d", db.Creds.Database,
-		"-f", absOutFile,
-	}
-
-	// Add format flag
-	if format == "sql" {
-		args = append(args, "-Fp") // plain SQL format
-	} else {
-		args = append(args, "-Fc") // custom format
-	}
-
-	// Build environment with PGPASSWORD
-	env := os.Environ()
-	if db.Creds.Password != "" {
-		env = append(env, fmt.Sprintf("PGPASSWORD=%s", db.Creds.Password))
-	}
-
-	e.Logger.Printf("Running: %s (to %s)", e.PGDumpBin, absOutFile)
-
-	output, err := e.Executor.Execute(ctx, e.PGDumpBin, args, env)
-	if err != nil {
-		return &DBError{
-			Code:    "BACKUP_FAILED",
-			Message: fmt.Sprintf("pg_dump (host) failed: %v: %s", err, string(output)),
-			Err:     err,
-		}
-	}
-
-	// Verify the backup file was created
-	if _, err := os.Stat(absOutFile); os.IsNotExist(err) {
-		return &DBError{
-			Code:    "BACKUP_FAILED",
-			Message: fmt.Sprintf("backup file was not created: %s", absOutFile),
-		}
-	}
-
-	e.Logger.Printf("Backup created successfully: %s", absOutFile)
-	return nil
+	return dumpToFile(ctx, e, db, outFile, format)
 }
 
-// Restore restores a database from a backup by running pg_restore or psql from the host.
+// VerifyDumpFile implements PGExecutor.
+func (e *HostPGExecutor) VerifyDumpFile(ctx context.Context, db DBContext, file string, format string) error {
+	if err := e.checkTarget(db); err != nil {
+		return err
+	}
+	return verifyDumpFile(ctx, e, db, file, format)
+}
+
+// Restore implements PGExecutor.
 func (e *HostPGExecutor) Restore(ctx context.Context, db DBContext, inFile string, format string) error {
-	if db.Mode == DBModeInContainer {
-		return &DBError{
-			Code:    "INVALID_DB_CONFIG",
-			Message: "HostPGExecutor can only be used with external databases",
-		}
-	}
+	return restoreFromFile(ctx, e, db, inFile, format)
+}
 
-	// Get absolute path for the input file
-	absInFile, err := filepath.Abs(inFile)
-	if err != nil {
-		return &DBError{
-			Code:    "RESTORE_FAILED",
-			Message: "failed to get absolute path for backup file",
-			Err:     err,
-		}
-	}
+// DescribeDatabase implements PGExecutor.
+func (e *HostPGExecutor) DescribeDatabase(ctx context.Context, db DBContext) (DatabaseSummary, error) {
+	return describeDatabase(ctx, e, db)
+}
 
-	// Verify the backup file exists
-	if _, err := os.Stat(absInFile); os.IsNotExist(err) {
-		return &DBError{
-			Code:    "RESTORE_FAILED",
-			Message: fmt.Sprintf("backup file does not exist: %s", absInFile),
-			Err:     err,
-		}
-	}
+// CheckTools implements PGExecutor.
+func (e *HostPGExecutor) CheckTools(ctx context.Context, db DBContext) error {
+	return checkTools(ctx, e, db)
+}
 
-	// Build environment with PGPASSWORD
-	env := os.Environ()
-	if db.Creds.Password != "" {
-		env = append(env, fmt.Sprintf("PGPASSWORD=%s", db.Creds.Password))
-	}
+// Ping implements PGExecutor.
+func (e *HostPGExecutor) Ping(ctx context.Context, db DBContext) error {
+	return ping(ctx, e, db)
+}
 
-	var output []byte
-	if format == "sql" {
-		e.Logger.Printf("Executing psql from host to remote database: %s:%s", db.Creds.Host, db.Creds.Port)
-		args := []string{
-			"-h", db.Creds.Host,
-			"-p", db.Creds.Port,
-			"-U", db.Creds.Username,
-			"-d", db.Creds.Database,
-			"-f", absInFile,
-		}
-		output, err = e.Executor.Execute(ctx, e.PSQLBin, args, env)
-	} else {
-		e.Logger.Printf("Executing pg_restore from host to remote database: %s:%s", db.Creds.Host, db.Creds.Port)
-		args := []string{
-			"--clean",
-			"--if-exists",
-			"--no-owner",
-			"--no-privileges",
-			"-h", db.Creds.Host,
-			"-p", db.Creds.Port,
-			"-U", db.Creds.Username,
-			"-d", db.Creds.Database,
-			absInFile,
-		}
-		output, err = e.Executor.Execute(ctx, e.PGRestoreBin, args, env)
-	}
-
-	if err != nil {
-		return &DBError{
-			Code:    "RESTORE_FAILED",
-			Message: fmt.Sprintf("restore (host) failed: %v: %s", err, string(output)),
-			Err:     err,
-		}
-	}
-
-	e.Logger.Printf("Database restored successfully from: %s", absInFile)
-	return nil
+// WaitReady implements PGExecutor.
+func (e *HostPGExecutor) WaitReady(ctx context.Context, db DBContext, timeout time.Duration) error {
+	return waitReady(ctx, e, db, timeout)
 }

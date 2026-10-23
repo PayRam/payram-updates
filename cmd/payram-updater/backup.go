@@ -62,6 +62,9 @@ Examples:
 		PGPassword:          cfg.Backup.PGPassword,
 		ImagePattern:        imagePattern,
 		TargetContainerName: cfg.TargetContainerName,
+		StateDir:            cfg.StateDir,
+		DockerBin:           cfg.DockerBin,
+		SupervisorExclude:   cfg.SupervisorExclude,
 	}
 	mgr := backup.NewManager(backupCfg, &backup.RealExecutor{}, log.Default())
 
