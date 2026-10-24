@@ -181,24 +181,5 @@ func (r *containerRollback) finish(state jobs.JobState, code, cause, message str
 // heartbeat keeps the saved job fresh while this command works, so the
 // daemon and the installer see an update in progress, not a dead one.
 func heartbeat(store *jobs.Store) func() {
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(20 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				store.Touch()
-			}
-		}
-	}()
-	stopped := false
-	return func() {
-		if !stopped {
-			stopped = true
-			close(done)
-		}
-	}
+	return store.StartHeartbeat(20*time.Second, nil)
 }

@@ -543,26 +543,13 @@ func (s *Server) executeUpgrade(job *jobs.Job, plan *UpgradePlan) {
 // startHeartbeat refreshes the saved job's UpdatedAt while a job runs, so an
 // active job that stops being refreshed is known to belong to a dead updater.
 func (s *Server) startHeartbeat() func() {
-	done := make(chan struct{})
 	every := s.heartbeatEvery
 	if every <= 0 {
 		every = 20 * time.Second
 	}
-	go func() {
-		ticker := time.NewTicker(every)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				if err := s.jobStore.Touch(); err != nil {
-					logger.Error("Server", "startHeartbeat", err)
-				}
-			}
-		}
-	}()
-	return func() { close(done) }
+	return s.jobStore.StartHeartbeat(every, func(err error) {
+		logger.Error("Server", "startHeartbeat", err)
+	})
 }
 
 func (s *Server) fetchPolicyInitVersion(ctx context.Context) string {

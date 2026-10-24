@@ -67,6 +67,35 @@ func (s *Store) Touch() error {
 	return s.save(job)
 }
 
+// StartHeartbeat touches the saved job every interval until the returned
+// stop is called. Stop returns once the heartbeat has ended, so nothing is
+// written after it (a stopped update must not be touched again). onError,
+// if set, hears failed touches. Stop may be called more than once.
+func (s *Store) StartHeartbeat(every time.Duration, onError func(error)) (stop func()) {
+	done := make(chan struct{})
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := s.Touch(); err != nil && onError != nil {
+					onError(err)
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+		<-ended
+	}
+}
+
 func (s *Store) save(job *Job) error {
 	if err := s.ensureJobDir(); err != nil {
 		return err

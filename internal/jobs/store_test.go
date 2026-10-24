@@ -295,3 +295,30 @@ func TestStore_RewriteLogs_CleansLinesAndKeepsTheRest(t *testing.T) {
 		t.Fatalf("RewriteLogs without a log: %v", err)
 	}
 }
+
+// TestStore_StartHeartbeat_NothingIsWrittenAfterStop: stop returns only once
+// the heartbeat has ended, so a finished update is never touched again.
+func TestStore_StartHeartbeat_NothingIsWrittenAfterStop(t *testing.T) {
+	store := NewStore(t.TempDir())
+	job := NewJob("j", JobModeDashboard, "3.10.0")
+	job.State = JobStateVerifying
+	job.UpdatedAt = time.Now().Add(-time.Hour).UTC()
+	if err := store.Save(job); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := store.StartHeartbeat(time.Millisecond, nil)
+	time.Sleep(20 * time.Millisecond)
+	stop()
+	refreshed, _ := store.LoadLatest()
+	if time.Since(refreshed.UpdatedAt) > time.Second {
+		t.Fatalf("UpdatedAt = %s, want refreshed", refreshed.UpdatedAt)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	after, _ := store.LoadLatest()
+	if !after.UpdatedAt.Equal(refreshed.UpdatedAt) {
+		t.Fatal("the heartbeat wrote after stop returned")
+	}
+	stop() // a second stop is harmless
+}
