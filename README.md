@@ -112,21 +112,23 @@ Requires `sudo` access and systemd.
 
 ## Performing Upgrades
 
+Manual mode (the default for these commands) needs root: run them with `sudo`.
+
 ### Validate an upgrade (dry-run)
 ```bash
-payram-updater dry-run --to latest
+sudo payram-updater dry-run --to latest
 ```
 
 ### Execute an upgrade
 
 Upgrade to the latest version (manual mode):
 ```bash
-payram-updater run --to latest
+sudo payram-updater run --to latest
 ```
 
 Dashboard-controlled upgrade:
 ```bash
-payram-updater run --mode dashboard --to latest
+sudo payram-updater run --mode dashboard --to latest
 ```
 
 You'll see a confirmation prompt before the upgrade starts:
@@ -148,12 +150,12 @@ Proceed? (y/N):
 
 ### Skip confirmation (for automation)
 ```bash
-payram-updater run --to 1.7.8 --yes
+sudo payram-updater run --to 1.7.8 --yes
 ```
 
 ### Upgrade to a specific version
 ```bash
-payram-updater run --to 1.7.8
+sudo payram-updater run --to 1.7.8
 ```
 
 ## Upgrade Modes
@@ -164,6 +166,9 @@ payram-updater run --to 1.7.8
 - Can use "latest" to get newest version from policy
 - For operator-initiated upgrades
 - Use when you need to override policy restrictions
+- Only root's `payram-updater` command can use it (the updater checks a token
+  in its state directory that only root can read), so run it with `sudo`; no
+  other program on the server and not the PayRam container can ask for it
 
 **Dashboard Mode** (recommended for automated upgrades)
 - Uses policy-controlled version selection
@@ -415,6 +420,18 @@ sudo rm -rf /etc/payram/updater.env /etc/payram/installer-backups /var/lib/payra
 ```
 
 Do not remove `/var/lib/payram`: it holds the database backups (`/var/lib/payram/backups`). Delete that folder only if you are sure you no longer need them.
+
+## Testing a release
+
+Run all three before publishing an updater release:
+
+```bash
+go test -race ./...      # unit and integration tests
+test/e2e/run.sh          # real PayRam containers through every update path (about 90 minutes)
+test/installer/run.sh    # the installer on fresh Linux servers, and over the released v0.2.3 (about 15 minutes)
+```
+
+See [test/e2e/README.md](test/e2e/README.md) and [test/installer/README.md](test/installer/README.md).
 
 ## Support
 

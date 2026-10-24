@@ -58,10 +58,6 @@ func (s *Server) runUpgrade(ctx context.Context, job *jobs.Job, plan *UpgradePla
 	job.ContainerName = containerName
 
 	sw := s.newSwitch()
-	if err := sw.ClearLeftovers(ctx, containerName); err != nil {
-		s.failStep(ctx, sw, job, err)
-		return
-	}
 
 	coreURL, how, err := container.FindCoreBaseURL(ctx, s.config.DockerBin, containerName, s.config.CoreBaseURL, logger.StdLogger())
 	if err != nil {
@@ -90,6 +86,13 @@ func (s *Server) runUpgrade(ctx context.Context, job *jobs.Job, plan *UpgradePla
 
 	if isDryRun {
 		s.executeDryRun(job, imageRepo, tag, containerName, spec)
+		return
+	}
+
+	// Only now that the update really goes ahead: a refused update or a dry
+	// run must not remove the <name>-failed container kept for support.
+	if err := sw.ClearLeftovers(ctx, containerName); err != nil {
+		s.failStep(ctx, sw, job, err)
 		return
 	}
 
@@ -129,6 +132,10 @@ func (s *Server) prepareHop(ctx context.Context, job *jobs.Job, containerName st
 		s.failBeforeChange(job, jobs.FailureTargetNotAllowed, fmt.Sprintf("Container %s runs %s, which is not a PayRam image; the updater only replaces PayRam containers", containerName, runtimeState.Image))
 		return nil, nil, "", false
 	}
+	if err := container.CheckReplaceable(runtimeState); err != nil {
+		s.failBeforeChange(job, jobs.FailureContainerNotReplaceable, err.Error())
+		return nil, nil, "", false
+	}
 	s.jobStore.AppendLog(fmt.Sprintf("Runtime state extracted: %d ports, %d mounts, %d env vars",
 		len(runtimeState.Ports), len(runtimeState.Mounts), len(runtimeState.Env)))
 
@@ -156,8 +163,7 @@ func (s *Server) runHop(ctx context.Context, sw *switchover.Switch, job *jobs.Jo
 	}
 
 	s.setProgress(job, jobs.JobStateExecuting, fmt.Sprintf("Preparing %s", baseVersionTag(tag)))
-	createArgs := container.NewDockerRunBuilder(logger.StdLogger()).BuildCreateArgs(spec, switchover.NextName(name))
-	if err := sw.CreateNext(ctx, job, createArgs, spec.ExtraNetworks); err != nil {
+	if err := sw.CreateNext(ctx, job, spec); err != nil {
 		s.failStep(ctx, sw, job, err)
 		return false
 	}
@@ -454,7 +460,7 @@ func (s *Server) applyArchSuffix(job *jobs.Job, runningTag, baseTag string, arch
 
 // executeDryRun logs planned upgrade steps and completes the job in dry-run mode.
 func (s *Server) executeDryRun(job *jobs.Job, imageRepo, imageTag, containerName string, spec *container.ContainerSpec) {
-	createArgs := container.NewDockerRunBuilder(logger.StdLogger()).BuildCreateArgs(spec, switchover.NextName(containerName))
+	createArgs := spec.CreateArgs(switchover.NextName(containerName))
 	s.jobStore.AppendLog("DRY-RUN mode: would execute the following steps:")
 	s.jobStore.AppendLog(fmt.Sprintf("  1. Pull image: %s:%s", imageRepo, imageTag))
 	s.jobStore.AppendLog(fmt.Sprintf("  2. Create the new container next to the running one: docker %s", strings.Join(dockerexec.RedactArgs(createArgs), " ")))

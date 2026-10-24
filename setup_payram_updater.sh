@@ -103,6 +103,15 @@ DAEMON_HEARTBEATS=false
 LAST_BUSY_STATE=""
 STALE_REASON=""
 
+# Commands that need root run through $SUDO: sudo for a user that is not
+# root, nothing when the script already runs as root (many servers are run as
+# root and have no sudo installed; setup_payram.sh runs this script as root).
+if [[ "$(id -u)" -eq 0 ]]; then
+  SUDO=""
+else
+  SUDO="sudo"
+fi
+
 log() {
   if [[ "$QUIET" != "true" ]]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
@@ -185,7 +194,7 @@ cleanup_work_files() {
     rm -rf "$WORK_DIR"
   fi
   if [[ -n "${STAGED_BIN:-}" ]] && [[ -e "$STAGED_BIN" ]]; then
-    sudo rm -f "$STAGED_BIN" 2>/dev/null || true
+    $SUDO rm -f "$STAGED_BIN" 2>/dev/null || true
   fi
 }
 
@@ -199,10 +208,10 @@ cleanup_work_files() {
 # [[:space:]]: mawk 1.3.3 on older Ubuntu/Debian has no character classes.)
 env_file_value() {
   local key="$1"
-  if ! sudo test -f "$ENV_PATH"; then
+  if ! $SUDO test -f "$ENV_PATH"; then
     return 0
   fi
-  sudo cat "$ENV_PATH" 2>/dev/null | awk -v k="$key" '
+  $SUDO cat "$ENV_PATH" 2>/dev/null | awk -v k="$key" '
     /^[ \t]*#/ { next }
     {
       line = $0
@@ -225,10 +234,10 @@ env_file_value() {
 # env_file_has_key KEY: true when the env file assigns KEY (comments don't count).
 env_file_has_key() {
   local key="$1"
-  if ! sudo test -f "$ENV_PATH"; then
+  if ! $SUDO test -f "$ENV_PATH"; then
     return 1
   fi
-  sudo cat "$ENV_PATH" 2>/dev/null | awk -v k="$key" '
+  $SUDO cat "$ENV_PATH" 2>/dev/null | awk -v k="$key" '
     /^[ \t]*#/ { next }
     {
       line = $0
@@ -264,21 +273,21 @@ EOF
 # backup_file PATH MODE: copy PATH into INSTALLER_BACKUP_DIR with a timestamp.
 backup_file() {
   local src="$1" mode="$2" dest
-  sudo mkdir -p "$INSTALLER_BACKUP_DIR"
-  sudo chmod 0700 "$INSTALLER_BACKUP_DIR"
+  $SUDO mkdir -p "$INSTALLER_BACKUP_DIR"
+  $SUDO chmod 0700 "$INSTALLER_BACKUP_DIR"
   dest="${INSTALLER_BACKUP_DIR}/$(basename "$src").$(date '+%Y%m%d-%H%M%S')"
-  sudo cp "$src" "$dest"
-  sudo chmod "$mode" "$dest"
+  $SUDO cp "$src" "$dest"
+  $SUDO chmod "$mode" "$dest"
   log "Backed up $src to $dest"
 }
 
 write_env_file() {
-  if ! sudo test -f "$ENV_PATH"; then
+  if ! $SUDO test -f "$ENV_PATH"; then
     log "Creating environment file at $ENV_PATH..."
     {
       echo "# Payram Updater configuration"
       env_template
-    } | sudo tee "$ENV_PATH" >/dev/null
+    } | $SUDO tee "$ENV_PATH" >/dev/null
     log "Environment file created"
     return 0
   fi
@@ -317,12 +326,12 @@ write_env_file() {
   backup_file "$ENV_PATH" 0600
   {
     # Make sure the first added line does not join the file's last line.
-    if [[ -n "$(sudo tail -c 1 "$ENV_PATH" 2>/dev/null)" ]]; then
+    if [[ -n "$($SUDO tail -c 1 "$ENV_PATH" 2>/dev/null)" ]]; then
       echo ""
     fi
     echo "# Added by setup_payram_updater.sh on $(date '+%Y-%m-%d %H:%M:%S'): settings this file did not have yet"
     cat "$missing_file"
-  } | sudo tee -a "$ENV_PATH" >/dev/null
+  } | $SUDO tee -a "$ENV_PATH" >/dev/null
   while IFS= read -r line; do
     log "  added ${line}"
   done <"$missing_file"
@@ -514,11 +523,11 @@ wait_for_updater_down() {
 
 restart_updater_service() {
   if [[ "$OS" == "linux" ]]; then
-    sudo systemctl restart "$SERVICE_NAME"
+    $SUDO systemctl restart "$SERVICE_NAME"
   else
-    sudo launchctl unload "$SERVICE_PATH" 2>/dev/null || true
+    $SUDO launchctl unload "$SERVICE_PATH" 2>/dev/null || true
     wait_for_updater_down
-    sudo launchctl load "$SERVICE_PATH"
+    $SUDO launchctl load "$SERVICE_PATH"
   fi
 }
 
@@ -578,36 +587,36 @@ do_uninstall() {
   if [[ "$OS" == "linux" ]]; then
     if systemctl is-active --quiet payram-updater 2>/dev/null; then
       log "Stopping payram-updater service..."
-      sudo systemctl stop payram-updater
+      $SUDO systemctl stop payram-updater
     fi
 
     if systemctl is-enabled --quiet payram-updater 2>/dev/null; then
       log "Disabling payram-updater service..."
-      sudo systemctl disable payram-updater
+      $SUDO systemctl disable payram-updater
     fi
 
     # Remove service file
     if [[ -f "$SERVICE_PATH" ]]; then
       log "Removing service file: $SERVICE_PATH"
-      sudo rm -f "$SERVICE_PATH"
-      sudo systemctl daemon-reload
+      $SUDO rm -f "$SERVICE_PATH"
+      $SUDO systemctl daemon-reload
     fi
   elif [[ "$OS" == "darwin" ]]; then
-    if sudo launchctl list com.payram.updater >/dev/null 2>&1; then
+    if $SUDO launchctl list com.payram.updater >/dev/null 2>&1; then
       log "Stopping payram-updater service..."
-      sudo launchctl unload "$SERVICE_PATH" 2>/dev/null || true
+      $SUDO launchctl unload "$SERVICE_PATH" 2>/dev/null || true
     fi
 
     # Remove plist file
     if [[ -f "$SERVICE_PATH" ]]; then
       log "Removing service file: $SERVICE_PATH"
-      sudo rm -f "$SERVICE_PATH"
+      $SUDO rm -f "$SERVICE_PATH"
     fi
 
     # Remove launcher script
     if [[ -f "$LAUNCHER_PATH" ]]; then
       log "Removing launcher script: $LAUNCHER_PATH"
-      sudo rm -f "$LAUNCHER_PATH"
+      $SUDO rm -f "$LAUNCHER_PATH"
     fi
   fi
 
@@ -616,18 +625,18 @@ do_uninstall() {
   for bin in "$INSTALLED_BIN" "$PREVIOUS_BIN" "$STAGED_BIN"; do
     if [[ -f "$bin" ]]; then
       log "Removing binary: $bin"
-      sudo rm -f "$bin"
+      $SUDO rm -f "$bin"
     fi
   done
 
   # Remove config
   if [[ -f "$ENV_PATH" ]]; then
     log "Removing config: $ENV_PATH"
-    sudo rm -f "$ENV_PATH"
+    $SUDO rm -f "$ENV_PATH"
   fi
   if [[ -d "$INSTALLER_BACKUP_DIR" ]]; then
     log "Removing config backups: $INSTALLER_BACKUP_DIR"
-    sudo rm -rf "$INSTALLER_BACKUP_DIR"
+    $SUDO rm -rf "$INSTALLER_BACKUP_DIR"
   fi
 
   # Remove /etc/payram if empty
@@ -636,25 +645,25 @@ do_uninstall() {
   data_dir="$(dirname "$BACKUP_DIR")"
   if [[ -d "$config_dir" ]] && [[ -z "$(ls -A "$config_dir" 2>/dev/null)" ]]; then
     log "Removing empty config directory: $config_dir"
-    sudo rmdir "$config_dir"
+    $SUDO rmdir "$config_dir"
   fi
 
   # Remove state directory
   if [[ -d "$STATE_DIR" ]]; then
     log "Removing state directory: $STATE_DIR"
-    sudo rm -rf "$STATE_DIR"
+    $SUDO rm -rf "$STATE_DIR"
   fi
 
   # Remove backups if requested
   if [[ "$REMOVE_BACKUPS" == "true" ]]; then
     if [[ -d "$BACKUP_DIR" ]]; then
       log "Removing backups directory: $BACKUP_DIR"
-      sudo rm -rf "$BACKUP_DIR"
+      $SUDO rm -rf "$BACKUP_DIR"
     fi
     # Remove /var/lib/payram if empty
     if [[ -d "$data_dir" ]] && [[ -z "$(ls -A "$data_dir" 2>/dev/null)" ]]; then
       log "Removing empty directory: $data_dir"
-      sudo rmdir "$data_dir"
+      $SUDO rmdir "$data_dir"
     fi
   else
     if [[ -d "$BACKUP_DIR" ]]; then
@@ -663,9 +672,9 @@ do_uninstall() {
   fi
 
   # Remove iptables rule if it exists (Linux only)
-  if [[ "$OS" == "linux" ]] && sudo iptables -C INPUT -i docker0 -p tcp --dport 2567 -j ACCEPT 2>/dev/null; then
+  if [[ "$OS" == "linux" ]] && $SUDO iptables -C INPUT -i docker0 -p tcp --dport 2567 -j ACCEPT 2>/dev/null; then
     log "Removing iptables rule for docker0..."
-    sudo iptables -D INPUT -i docker0 -p tcp --dport 2567 -j ACCEPT || true
+    $SUDO iptables -D INPUT -i docker0 -p tcp --dport 2567 -j ACCEPT || true
   fi
 
   log ""
@@ -702,19 +711,26 @@ detect_colima_docker_host() {
 resolve_version() {
   log "Fetching latest version..."
   VERSION="${PAYRAM_UPDATER_VERSION:-}"
+  ASSET="${BIN_NAME}-${OS}-${ARCH}"
+  local release_path
   if [[ -z "$VERSION" ]]; then
-    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest" 2>&1 | \
+    VERSION="$(curl -fsSL --connect-timeout 15 "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest" 2>/dev/null | \
       grep -m1 '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
   fi
 
-  if [[ -z "$VERSION" ]]; then
-    log_error "Failed to detect latest version. Set PAYRAM_UPDATER_VERSION env var to specify manually."
-    exit 1
+  if [[ -n "$VERSION" ]]; then
+    log "Version to install: $VERSION"
+    release_path="download/${VERSION}"
+  else
+    # GitHub's API allows 60 unauthenticated requests an hour per address and
+    # is sometimes blocked; the release download links do not need it. The
+    # binary and its checksum both come from the latest release (a release
+    # published between the two downloads makes the checksum fail, safely).
+    VERSION="latest"
+    log "Could not ask GitHub's API for the latest version; downloading the latest release directly"
+    release_path="latest/download"
   fi
-  log "Version to install: $VERSION"
-
-  ASSET="${BIN_NAME}-${OS}-${ARCH}"
-  DOWNLOAD_URL="${PAYRAM_UPDATER_DOWNLOAD_URL:-https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${VERSION}/${ASSET}}"
+  DOWNLOAD_URL="${PAYRAM_UPDATER_DOWNLOAD_URL:-https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/${release_path}/${ASSET}}"
   CHECKSUM_URL="${PAYRAM_UPDATER_CHECKSUM_URL:-${DOWNLOAD_URL}.sha256}"
 }
 
@@ -771,8 +787,8 @@ verify_checksum() {
 # this machine (right OS/arch, no missing libraries) before anything changes.
 stage_and_test_binary() {
   local output
-  sudo mkdir -p "$INSTALL_DIR"
-  sudo install -m 0755 "$DOWNLOADED_BIN" "$STAGED_BIN"
+  $SUDO mkdir -p "$INSTALL_DIR"
+  $SUDO install -m 0755 "$DOWNLOADED_BIN" "$STAGED_BIN"
   if output="$("$STAGED_BIN" version 2>&1)"; then
     NEW_VERSION="$(echo "$output" | head -n 1)"
   elif "$STAGED_BIN" help >/dev/null 2>&1; then
@@ -789,23 +805,23 @@ stage_and_test_binary() {
 
 # Put back the binary this run replaced. Returns 1 when there is none.
 restore_previous_binary() {
-  if [[ "$BINARY_REPLACED" != "true" || "$PREVIOUS_SAVED" != "true" ]] || ! sudo test -f "$PREVIOUS_BIN"; then
+  if [[ "$BINARY_REPLACED" != "true" || "$PREVIOUS_SAVED" != "true" ]] || ! $SUDO test -f "$PREVIOUS_BIN"; then
     return 1
   fi
-  sudo install -m 0755 "$PREVIOUS_BIN" "$STAGED_BIN"
-  sudo mv -f "$STAGED_BIN" "$INSTALLED_BIN"
+  $SUDO install -m 0755 "$PREVIOUS_BIN" "$STAGED_BIN"
+  $SUDO mv -f "$STAGED_BIN" "$INSTALLED_BIN"
   BINARY_REPLACED=false
   log "Previous binary (version: ${CURRENT_VERSION}) is back at ${INSTALLED_BIN}"
 }
 
 install_binary() {
-  if sudo test -f "$INSTALLED_BIN"; then
-    sudo cp -p "$INSTALLED_BIN" "$PREVIOUS_BIN"
+  if $SUDO test -f "$INSTALLED_BIN"; then
+    $SUDO cp -p "$INSTALLED_BIN" "$PREVIOUS_BIN"
     PREVIOUS_SAVED=true
     log "Kept the current binary as ${PREVIOUS_BIN}"
   fi
   log "Installing binary to ${INSTALLED_BIN}..."
-  sudo mv -f "$STAGED_BIN" "$INSTALLED_BIN"
+  $SUDO mv -f "$STAGED_BIN" "$INSTALLED_BIN"
   BINARY_REPLACED=true
   log "Binary installed successfully"
 }
@@ -830,6 +846,9 @@ Wants=docker.service network-online.target
 Type=simple
 User=root
 Group=root
+# systemd's default PATH has no /snap/bin, where a Docker installed as a snap
+# (offered by Ubuntu Server's installer) puts the docker command.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 EnvironmentFile=/etc/payram/updater.env
 ExecStart=/usr/local/bin/payram-updater serve
 Restart=always
@@ -893,14 +912,14 @@ EOF
 # already has exactly that content; back up the DEST being replaced.
 install_generated_file() {
   local src="$1" dest="$2" mode="$3"
-  if sudo test -f "$dest"; then
-    if sudo cmp -s "$src" "$dest" 2>/dev/null; then
+  if $SUDO test -f "$dest"; then
+    if $SUDO cmp -s "$src" "$dest" 2>/dev/null; then
       log "$dest is up to date"
       return 0
     fi
     backup_file "$dest" 0600
   fi
-  sudo install -m "$mode" "$src" "$dest"
+  $SUDO install -m "$mode" "$src" "$dest"
   log "Wrote $dest"
 }
 
@@ -910,7 +929,7 @@ install_service_files() {
     systemd_unit_content >"${WORK_DIR}/payram-updater.service"
     install_generated_file "${WORK_DIR}/payram-updater.service" "$SERVICE_PATH" 0644
     log "Reloading service manager..."
-    sudo systemctl daemon-reload
+    $SUDO systemctl daemon-reload
   else
     log "Installing launchd plist at $SERVICE_PATH..."
     launchd_launcher_content >"${WORK_DIR}/payram-updater-launcher"
@@ -924,7 +943,7 @@ install_service_files() {
 run_updater_init() {
   local init_out
   log "Running updater init..."
-  if ! init_out=$(sudo env DOCKER_HOST="${DOCKER_HOST:-}" "$INSTALLED_BIN" init --no-autoupdate 2>&1); then
+  if ! init_out=$($SUDO env DOCKER_HOST="${DOCKER_HOST:-}" "$INSTALLED_BIN" init --no-autoupdate 2>&1); then
     echo "$init_out" >&2
     log_error "Initialization failed"
     if restore_previous_binary; then
@@ -970,7 +989,7 @@ discover_payram_container() {
   fi
   repo="$(env_file_value IMAGE_REPO_OVERRIDE)"
   repo="${repo:-${IMAGE_REPO_OVERRIDE:-payramapp/payram}}"
-  sudo "$docker_bin" ps --format '{{.Names}} {{.Image}}' 2>/dev/null | awk -v p="${repo}:" '
+  $SUDO "$docker_bin" ps --format '{{.Names}} {{.Image}}' 2>/dev/null | awk -v p="${repo}:" '
     index($2, p) == 1 {
       tag = substr($2, length(p) + 1)
       # version tags sort above "latest" and other names
@@ -1001,7 +1020,7 @@ check_container_connectivity() {
   fi
 
   target="$(discover_payram_container "$docker_bin")"
-  if [[ -z "$target" ]] || ! sudo "$docker_bin" ps --format '{{.Names}}' 2>/dev/null | grep -qx "$target"; then
+  if [[ -z "$target" ]] || ! $SUDO "$docker_bin" ps --format '{{.Names}}' 2>/dev/null | grep -qx "$target"; then
     log "No running PayRam container found; skipping the container-to-updater connectivity test"
     return 0
   fi
@@ -1010,15 +1029,15 @@ check_container_connectivity() {
   bridge_ip="${bridge_ip:-172.17.0.1}"
   url="http://${bridge_ip}:${UPDATER_HTTP_PORT}/health"
 
-  if ! sudo "$docker_bin" exec "$target" sh -c 'command -v wget || command -v curl' >/dev/null 2>&1; then
+  if ! $SUDO "$docker_bin" exec "$target" sh -c 'command -v wget || command -v curl' >/dev/null 2>&1; then
     log "Container ${target} has neither wget nor curl; skipping the container-to-updater connectivity test"
     return 0
   fi
 
   log "Testing connectivity from container ${target} to the updater (${url})..."
   # Try wget first, then curl
-  if run_with_timeout 5 sudo "$docker_bin" exec "$target" wget -qO- "$url" >/dev/null 2>&1 || \
-     run_with_timeout 5 sudo "$docker_bin" exec "$target" curl -sf "$url" >/dev/null 2>&1; then
+  if run_with_timeout 5 $SUDO "$docker_bin" exec "$target" wget -qO- "$url" >/dev/null 2>&1 || \
+     run_with_timeout 5 $SUDO "$docker_bin" exec "$target" curl -sf "$url" >/dev/null 2>&1; then
     log "Connectivity test passed"
   else
     log ""
@@ -1043,9 +1062,9 @@ start_and_verify_service() {
   if [[ "$OS" == "linux" ]]; then
     log "Enabling payram-updater service..."
     if [[ "$QUIET" == "true" ]]; then
-      sudo systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+      $SUDO systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
     else
-      sudo systemctl enable "$SERVICE_NAME"
+      $SUDO systemctl enable "$SERVICE_NAME"
     fi
   fi
 
@@ -1086,7 +1105,9 @@ main() {
 
   log "Checking dependencies..."
   require curl
-  require sudo
+  if [[ -n "$SUDO" ]]; then
+    require sudo
+  fi
 
   log "Detecting operating system..."
   log "Detected OS: $OS"
@@ -1109,7 +1130,7 @@ main() {
   stage_and_test_binary
 
   local replace_binary="y"
-  if sudo test -f "$INSTALLED_BIN"; then
+  if $SUDO test -f "$INSTALLED_BIN"; then
     # Releases before the version command print their help and exit 1.
     if CURRENT_VERSION="$("$INSTALLED_BIN" version 2>/dev/null)" && [[ -n "$CURRENT_VERSION" ]]; then
       CURRENT_VERSION="$(echo "$CURRENT_VERSION" | head -n 1)"
@@ -1143,8 +1164,11 @@ main() {
   fi
 
   log "Creating required directories..."
-  sudo mkdir -p "$(dirname "$ENV_PATH")"
-  sudo mkdir -p "$STATE_DIR" "$BACKUP_DIR"
+  $SUDO mkdir -p "$(dirname "$ENV_PATH")"
+  $SUDO mkdir -p "$STATE_DIR" "$BACKUP_DIR"
+  # Root only: backups hold the whole payments database, and the state
+  # directory holds the update log and the CLI's token.
+  $SUDO chmod 0700 "$STATE_DIR" "$BACKUP_DIR"
   log "Directories created"
 
   write_env_file
@@ -1152,8 +1176,8 @@ main() {
   # macOS: persist DOCKER_HOST (Colima socket) into the env file so the
   # launchd service (running as root) can reach the user-owned Docker daemon.
   if [[ "$OS" == "darwin" && -n "${DOCKER_HOST:-}" ]]; then
-    if ! sudo grep -q "^DOCKER_HOST=" "$ENV_PATH" 2>/dev/null; then
-      echo "DOCKER_HOST=${DOCKER_HOST}" | sudo tee -a "$ENV_PATH" >/dev/null
+    if ! $SUDO grep -q "^DOCKER_HOST=" "$ENV_PATH" 2>/dev/null; then
+      echo "DOCKER_HOST=${DOCKER_HOST}" | $SUDO tee -a "$ENV_PATH" >/dev/null
       log "macOS: Persisted DOCKER_HOST=$DOCKER_HOST to $ENV_PATH"
     fi
   fi
@@ -1162,7 +1186,7 @@ main() {
 
   log "Checking initialization status..."
   local reinit="n"
-  if sudo test -f "$INIT_CONFIG" && sudo grep -q '"initialized": true' "$INIT_CONFIG"; then
+  if $SUDO test -f "$INIT_CONFIG" && $SUDO grep -q '"initialized": true' "$INIT_CONFIG"; then
     log "Updater already initialized"
 
     if [[ "$FORCE_REINSTALL" == "true" ]]; then

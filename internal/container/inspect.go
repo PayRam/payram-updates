@@ -51,6 +51,10 @@ type RuntimeState struct {
 
 	// Restart policy
 	RestartPolicy RestartPolicy
+
+	// AutoRemove is HostConfig.AutoRemove (`docker run --rm`): Docker deletes
+	// the container as soon as it stops.
+	AutoRemove bool
 }
 
 // PortMapping represents a port mapping from host to container.
@@ -110,6 +114,7 @@ type dockerInspectOutput struct {
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	HostConfig struct {
+		AutoRemove    bool   `json:"AutoRemove"`
 		NetworkMode   string `json:"NetworkMode"`
 		RestartPolicy struct {
 			Name              string `json:"Name"`
@@ -195,6 +200,7 @@ func (i *Inspector) ExtractRuntimeState(ctx context.Context, containerNameOrID s
 
 	// Extract networks
 	state.NetworkMode = data.HostConfig.NetworkMode
+	state.AutoRemove = data.HostConfig.AutoRemove
 	state.Networks = extractNetworks(data.NetworkSettings.Networks, data.HostConfig.NetworkMode)
 
 	// Best effort: the image's own environment, to tell its defaults apart

@@ -170,11 +170,11 @@ func safetyBackupFilename(now time.Time) string {
 	return fmt.Sprintf("payram-backup-%s-%s.dump", now.UTC().Format("20060102-150405"), safetyBackupSuffix)
 }
 
-// secureBackupDir creates the backup directory with mode 0700 and tightens
+// SecureBackupDir creates the backup directory with mode 0700 and tightens
 // an existing one: backups hold the whole payments database. Existing
 // backup files are made 0600 as well. A failed chmod is reported in the log
 // but does not stop a backup.
-func secureBackupDir(dir string, logger Logger) error {
+func SecureBackupDir(dir string, logger Logger) error {
 	if dir == "" {
 		return fmt.Errorf("backup directory is not configured")
 	}
@@ -257,7 +257,7 @@ func (m *Manager) resolveDatabase(ctx context.Context, containerOverride string)
 // 1. If POSTGRES_HOST is localhost/127.0.0.1 → IN_CONTAINER_DB (run pg_dump via docker exec)
 // 2. Else → EXTERNAL_DB (run pg_dump from host)
 func (m *Manager) CreateBackup(ctx context.Context, meta BackupMeta) (*BackupInfo, error) {
-	if err := secureBackupDir(m.Config.Dir, m.Logger); err != nil {
+	if err := SecureBackupDir(m.Config.Dir, m.Logger); err != nil {
 		return nil, err
 	}
 
@@ -366,7 +366,7 @@ func DescribeBackupFile(path string) (BackupListItem, error) {
 // Empty files (a backup that never got written) are not listed.
 // Returns sorted by timestamp DESC (parseable) or file modtime DESC (fallback).
 func (m *Manager) ListBackups() ([]BackupListItem, error) {
-	if err := secureBackupDir(m.Config.Dir, m.Logger); err != nil {
+	if err := SecureBackupDir(m.Config.Dir, m.Logger); err != nil {
 		return nil, err
 	}
 
@@ -809,7 +809,7 @@ func (m *Manager) RestoreBackup(ctx context.Context, backupPath string, opts Res
 
 // dumpSafetyBackup dumps the current database to a safety backup.
 func (m *Manager) dumpSafetyBackup(ctx context.Context, dbCtx dbexec.DBContext, pgExec dbexec.PGExecutor) (string, error) {
-	if err := secureBackupDir(m.Config.Dir, m.Logger); err != nil {
+	if err := SecureBackupDir(m.Config.Dir, m.Logger); err != nil {
 		return "", err
 	}
 	path := filepath.Join(m.Config.Dir, safetyBackupFilename(time.Now()))

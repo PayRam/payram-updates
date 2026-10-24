@@ -150,8 +150,9 @@ func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTa
 	// When both kinds exist, the lowest-version gate wins.
 	// When currentVersion is empty, gate logic is skipped.
 	if mode == jobs.JobModeDashboard && policyData != nil && currentVersion != "" {
+		// "3.9.0-arm64" is the arm64 build of 3.9.0, not a pre-release of it.
 		normalizeVer := func(v string) string {
-			return strings.TrimPrefix(strings.TrimSpace(v), "v")
+			return baseVersionTag(strings.TrimPrefix(strings.TrimSpace(v), "v"))
 		}
 
 		cur, curErr := goversion.NewVersion(normalizeVer(currentVersion))

@@ -313,6 +313,23 @@ var playbooks = map[string]Playbook{
 		PayRamState: PayRamUnchanged,
 	},
 
+	jobs.FailureContainerNotReplaceable: {
+		Code:        jobs.FailureContainerNotReplaceable,
+		Severity:    SeverityManual,
+		Title:       "Container Cannot Be Switched Back",
+		UserMessage: msgUnchanged + "PayRam's container was started with --rm, so Docker deletes it as soon as it stops. The updater only replaces a container it can switch back to if the new version fails, so it refused.",
+		SSHSteps: numbered(
+			stepCheckHealth,
+			"See how the container was started (read-only): docker inspect -f '{{.HostConfig.AutoRemove}} {{.HostConfig.RestartPolicy.Name}}' <container_name>",
+			"If a systemd service starts it (systemctl list-units | grep -i payram), update it the way that service was installed.",
+			"To use the dashboard's Update button instead, recreate the container once without --rm, with the same volumes, ports and environment, and a restart policy such as unless-stopped.",
+			stepContactSupport,
+		),
+		DocsURL:     "https://docs.payram.com/upgrades",
+		DataRisk:    DataRiskNone,
+		PayRamState: PayRamUnchanged,
+	},
+
 	// ---- Failures before PayRam was changed ----
 
 	"POLICY_FETCH_FAILED": {

@@ -436,3 +436,24 @@ func TestState_MissingContainerInEveryDockerWording(t *testing.T) {
 		}
 	}
 }
+
+// TestRedactLine_CleansWhatOlderUpdatersLogged: v0.2.3 logged whole docker
+// command lines, with the hot-wallet key and the database password in them.
+func TestRedactLine_CleansWhatOlderUpdatersLogged(t *testing.T) {
+	cases := map[string]string{
+		"  5. Run new container: docker run -d --name payram -e AES_KEY=6b1f0e1d2c -e POSTGRES_PASSWORD=payram123 -e SERVER=PRODUCTION payramapp/payram:3.8.1": "  5. Run new container: docker run -d --name payram -e AES_KEY=*** -e POSTGRES_PASSWORD=*** -e SERVER=*** payramapp/payram:3.8.1",
+		"Executing: docker run --env=AES_KEY=abc --env POSTGRES_PASSWORD=x img":                                                                                "Executing: docker run --env=AES_KEY=*** --env POSTGRES_PASSWORD=*** img",
+		"sh -c PGPASSWORD=secret pg_dump -h 127.0.0.1":                                                                                                         "sh -c PGPASSWORD=*** pg_dump -h 127.0.0.1",
+		"config: AES_KEY=deadbeef DB_PASSWORD=hunter2 API_TOKEN=t0k":                                                                                           "config: AES_KEY=*** DB_PASSWORD=*** API_TOKEN=***",
+		"Backup created successfully: payram-backup-20261024-to-3.10.0.dump (12.00 MB)":                                                                        "Backup created successfully: payram-backup-20261024-to-3.10.0.dump (12.00 MB)",
+		"-e AES_KEY -e POSTGRES_PASSWORD (names only)":                                                                                                         "-e AES_KEY -e POSTGRES_PASSWORD (names only)",
+	}
+	for in, want := range cases {
+		if got := RedactLine(in); got != want {
+			t.Errorf("RedactLine(%q)\n got %q\nwant %q", in, got, want)
+		}
+	}
+	if got := RedactLines("a -e AES_KEY=1\nb\n"); got != "a -e AES_KEY=***\nb\n" {
+		t.Errorf("RedactLines = %q", got)
+	}
+}

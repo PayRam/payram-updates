@@ -1,11 +1,25 @@
 package container
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/payram/payram-updater/internal/manifest"
 )
+
+// upgradeArgs builds the new container's settings and returns the arguments
+// an update creates it with, under the running container's name.
+func upgradeArgs(builder *DockerRunBuilder, state *RuntimeState, m *manifest.Manifest, tag string) ([]string, error) {
+	if state == nil {
+		return nil, fmt.Errorf("runtime state is required (cannot infer configuration)")
+	}
+	spec, err := builder.BuildContainerSpec(state, m, tag)
+	if err != nil {
+		return nil, err
+	}
+	return spec.CreateArgs(ContainerName(state.Name)), nil
+}
 
 // TestBuildUpgradeArgs_PreservesRuntimeState tests that runtime state is preserved.
 func TestBuildUpgradeArgs_PreservesRuntimeState(t *testing.T) {
@@ -41,7 +55,7 @@ func TestBuildUpgradeArgs_PreservesRuntimeState(t *testing.T) {
 	logger := &mockLogger{}
 	builder := NewDockerRunBuilder(logger)
 
-	args, err := builder.BuildUpgradeArgs(state, m, "1.9.0")
+	args, err := upgradeArgs(builder, state, m, "1.9.0")
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -51,9 +65,9 @@ func TestBuildUpgradeArgs_PreservesRuntimeState(t *testing.T) {
 		t.Error("Container name not preserved")
 	}
 
-	// Check restart policy preserved
-	if !containsArgs(args, "--restart", "unless-stopped") {
-		t.Error("Restart policy not preserved")
+	// Check restart policy preserved (applied when the switch starts it)
+	if spec, _ := builder.BuildContainerSpec(state, m, "1.9.0"); spec.RestartPolicy != "unless-stopped" {
+		t.Errorf("Restart policy not preserved: %q", spec.RestartPolicy)
 	}
 
 	// Check ports preserved
@@ -72,12 +86,19 @@ func TestBuildUpgradeArgs_PreservesRuntimeState(t *testing.T) {
 		t.Error("Bind mount not preserved")
 	}
 
-	// Check env vars preserved
-	if !containsArg(args, "-e", "AES_KEY=secret123") {
-		t.Error("AES_KEY not preserved")
+	// Check env vars preserved: named on the command line, valued in Env
+	spec, _ := builder.BuildContainerSpec(state, m, "1.9.0")
+	for _, pair := range []string{"AES_KEY=secret123", "POSTGRES_PASSWORD=dbsecret", "CUSTOM_VAR=value"} {
+		key := strings.SplitN(pair, "=", 2)[0]
+		if !containsArg(args, "-e", key) {
+			t.Errorf("%s not passed to the new container", key)
+		}
+		if !containsString(spec.Env, pair) {
+			t.Errorf("%s missing from the environment docker gets: %v", pair, spec.Env)
+		}
 	}
-	if !containsArg(args, "-e", "POSTGRES_PASSWORD=dbsecret") {
-		t.Error("POSTGRES_PASSWORD not preserved")
+	if joined := strings.Join(args, " "); strings.Contains(joined, "secret123") || strings.Contains(joined, "dbsecret") {
+		t.Errorf("a secret value is on the docker command line: %s", joined)
 	}
 
 	// Check network preserved
@@ -124,7 +145,7 @@ func TestBuildUpgradeArgs_AddsManifestRequirements(t *testing.T) {
 	logger := &mockLogger{}
 	builder := NewDockerRunBuilder(logger)
 
-	args, err := builder.BuildUpgradeArgs(state, m, "1.9.0")
+	args, err := upgradeArgs(builder, state, m, "1.9.0")
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -178,7 +199,7 @@ func TestBuildUpgradeArgs_OnlyImageChanges(t *testing.T) {
 	logger := &mockLogger{}
 	builder := NewDockerRunBuilder(logger)
 
-	args, err := builder.BuildUpgradeArgs(state, m, "2.0.0")
+	args, err := upgradeArgs(builder, state, m, "2.0.0")
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -193,8 +214,8 @@ func TestBuildUpgradeArgs_OnlyImageChanges(t *testing.T) {
 	if !containsArgs(args, "--name", "payram") {
 		t.Error("Container name changed")
 	}
-	if !containsArgs(args, "--restart", "always") {
-		t.Error("Restart policy changed")
+	if spec, _ := builder.BuildContainerSpec(state, m, "2.0.0"); spec.RestartPolicy != "always" {
+		t.Errorf("Restart policy changed: %q", spec.RestartPolicy)
 	}
 	if !containsArg(args, "-p", "8080:80/tcp") {
 		t.Error("Port changed")
@@ -211,7 +232,7 @@ func TestBuildUpgradeArgs_NilRuntimeState(t *testing.T) {
 	logger := &mockLogger{}
 	builder := NewDockerRunBuilder(logger)
 
-	_, err := builder.BuildUpgradeArgs(nil, m, "1.9.0")
+	_, err := upgradeArgs(builder, nil, m, "1.9.0")
 	if err == nil {
 		t.Fatal("Expected error for nil runtime state, got nil")
 	}
@@ -231,7 +252,7 @@ func TestBuildUpgradeArgs_NilManifest(t *testing.T) {
 	logger := &mockLogger{}
 	builder := NewDockerRunBuilder(logger)
 
-	_, err := builder.BuildUpgradeArgs(state, nil, "1.9.0")
+	_, err := upgradeArgs(builder, state, nil, "1.9.0")
 	if err == nil {
 		t.Fatal("Expected error for nil manifest, got nil")
 	}
@@ -256,7 +277,7 @@ func TestBuildUpgradeArgs_EmptyImageTag(t *testing.T) {
 	logger := &mockLogger{}
 	builder := NewDockerRunBuilder(logger)
 
-	_, err := builder.BuildUpgradeArgs(state, m, "")
+	_, err := upgradeArgs(builder, state, m, "")
 	if err == nil {
 		t.Fatal("Expected error for empty image tag, got nil")
 	}
@@ -281,7 +302,7 @@ func TestBuildUpgradeArgs_MissingContainerName(t *testing.T) {
 	logger := &mockLogger{}
 	builder := NewDockerRunBuilder(logger)
 
-	_, err := builder.BuildUpgradeArgs(state, m, "1.9.0")
+	_, err := upgradeArgs(builder, state, m, "1.9.0")
 	if err == nil {
 		t.Fatal("Expected error for missing container name, got nil")
 	}
@@ -321,13 +342,17 @@ func TestBuildUpgradeArgs_RestartPolicyFormatting(t *testing.T) {
 			logger := &mockLogger{}
 			builder := NewDockerRunBuilder(logger)
 
-			args, err := builder.BuildUpgradeArgs(state, m, "1.1")
+			spec, err := builder.BuildContainerSpec(state, m, "1.1")
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
 
-			if !containsArgs(args, "--restart", tt.expected) {
-				t.Errorf("Expected restart policy '%s', not found in args", tt.expected)
+			if spec.RestartPolicy != tt.expected {
+				t.Errorf("restart policy = %q, want %q", spec.RestartPolicy, tt.expected)
+			}
+			// Created with "no"; the switch applies the policy when it starts it.
+			if !containsArgs(spec.CreateArgs("test-next"), "--restart", "no") {
+				t.Errorf("the new container must be created with restart policy no: %v", spec.CreateArgs("test-next"))
 			}
 		})
 	}
@@ -373,7 +398,7 @@ func TestBuildUpgradeArgs_PortFormatting(t *testing.T) {
 			logger := &mockLogger{}
 			builder := NewDockerRunBuilder(logger)
 
-			args, err := builder.BuildUpgradeArgs(state, m, "1.1")
+			args, err := upgradeArgs(builder, state, m, "1.1")
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
@@ -430,7 +455,7 @@ func TestBuildUpgradeArgs_MountFormatting(t *testing.T) {
 			logger := &mockLogger{}
 			builder := NewDockerRunBuilder(logger)
 
-			args, err := builder.BuildUpgradeArgs(state, m, "1.1")
+			args, err := upgradeArgs(builder, state, m, "1.1")
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
@@ -460,7 +485,7 @@ func TestBuildUpgradeArgs_NetworkPreservation(t *testing.T) {
 	logger := &mockLogger{}
 	builder := NewDockerRunBuilder(logger)
 
-	args, err := builder.BuildUpgradeArgs(state, m, "1.1")
+	args, err := upgradeArgs(builder, state, m, "1.1")
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -488,7 +513,7 @@ func TestBuildUpgradeArgs_SkipsBridgeNetwork(t *testing.T) {
 	logger := &mockLogger{}
 	builder := NewDockerRunBuilder(logger)
 
-	args, err := builder.BuildUpgradeArgs(state, m, "1.1")
+	args, err := upgradeArgs(builder, state, m, "1.1")
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -527,6 +552,15 @@ func TestNewDockerRunBuilder_NilLogger(t *testing.T) {
 }
 
 // Helper functions
+
+func containsString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
 
 func containsArgs(args []string, flag, value string) bool {
 	for i, arg := range args {
@@ -582,7 +616,7 @@ func TestBuildUpgradeArgs_SkipsEmptyMounts(t *testing.T) {
 	logger := &mockLogger{}
 	builder := NewDockerRunBuilder(logger)
 
-	args, err := builder.BuildUpgradeArgs(state, m, "1.1.0")
+	args, err := upgradeArgs(builder, state, m, "1.1.0")
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -647,7 +681,7 @@ func TestBuildUpgradeArgs_DeduplicatesMounts(t *testing.T) {
 	logger := &mockLogger{}
 	builder := NewDockerRunBuilder(logger)
 
-	args, err := builder.BuildUpgradeArgs(state, m, "1.1.0")
+	args, err := upgradeArgs(builder, state, m, "1.1.0")
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -744,7 +778,7 @@ func TestBuildUpgradeArgs_NoInvalidMountSpecs(t *testing.T) {
 			logger := &mockLogger{}
 			builder := NewDockerRunBuilder(logger)
 
-			args, err := builder.BuildUpgradeArgs(state, m, "1.1")
+			args, err := upgradeArgs(builder, state, m, "1.1")
 			if err != nil {
 				t.Fatalf("Expected no error, got: %v", err)
 			}
@@ -799,7 +833,7 @@ func TestBuildUpgradeArgs_DropsDatabasePort(t *testing.T) {
 		},
 	}
 
-	args, err := NewDockerRunBuilder(&mockLogger{}).BuildUpgradeArgs(state, m, "3.10.0")
+	args, err := upgradeArgs(NewDockerRunBuilder(&mockLogger{}), state, m, "3.10.0")
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -857,25 +891,33 @@ func TestBuildCreateArgs_RecreatesTheContainerFaithfully(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildContainerSpec: %v", err)
 	}
-	args := strings.Join(builder.BuildCreateArgs(spec, "payram-next"), " ")
+	args := strings.Join(spec.CreateArgs("payram-next"), " ")
 
 	for _, want := range []string{
-		"create --name payram-next ",
-		"--restart unless-stopped",
+		"create --name payram-next --restart no ",
 		"-p 443:443/tcp",
 		"-p 127.0.0.1:8080:8080/tcp",
 		"-p [::1]:8443:8443/tcp",
 		"-v payram-postgres-data:/var/lib/payram/db",
 		"-v /root/payram/log:/var/log:rw",
-		"-e AES_KEY=secret",
-		"-e POSTGRES_USER=payram",
+		"-e AES_KEY ",
+		"-e POSTGRES_USER ",
 		"--network payramnet",
 	} {
 		if !strings.Contains(args, want) {
 			t.Errorf("create args missing %q:\n%s", want, args)
 		}
 	}
-	if strings.Contains(args, "PATH=") {
+	if strings.Contains(args, "secret") {
+		t.Errorf("the AES key's value is on the docker command line:\n%s", args)
+	}
+	if spec.RestartPolicy != "unless-stopped" {
+		t.Errorf("restart policy = %q, want unless-stopped for the switch to apply", spec.RestartPolicy)
+	}
+	if want := []string{"AES_KEY=secret", "POSTGRES_USER=payram"}; strings.Join(spec.Env, " ") != strings.Join(want, " ") {
+		t.Errorf("env = %v, want %v (and not the old image's PATH)", spec.Env, want)
+	}
+	if strings.Contains(args, "PATH") {
 		t.Errorf("the old image's default PATH must be left to the new image:\n%s", args)
 	}
 	if strings.Contains(args, "/var/lib/docker/volumes") {
@@ -886,14 +928,6 @@ func TestBuildCreateArgs_RecreatesTheContainerFaithfully(t *testing.T) {
 	}
 	if len(spec.ExtraNetworks) != 1 || spec.ExtraNetworks[0] != "monitoring" {
 		t.Errorf("extra networks = %v, want [monitoring]", spec.ExtraNetworks)
-	}
-
-	run, err := builder.BuildUpgradeArgs(state, m, "3.10.0")
-	if err != nil {
-		t.Fatalf("BuildUpgradeArgs: %v", err)
-	}
-	if got := strings.Join(run[:4], " "); got != "run -d --name payram" {
-		t.Errorf("run args start = %q, want run -d --name payram", got)
 	}
 }
 
@@ -915,5 +949,48 @@ func TestBuildContainerSpec_HostNetworkKeepsHostMode(t *testing.T) {
 	args := strings.Join(spec.Options, " ")
 	if !strings.Contains(args, "--network host") || strings.Contains(args, "-p ") {
 		t.Errorf("host network container rebuilt wrongly: %s", args)
+	}
+}
+
+// TestBuildContainerSpec_SecretsTravelInTheEnvironmentOnly: values go to
+// docker through its environment, except settings docker itself reads,
+// which would steer docker (another daemon, config or proxy) if put there.
+func TestBuildContainerSpec_SecretsTravelInTheEnvironmentOnly(t *testing.T) {
+	state := &RuntimeState{
+		Name:  "payram",
+		Image: "payramapp/payram:3.9.0",
+		Env: []string{
+			"AES_KEY=hot-wallet-key",
+			"POSTGRES_PASSWORD=db-pass",
+			"SSL_CERT_PATH=",
+			"HTTPS_PROXY=http://user:proxy-pass@proxy:3128",
+			"HOME=/srv/payram",
+			"DOCKER_HOST=tcp://elsewhere:2375",
+		},
+	}
+	m := &manifest.Manifest{Image: manifest.Image{Repo: "payramapp/payram"}}
+	spec, err := NewDockerRunBuilder(&mockLogger{}).BuildContainerSpec(state, m, "3.10.0")
+	if err != nil {
+		t.Fatalf("BuildContainerSpec: %v", err)
+	}
+	args := strings.Join(spec.CreateArgs("payram-next"), " ")
+	for _, secret := range []string{"hot-wallet-key", "db-pass", "proxy-pass"} {
+		if strings.Contains(args, secret) {
+			t.Errorf("%s is on the docker command line: %s", secret, args)
+		}
+	}
+	for _, named := range []string{"-e AES_KEY ", "-e POSTGRES_PASSWORD ", "-e SSL_CERT_PATH ", "-e HTTPS_PROXY "} {
+		if !strings.Contains(args, named) {
+			t.Errorf("args lack %q: %s", named, args)
+		}
+	}
+	for _, inline := range []string{"-e HOME=/srv/payram", "-e DOCKER_HOST=tcp://elsewhere:2375"} {
+		if !strings.Contains(args, inline) {
+			t.Errorf("args lack %q (docker reads it, so it must not go in its environment): %s", inline, args)
+		}
+	}
+	want := []string{"AES_KEY=hot-wallet-key", "POSTGRES_PASSWORD=db-pass", "SSL_CERT_PATH=", "HTTPS_PROXY=http://user:proxy-pass@proxy:3128"}
+	if strings.Join(spec.Env, "|") != strings.Join(want, "|") {
+		t.Errorf("env = %v, want %v", spec.Env, want)
 	}
 }

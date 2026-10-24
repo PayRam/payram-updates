@@ -267,3 +267,31 @@ func TestStore_FilesAreRootOnly(t *testing.T) {
 		t.Errorf("job dir mode = %o, want 700", perm)
 	}
 }
+
+func TestStore_RewriteLogs_CleansLinesAndKeepsTheRest(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	store.AppendLog("first line")
+	store.AppendLog("docker run -e AES_KEY=secret img")
+	store.AppendLog("last line")
+
+	err := store.RewriteLogs(func(line string) string { return strings.ReplaceAll(line, "secret", "***") })
+	if err != nil {
+		t.Fatalf("RewriteLogs: %v", err)
+	}
+	logs, _ := store.ReadLogs()
+	if logs != "first line\ndocker run -e AES_KEY=*** img\nlast line\n" {
+		t.Fatalf("logs = %q", logs)
+	}
+	info, err := os.Stat(filepath.Join(dir, "jobs", "latest", "logs.txt"))
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("rewritten log mode = %v, %v; want 0600", info.Mode().Perm(), err)
+	}
+	// Nothing to change, nothing written; no log at all is fine too.
+	if err := store.RewriteLogs(func(line string) string { return line }); err != nil {
+		t.Fatalf("RewriteLogs without changes: %v", err)
+	}
+	if err := NewStore(t.TempDir()).RewriteLogs(func(line string) string { return "x" }); err != nil {
+		t.Fatalf("RewriteLogs without a log: %v", err)
+	}
+}

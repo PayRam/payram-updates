@@ -17,6 +17,7 @@ import (
 
 	goversion "github.com/hashicorp/go-version"
 	"github.com/payram/payram-updater/internal/backup"
+	"github.com/payram/payram-updater/internal/cli"
 	"github.com/payram/payram-updater/internal/config"
 	"github.com/payram/payram-updater/internal/container"
 	"github.com/payram/payram-updater/internal/coreclient"
@@ -76,6 +77,13 @@ type Server struct {
 	coreURLMu sync.Mutex
 	coreURL   string
 	coreURLAt time.Time
+
+	// cliToken is the secret root's payram-updater command sends to be
+	// granted manual mode (see cli.EnsureToken). Empty: manual mode is off.
+	cliToken string
+
+	// versionLookup replaces lookupCurrentVersion in tests.
+	versionLookup func(ctx context.Context) string
 }
 
 // New creates a new HTTP server instance. It does not look for PayRam yet:
@@ -182,6 +190,13 @@ func (s *Server) Start() error {
 
 	serverErrors := make(chan error, 2)
 
+	s.secureStoredFiles()
+	if token, err := cli.EnsureToken(s.config.StateDir); err != nil {
+		logger.Warnf("Server", "Start", "Manual mode is unavailable: %v (dashboard updates are not affected)", err)
+	} else {
+		s.cliToken = token
+	}
+
 	listener, err := net.Listen("tcp", s.httpServer.Addr)
 	if err != nil {
 		return fmt.Errorf("failed to create listener: %w", err)
@@ -195,12 +210,14 @@ func (s *Server) Start() error {
 	go s.serveOnDockerBridge(backgroundCtx, serverErrors)
 
 	// An updater that stopped mid-update left its job behind: finish or
-	// reverse it before taking new work.
-	go s.repairInterruptedUpgrade(backgroundCtx)
-
-	if s.config.AutoUpdateEnabled {
-		go s.startAutoUpdateLoop(backgroundCtx)
-	}
+	// reverse it before taking new work. Auto-update starts only after the
+	// repair, so it can never start an update on top of the interrupted one.
+	go func() {
+		s.repairInterruptedUpgrade(backgroundCtx)
+		if s.config.AutoUpdateEnabled {
+			s.startAutoUpdateLoop(backgroundCtx)
+		}
+	}()
 
 	select {
 	case err := <-serverErrors:
@@ -236,6 +253,24 @@ func (s *Server) Start() error {
 
 	logger.Infof("Server", "Start", "Server stopped gracefully")
 	return nil
+}
+
+// secureStoredFiles makes what the updater keeps on disk root-only before it
+// serves anything. Updaters up to v0.2.3 logged docker command lines with
+// AES_KEY in them (the dashboard shows that log), and left backups, which
+// hold the whole payments database, readable by every user on the server
+// until the next backup was taken. (The state directory's own files are
+// root-only already, and the directory itself may be shared, so it is left
+// as it is; the installer restricts its default one.)
+func (s *Server) secureStoredFiles() {
+	if err := s.jobStore.RewriteLogs(dockerexec.RedactLine); err != nil {
+		logger.Warnf("Server", "secureStoredFiles", "Could not clean the update log of secret values: %v", err)
+	}
+	if s.config.Backup.Dir != "" {
+		if err := backup.SecureBackupDir(s.config.Backup.Dir, logger.StdLogger()); err != nil {
+			logger.Warnf("Server", "secureStoredFiles", "Could not restrict the backup folder to root: %v", err)
+		}
+	}
 }
 
 // serveOnDockerBridge listens on the docker0 address the PayRam container
@@ -351,6 +386,10 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 		logger.Error("Server", "runAutoUpdateOnce", err)
 		return
 	}
+	if existingJob != nil && existingJob.IsActive() {
+		logger.Warnf("Server", "runAutoUpdateOnce", "Auto update: update %s is still marked %s, skipping", existingJob.JobID, existingJob.State)
+		return
+	}
 	if existingJob != nil && existingJob.State == jobs.JobStateFailed {
 		logger.Warnf("Server", "runAutoUpdateOnce", "Auto update: last job failed (%s), skipping", existingJob.FailureCode)
 		return
@@ -372,16 +411,9 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	}
 	initVersion := strings.TrimSpace(policyData.UpdaterAPIInitVersion)
 
-	containerName, err := s.discoverContainerName(ctx)
-	if err != nil {
-		logger.Error("Server", "runAutoUpdateOnce", err)
-		return
-	}
-
-	// Fetch current version (API or label fallback)
-	versionCtx, cancel := context.WithTimeout(ctx, time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
-	defer cancel()
-	currentVersion, _, err := s.resolveCoreVersion(versionCtx, containerName, initVersion)
+	// Unlike a dashboard request, auto-update does not go ahead without
+	// knowing what runs.
+	currentVersion, err := s.runningVersion(ctx, initVersion)
 	if err != nil {
 		logger.Error("Server", "runAutoUpdateOnce", err)
 		return

@@ -63,52 +63,34 @@ func NewDockerRunBuilder(logSink Logger) *DockerRunBuilder {
 	return &DockerRunBuilder{logger: logSink}
 }
 
-// BuildUpgradeArgs constructs `docker run -d --name <name> ...` arguments for
-// an upgrade.
-//
-// ALGORITHM:
-//  1. Extract runtime state from running container (docker inspect)
-//  2. Reconcile with manifest requirements (additive only)
-//  3. Build docker run args preserving ALL runtime configuration
-//  4. Change ONLY the image tag
-//
-// Parameters:
-//   - runtimeState: Current container configuration from docker inspect
-//   - manifest: Manifest with minimum requirements (additive overlay)
-//   - newImageTag: New image tag to use (e.g., "1.9.0")
-//
-// Returns:
-//   - Docker run arguments ready for execution
-//   - Error if reconciliation fails or required data is missing
-func (b *DockerRunBuilder) BuildUpgradeArgs(
-	runtimeState *RuntimeState,
-	manifest *manifest.Manifest,
-	newImageTag string,
-) ([]string, error) {
-	if runtimeState == nil {
-		return nil, fmt.Errorf("runtime state is required (cannot infer configuration)")
-	}
-	spec, err := b.BuildContainerSpec(runtimeState, manifest, newImageTag)
-	if err != nil {
-		return nil, err
-	}
-	return append([]string{"run", "-d", "--name", ContainerName(runtimeState.Name)}, spec.Options...), nil
-}
-
-// ContainerSpec is everything needed to recreate a container under any name:
-// the options for `docker create`/`docker run` (ending with the image), and
-// the networks to attach after creation (docker can only attach one at create).
+// ContainerSpec is everything needed to recreate a container under any name.
+// Options are the `docker create` options, ending with the image. They name
+// each environment variable (`-e KEY`) without its value: the values (AES_KEY,
+// the database password) are in Env and must reach docker through its own
+// environment, never its command line, which every user on the server can
+// read (`ps`) while the command runs.
 type ContainerSpec struct {
-	Options       []string
+	Options []string
+	// Env is KEY=VALUE for every `-e KEY` in Options.
+	Env []string
+	// RestartPolicy is the running container's, for the new one to get once
+	// it takes over (it is created with "no", see CreateArgs).
+	RestartPolicy string
+	// ExtraNetworks are attached after creation (docker create attaches one).
 	ExtraNetworks []string
 	Image         string
 }
 
-// BuildCreateArgs constructs `docker create --name <name> ...` arguments, so
-// the new version's container can be created (and its image, mounts and
-// network checked) while the current one keeps running.
-func (b *DockerRunBuilder) BuildCreateArgs(spec *ContainerSpec, name string) []string {
-	return append([]string{"create", "--name", name}, spec.Options...)
+// CreateArgs returns `docker create --name <name> ...` arguments, so the new
+// version's container can be created (and its image, mounts and network
+// checked) while the current one keeps running. It is created with restart
+// policy "no": until it is started in the old one's place it must never start
+// by itself (two PayRam containers on one data folder would run two Postgres
+// servers on the same files). The switch gives it RestartPolicy when it
+// starts it. Run it with Env as the docker command's environment.
+func (s *ContainerSpec) CreateArgs(name string) []string {
+	args := []string{"create", "--name", name, "--restart", "no"}
+	return append(args, s.Options...)
 }
 
 // BuildContainerSpec reconciles the runtime state with the manifest and builds
@@ -148,9 +130,8 @@ func (b *DockerRunBuilder) BuildContainerSpec(
 
 	var args []string
 
-	// Restart policy (PRESERVED from runtime state)
+	// Restart policy (PRESERVED from runtime state, applied at the switch)
 	restartPolicy := FormatRestartPolicy(runtimeState.RestartPolicy)
-	args = append(args, "--restart", restartPolicy)
 	b.logger.Printf("Restart policy: %s (preserved from runtime)", restartPolicy)
 
 	// Network mode first: a host-network container publishes no ports.
@@ -236,16 +217,26 @@ func (b *DockerRunBuilder) BuildContainerSpec(
 	for _, env := range runtimeState.ImageEnv {
 		imageDefaults[env] = true
 	}
-	passedEnv := 0
-	for _, env := range reconciled.Env {
-		if imageDefaults[env] {
+	var env []string
+	for _, pair := range reconciled.Env {
+		if imageDefaults[pair] {
 			continue
 		}
-		args = append(args, "-e", env)
-		passedEnv++
+		key, _, hasValue := strings.Cut(pair, "=")
+		if !hasValue || key == "" {
+			continue
+		}
+		if dockerCommandReads(key) {
+			// Set in docker's environment, it would change how docker
+			// itself runs (which daemon, config or proxy it uses).
+			args = append(args, "-e", pair)
+			continue
+		}
+		args = append(args, "-e", key)
+		env = append(env, pair)
 	}
 	b.logger.Printf("Environment variables: %d passed (%d from runtime, %d added from manifest, %d left to the new image's defaults)",
-		passedEnv, len(runtimeState.Env), reconciled.AddedEnvs, len(reconciled.Env)-passedEnv)
+		len(env), len(runtimeState.Env), reconciled.AddedEnvs, len(reconciled.Env)-len(env))
 
 	// Networks (PRESERVED from runtime state). docker create attaches one
 	// network; the others are connected right after.
@@ -278,7 +269,35 @@ func (b *DockerRunBuilder) BuildContainerSpec(
 	args = append(args, newImage)
 	b.logger.Printf("Image: %s (UPGRADED from %s)", newImage, runtimeState.Image)
 
-	return &ContainerSpec{Options: args, ExtraNetworks: extraNetworks, Image: newImage}, nil
+	return &ContainerSpec{Options: args, Env: env, RestartPolicy: restartPolicy, ExtraNetworks: extraNetworks, Image: newImage}, nil
+}
+
+// dockerCommandReads reports whether the docker command itself reads an
+// environment variable named key to decide which daemon, context, config or
+// TLS files it uses (and HOME, where its config lives). Such a setting of
+// PayRam's container stays on the command line: put in docker's environment,
+// it would steer docker itself. None of them is a secret PayRam keeps.
+// (Proxy settings, which can carry a password, go through the environment:
+// docker does not use a proxy to reach its local daemon.)
+func dockerCommandReads(key string) bool {
+	switch strings.ToUpper(key) {
+	case "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_CERT_PATH",
+		"DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_API_VERSION", "DOCKER_DEFAULT_PLATFORM",
+		"DOCKER_CONTENT_TRUST", "DOCKER_CONTENT_TRUST_SERVER":
+		return true
+	}
+	return false
+}
+
+// CheckReplaceable refuses a container an update could not switch back from.
+// A container started with --rm (as some systemd units do) is deleted by
+// Docker the moment it stops, so if the new version failed there would be no
+// old container to put back. It is checked before anything is changed.
+func CheckReplaceable(state *RuntimeState) error {
+	if state.AutoRemove {
+		return fmt.Errorf("container %s was started with --rm (often by a systemd service), so Docker deletes it as soon as it stops and the updater could not switch back if the new version failed. Update it the way it was installed, or recreate it once without --rm (same volumes and settings) to use the dashboard's Update button", ContainerName(state.Name))
+	}
+	return nil
 }
 
 // ContainerName returns a container name without docker inspect's leading "/".

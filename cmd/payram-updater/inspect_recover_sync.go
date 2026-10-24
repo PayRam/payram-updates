@@ -125,7 +125,7 @@ func runInspect() {
 
 	// Initialize job store (read-only)
 	jobStore := jobs.NewStore(cfg.StateDir)
-	latestJob, _ := jobStore.LoadLatest()
+	latestJob := loadLatestJob(jobStore)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
@@ -213,7 +213,7 @@ func runRecover() {
 	}
 
 	jobStore := jobs.NewStore(cfg.StateDir)
-	latestJob, _ := jobStore.LoadLatest()
+	latestJob := loadLatestJob(jobStore)
 
 	// recover only reads container state; it never stops, removes or starts one.
 	runner := &dockerexec.Runner{DockerBin: cfg.DockerBin, Logger: log.Default()}

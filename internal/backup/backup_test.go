@@ -645,7 +645,7 @@ func TestSecureBackupDir_TightensDirectoryAndFiles(t *testing.T) {
 	os.WriteFile(old, []byte("data"), 0644)
 	os.WriteFile(other, []byte("data"), 0644)
 
-	if err := secureBackupDir(dir, &mockLogger{}); err != nil {
+	if err := SecureBackupDir(dir, &mockLogger{}); err != nil {
 		t.Fatal(err)
 	}
 	if info, _ := os.Stat(dir); info.Mode().Perm() != 0700 {

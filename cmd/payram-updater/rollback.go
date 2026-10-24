@@ -66,6 +66,9 @@ func beginContainerRollback(ctx context.Context, cfg *config.Config, targetVersi
 	if err != nil {
 		return nil, fmt.Errorf("could not read PayRam's container, so nothing was changed: %w", err)
 	}
+	if err := container.CheckReplaceable(runtimeState); err != nil {
+		return nil, fmt.Errorf("nothing was changed: %w", err)
+	}
 	repo, currentTag := container.SplitImage(runtimeState.Image)
 	tag := targetVersion
 	if strings.HasSuffix(currentTag, "-arm64") && !strings.HasSuffix(tag, "-arm64") {
@@ -110,7 +113,7 @@ func beginContainerRollback(ctx context.Context, cfg *config.Config, targetVersi
 
 	err = r.sw.ClearLeftovers(ctx, name)
 	if err == nil {
-		err = r.sw.CreateNext(ctx, job, builder.BuildCreateArgs(spec, switchover.NextName(name)), spec.ExtraNetworks)
+		err = r.sw.CreateNext(ctx, job, spec)
 	}
 	if err == nil {
 		err = r.sw.Cutover(ctx, job, runtimeState.Image, container.FormatRestartPolicy(runtimeState.RestartPolicy))
@@ -132,16 +135,21 @@ func beginContainerRollback(ctx context.Context, cfg *config.Config, targetVersi
 func (r *containerRollback) ContainerName() string { return r.job.ContainerName }
 
 // Commit makes the rollback final: the newer container is removed (its image
-// stays) and the job is marked complete.
+// stays) and the job is marked complete. It finishes even after Ctrl-C or a
+// closed SSH session (the restore's context is cancelled by then).
 func (r *containerRollback) Commit(ctx context.Context) {
+	ctx = context.WithoutCancel(ctx)
 	defer r.stop()
 	r.sw.Finish(ctx, r.job)
 	r.finish(jobs.JobStateReady, "", "", fmt.Sprintf("Rollback to %s completed successfully", r.job.ResolvedTarget))
 }
 
 // Revert puts the newer container back (the database was not restored, so
-// it still matches the newer version).
+// it still matches the newer version). It runs to the end even when ctx was
+// cancelled: a Ctrl-C, a closed SSH session or a stop signal is exactly when
+// PayRam must be switched back, not left half-switched.
 func (r *containerRollback) Revert(ctx context.Context) error {
+	ctx = context.WithoutCancel(ctx)
 	defer r.stop()
 	if err := r.sw.Restore(ctx, r.job); err != nil {
 		r.finish(jobs.JobStateFailed, jobs.FailureRollbackFailed, "",

@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/payram/payram-updater/internal/cli"
 	"github.com/payram/payram-updater/internal/config"
 	"github.com/payram/payram-updater/internal/container"
 	"github.com/payram/payram-updater/internal/jobs"
@@ -77,22 +79,67 @@ func TestPlanUpgrade_ImageRepoOverrideIsAllowed(t *testing.T) {
 	}
 }
 
-func TestResolveMode_ManualOnlyFromThisMachine(t *testing.T) {
+func TestResolveMode_ManualOnlyForRootsCLI(t *testing.T) {
 	cases := []struct {
 		mode, source string
-		local        bool
+		rootCLI      bool
 		want         jobs.JobMode
+		wantErr      error
 	}{
-		{"MANUAL", "CLI", true, jobs.JobModeManual},
-		{"MANUAL", "CLI", false, jobs.JobModeDashboard}, // the container claiming to be the CLI
-		{"MANUAL", "DASHBOARD", true, jobs.JobModeDashboard},
-		{"", "CLI", true, jobs.JobModeDashboard},
+		{"MANUAL", "CLI", true, jobs.JobModeManual, nil},
+		// any other program on the server, or the container, claiming to be the CLI
+		{"MANUAL", "CLI", false, "", errManualNeedsRoot},
+		{"manual", "cli", false, "", errManualNeedsRoot},
+		{"MANUAL", "DASHBOARD", true, jobs.JobModeDashboard, nil},
+		{"MANUAL", "", false, jobs.JobModeDashboard, nil},
+		{"", "CLI", true, jobs.JobModeDashboard, nil},
+		{"", "CLI", false, jobs.JobModeDashboard, nil},
+		{"DASHBOARD", "CLI", false, jobs.JobModeDashboard, nil},
 	}
 	for _, tc := range cases {
-		got, err := resolveMode(tc.mode, tc.source, tc.local)
-		if err != nil || got != tc.want {
-			t.Errorf("resolveMode(%q, %q, local=%v) = %v, %v; want %v", tc.mode, tc.source, tc.local, got, err, tc.want)
+		got, err := resolveMode(tc.mode, tc.source, tc.rootCLI)
+		if got != tc.want || !errors.Is(err, tc.wantErr) {
+			t.Errorf("resolveMode(%q, %q, rootCLI=%v) = %v, %v; want %v, %v", tc.mode, tc.source, tc.rootCLI, got, err, tc.want, tc.wantErr)
 		}
+	}
+}
+
+// TestHandleUpgradePlan_ManualModeNeedsRootsToken: manual mode skips the
+// release policy, so a program on this machine gets it only with the token
+// root's CLI reads from the state directory.
+func TestHandleUpgradePlan_ManualModeNeedsRootsToken(t *testing.T) {
+	policyPath := buildPolicyFile(t, "3.10.0", []string{"3.10.0"}, nil)
+	srv := newTestServer(t, policyPath, writeManifest(t, "payramapp/payram"))
+	srv.jobStore = jobs.NewStore(t.TempDir())
+	srv.cliToken = "root-only-token"
+	srv.versionLookup = func(context.Context) string { return "3.10.0" }
+
+	plan := func(remote, token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/upgrade/plan", strings.NewReader(`{"mode":"MANUAL","source":"CLI","requestedTarget":"3.9.0"}`))
+		req.RemoteAddr = remote
+		if token != "" {
+			req.Header.Set(cli.TokenHeader, token)
+		}
+		w := httptest.NewRecorder()
+		srv.HandleUpgradePlan()(w, req)
+		return w
+	}
+
+	for _, tc := range []struct{ name, remote, token string }{
+		{"local program without the token", "127.0.0.1:40000", ""},
+		{"local program with a wrong token", "127.0.0.1:40000", "guess"},
+		{"the container with the token", "172.17.0.2:40000", "root-only-token"},
+	} {
+		if w := plan(tc.remote, tc.token); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "sudo") {
+			t.Errorf("%s: status %d %q, want 403 telling the operator to use sudo", tc.name, w.Code, w.Body.String())
+		}
+	}
+
+	w := plan("127.0.0.1:40000", "root-only-token")
+	var resp PlanResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if w.Code != http.StatusOK || resp.Mode != string(jobs.JobModeManual) {
+		t.Fatalf("root's CLI: status %d, mode %q (%s); want a MANUAL plan", w.Code, resp.Mode, resp.Message)
 	}
 }
 

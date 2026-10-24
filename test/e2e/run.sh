@@ -25,12 +25,17 @@ BIN="$E/payram-updater"
 NAME=payram-e2e
 UPORT=25670
 HPORT=18080
+SPORT=18443
+AES=6b1f0e1d2c3b4a5968778695a4b3c2d1e0f1a2b3c4d5e6f708192a3b4c5d6e7f
+HEALTH_URL="http://127.0.0.1:$HPORT"
 REAL_DOCKER="${REAL_DOCKER:-$(command -v docker)}"
 export REAL_DOCKER
 OLD="${E2E_OLD:-3.8.1}"
 NEW="${E2E_NEW:-3.10.0}"
 case "$(uname -m)" in arm64|aarch64) ARCH="-arm64" ;; *) ARCH="" ;; esac
 export E2E_FAIL_DIR="$E/fail"
+export E2E_ARGV_LOG="$E/docker-argv.log"
+: > "$E2E_ARGV_LOG"
 mkdir -p "$E2E_FAIL_DIR" "$E/state" "$E/backups"
 cp "$REPO/test/e2e/docker-shim.sh" "$E/docker" && chmod 755 "$E/docker"
 (cd "$REPO" && go build -o "$BIN" ./cmd/payram-updater) || { echo "build failed"; exit 1; }
@@ -52,7 +57,7 @@ JSON
 JSON
 }
 
-health() { curl -s -m 3 "http://127.0.0.1:$HPORT/api/v1/health"; }
+health() { curl -sk -m 3 "$HEALTH_URL/api/v1/health"; }
 
 wait_payram_healthy() {
   local deadline=$((SECONDS + ${1:-600}))
@@ -63,21 +68,57 @@ wait_payram_healthy() {
   return 1
 }
 
+# make_certs: a self-signed certificate where PayRam's nginx looks for one
+# (SSL_CERT_PATH/fullchain.pem and privkey.pem), as Let's Encrypt leaves it.
+make_certs() {
+  [ -f "$E/certs/fullchain.pem" ] && return 0
+  mkdir -p "$E/certs"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj /CN=localhost \
+    -keyout "$E/certs/privkey.pem" -out "$E/certs/fullchain.pem" >/dev/null 2>&1
+}
+
+# fresh_payram VERSION [LAYOUT] starts PayRam the way an install does:
+#   default     named volumes; port 80 on 127.0.0.1:$HPORT and the database
+#               port published (as installs before 28 May 2026 did)
+#   setup       as setup_payram.sh runs it on a server with a certificate:
+#               host folders for /root/payram and the logs, the certificate
+#               folder read-only, ports 80 and 443, SSL_CERT_PATH set
+#   https       like setup, with only 443 published (PayRam answers on HTTPS
+#               only, with a certificate that does not name 127.0.0.1)
+#   autoremove  started with --rm, as the DigitalOcean image's systemd unit does
 fresh_payram() {
-  local version="$1"
-  log "Fresh PayRam $version"
+  local version="$1" layout="${2:-default}"
+  log "Fresh PayRam $version ($layout layout)"
   $REAL_DOCKER rm -f $NAME $NAME-next $NAME-previous $NAME-failed >/dev/null 2>&1
   $REAL_DOCKER ps -a --format '{{.Names}}' | grep "^$NAME-previous-" | xargs -r $REAL_DOCKER rm -f >/dev/null 2>&1
   $REAL_DOCKER volume rm payram-e2e-core payram-e2e-log payram-e2e-db >/dev/null 2>&1
-  rm -rf "$E/state" "$E/backups"; mkdir -p "$E/state" "$E/backups"
-  $REAL_DOCKER run -d --name $NAME --restart unless-stopped \
-    -p 127.0.0.1:$HPORT:80 -p 127.0.0.1:15432:5432 \
-    -e AES_KEY=6b1f0e1d2c3b4a5968778695a4b3c2d1e0f1a2b3c4d5e6f708192a3b4c5d6e7f \
+  rm -rf "$E/state" "$E/backups" "$E/host"; mkdir -p "$E/state" "$E/backups"
+  local opts=() ssl=""
+  case "$layout" in
+    default)
+      opts=(--restart unless-stopped -p "127.0.0.1:$HPORT:80" -p 127.0.0.1:15432:5432
+            -v payram-e2e-core:/root/payram -v payram-e2e-log:/var/log)
+      HEALTH_URL="http://127.0.0.1:$HPORT" ;;
+    setup|https)
+      make_certs; mkdir -p "$E/host/core" "$E/host/log"; ssl=/etc/letsencrypt
+      opts=(--restart unless-stopped -v "$E/host/core:/root/payram" -v "$E/host/log:/var/log" -v "$E/certs:/etc/letsencrypt:ro")
+      if [ "$layout" = setup ]; then
+        opts+=(-p "127.0.0.1:$HPORT:80" -p "127.0.0.1:$SPORT:443" -p 127.0.0.1:15432:5432)
+      else
+        opts+=(-p "127.0.0.1:$SPORT:443")
+      fi
+      HEALTH_URL="https://127.0.0.1:$SPORT" ;;
+    autoremove)
+      opts=(--rm -p "127.0.0.1:$HPORT:80" -v payram-e2e-core:/root/payram -v payram-e2e-log:/var/log)
+      HEALTH_URL="http://127.0.0.1:$HPORT" ;;
+  esac
+  $REAL_DOCKER run -d --name $NAME "${opts[@]}" \
+    -e AES_KEY=$AES \
     -e BLOCKCHAIN_NETWORK_TYPE=testnet -e SERVER=DEVELOPMENT -e POSTGRES_SSLMODE=disable \
     -e POSTGRES_HOST=localhost -e POSTGRES_PORT=5432 -e POSTGRES_DATABASE=payram \
-    -e POSTGRES_USERNAME=payram -e POSTGRES_PASSWORD=payram123 -e SSL_CERT_PATH= \
-    -e PAYMENTS_APP_SERVER_URL=https://x.payram.com \
-    -v payram-e2e-core:/root/payram -v payram-e2e-log:/var/log -v payram-e2e-db:/var/lib/payram/db/postgres \
+    -e POSTGRES_USERNAME=payram -e POSTGRES_PASSWORD=payram123 -e SSL_CERT_PATH=$ssl \
+    -e PAYMENTS_APP_SERVER_URL=https://x.payram.com -e PAYRAM_E2E_EMPTY= \
+    -v payram-e2e-db:/var/lib/payram/db/postgres \
     payram-e2e/payram:$version >/dev/null || { fail "could not start PayRam $version"; return 1; }
   if wait_payram_healthy 600; then pass "PayRam $version healthy"; else fail "PayRam $version never healthy"; return 1; fi
   sql "create table if not exists e2e_marker(id int); insert into e2e_marker values (42);" >/dev/null
@@ -87,7 +128,7 @@ sql() { $REAL_DOCKER exec -e PGPASSWORD=payram123 $NAME psql -h 127.0.0.1 -U pay
 
 updater_env() {
   exec env -i PATH="$PATH" HOME="$HOME" \
-      DOCKER_BIN="$E/docker" REAL_DOCKER="$REAL_DOCKER" E2E_FAIL_DIR="$E2E_FAIL_DIR" \
+      DOCKER_BIN="$E/docker" REAL_DOCKER="$REAL_DOCKER" E2E_FAIL_DIR="$E2E_FAIL_DIR" E2E_ARGV_LOG="$E2E_ARGV_LOG" \
       STATE_DIR="$E/state" BACKUP_DIR="$E/backups" \
       POLICY_URL="$E/policy.json" RUNTIME_MANIFEST_URL="$E/manifest.json" \
       IMAGE_REPO_OVERRIDE=payram-e2e/payram UPDATER_PORT=$UPORT \
@@ -101,10 +142,10 @@ start_updater() {
   fi
   log "Starting updater (health timeout ${HC:-600}s)"
   if lsof -nP -iTCP:$UPORT -sTCP:LISTEN >/dev/null 2>&1; then fail "port $UPORT is already taken"; return 1; fi
-  cd "$E"
+  cd "$E" || return 1
   ( updater_env "$BIN" serve >>"$E/updater.log" 2>&1 ) &
   echo $! > "$E/updater.pid"
-  cd - >/dev/null
+  cd - >/dev/null || return 1
   for _ in $(seq 1 50); do
     kill -0 "$(cat "$E/updater.pid")" 2>/dev/null || { fail "updater exited at start (see updater.log)"; return 1; }
     curl -s -m 1 "http://127.0.0.1:$UPORT/health" | grep -q ok && { pass "updater answers /health (pid $(cat "$E/updater.pid"))"; return 0; }
@@ -171,7 +212,7 @@ expect_job() {
 # to restart on its own; the marker row survives.
 expect_payram() {
   local image="payram-e2e/payram:$1"
-  local got running restart
+  local got
   got=$($REAL_DOCKER inspect -f '{{.Config.Image}}|{{.State.Running}}|{{.HostConfig.RestartPolicy.Name}}' $NAME 2>/dev/null)
   [ "$got" = "$image|true|unless-stopped" ] && pass "$NAME runs $1 (restart unless-stopped)" || fail "$NAME is '$got', want $image|true|unless-stopped"
   health | grep -q '"status":"ok"' && pass "PayRam answers its health check" || fail "PayRam does not answer: $(health)"
@@ -287,6 +328,122 @@ scenario_start_fails() {
   expect_payram ${NEW}${ARCH}
 }
 
+scenario_manual_mode_token() {
+  HC=600 start_updater
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$UPORT/upgrade/plan" -H 'Content-Type: application/json' \
+    -d "{\"mode\":\"MANUAL\",\"source\":\"CLI\",\"requestedTarget\":\"$NEW\"}")
+  [ "$code" = 403 ] && pass "manual mode refused to a program without root's token (403)" || fail "manual mode without the token got $code"
+  cli dry-run --mode manual --to "$NEW" > "$E/dry-run.log" 2>&1 && grep -q '"mode": "MANUAL"' "$E/dry-run.log" \
+    && pass "payram-updater dry-run --mode manual works with the token" || fail "CLI manual dry-run: $(tail -3 "$E/dry-run.log")"
+  [ "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$E/state/cli-token")" = 600 ] \
+    && pass "CLI token is readable by its owner only" || fail "cli-token mode"
+}
+
+scenario_backup_fails() {
+  HC=600 start_updater
+  # The dump itself fails (all 3 attempts), after PayRam's programs were stopped.
+  echo 3 > "$E2E_FAIL_DIR/arg--Fc"
+  run_update "$NEW"
+  wait_job_done 900
+  rm -f "$E2E_FAIL_DIR/arg--Fc"
+  expect_job FAILED BACKUP_FAILED_AFTER_QUIESCE
+  grep -q "was not changed" "$E/last-status.json" && pass "message says PayRam was not changed" || fail "message: $(field message < "$E/last-status.json")"
+  local stopped; stopped=$($REAL_DOCKER exec $NAME supervisorctl status 2>/dev/null | grep -v -E 'postgres|redis' | grep -c -E 'STOPPED|EXITED')
+  [ "$stopped" = 0 ] && pass "every program stopped for the backup runs again" || fail "$stopped programs still stopped: $($REAL_DOCKER exec $NAME supervisorctl status | grep -E 'STOPPED|EXITED')"
+  expect_container $NAME-next no
+  expect_payram ${OLD}${ARCH}
+}
+
+# A job left active by an updater from before the container switch (v0.2.3):
+# it stopped PayRam's programs for the backup and died. The new updater, on
+# start, starts them again and ends the job, and the next update works.
+scenario_interrupted_old_updater_job() {
+  fresh_payram ${OLD}${ARCH} || return
+  HC=600 start_updater
+  stop_updater
+  $REAL_DOCKER exec $NAME supervisorctl stop payram-core webhook-processor deposit-processor >/dev/null 2>&1
+  mkdir -p "$E/state/jobs/latest"
+  cat > "$E/state/jobs/latest/status.json" <<JSON
+{"jobId":"job-v023","mode":"DASHBOARD","requestedTarget":"$NEW","resolvedTarget":"$NEW","state":"BACKING_UP","failureCode":"","message":"Creating database backup","createdAt":"2026-10-20T10:00:00Z","updatedAt":"2026-10-20T10:01:00Z"}
+JSON
+  HC=600 start_updater
+  wait_job_done 900
+  expect_job FAILED UPGRADE_INTERRUPTED
+  local stopped; stopped=$($REAL_DOCKER exec $NAME supervisorctl status 2>/dev/null | grep -c -E '^(payram-core|webhook-processor|deposit-processor) .*(STOPPED|EXITED)')
+  [ "$stopped" = 0 ] && pass "programs the old updater stopped run again" || fail "programs still stopped"
+  expect_payram ${OLD}${ARCH}
+  run_update "$NEW"
+  wait_job_done 1500
+  expect_job READY
+  expect_payram ${NEW}${ARCH}
+}
+
+# PayRam set up the way setup_payram.sh does it on a server with a
+# certificate. The update must keep every host folder (the certificate one
+# read-only), both web ports and every setting, an empty one included.
+scenario_setup_script_install() {
+  fresh_payram ${OLD}${ARCH} setup || return
+  HC=600 start_updater
+  run_update "$NEW"
+  wait_job_done 1500
+  expect_job READY
+  expect_payram ${NEW}${ARCH}
+  local mounts env ports
+  mounts=$($REAL_DOCKER inspect -f '{{range .Mounts}}{{.Type}}:{{.Source}}->{{.Destination}}:{{.RW}} {{end}}' $NAME)
+  echo "$mounts" | grep -q "bind:[^ ]*/host/core->/root/payram:true" && pass "host folder for /root/payram kept" || fail "mounts: $mounts"
+  echo "$mounts" | grep -q "bind:[^ ]*/certs->/etc/letsencrypt:false" && pass "certificate folder kept, read-only" || fail "mounts: $mounts"
+  env=$($REAL_DOCKER inspect -f '{{range .Config.Env}}{{println .}}{{end}}' $NAME)
+  echo "$env" | grep -qx "AES_KEY=$AES" && pass "AES key carried over unchanged" || fail "AES_KEY not carried over"
+  echo "$env" | grep -qx "SSL_CERT_PATH=/etc/letsencrypt" && pass "SSL_CERT_PATH kept" || fail "SSL_CERT_PATH: $(echo "$env" | grep SSL_CERT_PATH)"
+  echo "$env" | grep -qx "PAYRAM_E2E_EMPTY=" && pass "a setting with an empty value is kept, empty" || fail "PAYRAM_E2E_EMPTY: '$(echo "$env" | grep PAYRAM_E2E_EMPTY)'"
+  ports=$($REAL_DOCKER port $NAME)
+  echo "$ports" | grep -q "443/tcp -> 127.0.0.1:$SPORT" && echo "$ports" | grep -q "80/tcp -> 127.0.0.1:$HPORT" \
+    && pass "both web ports kept" || fail "ports: $ports"
+  echo "$ports" | grep -q 5432 && fail "database port still published" || pass "database port no longer published"
+}
+
+# PayRam answers on HTTPS only (443), the case of the merchant whose update
+# was reported failed: the updater must find it there and check it over TLS.
+scenario_https_only_install() {
+  fresh_payram ${OLD}${ARCH} https || return
+  HC=600 start_updater
+  run_update "$NEW"
+  wait_job_done 1500
+  expect_job READY
+  grep -q "PayRam answers at https://127.0.0.1:$SPORT" "$E/state/jobs/latest/logs.txt" \
+    && pass "updater found PayRam on https://127.0.0.1:$SPORT" || fail "log: $(grep -i 'answers at\|CORE_BASE_URL\|not answering' "$E/state/jobs/latest/logs.txt" | tail -2)"
+  expect_payram ${NEW}${ARCH}
+}
+
+# A container started with --rm is deleted by Docker when it stops, so the
+# updater could never switch back: it must refuse before touching anything.
+scenario_auto_remove_refused() {
+  fresh_payram ${OLD}${ARCH} autoremove || return
+  HC=600 start_updater
+  local id; id=$($REAL_DOCKER inspect -f '{{.Id}}' $NAME)
+  run_update "$NEW"
+  wait_job_done 300
+  expect_job FAILED CONTAINER_NOT_REPLACEABLE
+  [ "$($REAL_DOCKER inspect -f '{{.Id}} {{.State.Running}}' $NAME 2>/dev/null)" = "$id true" ] \
+    && pass "PayRam's container was not touched and still runs" || fail "container changed or stopped"
+  health | grep -q '"status":"ok"' && pass "PayRam answers its health check" || fail "PayRam does not answer"
+  expect_container $NAME-next no
+  $REAL_DOCKER rm -f $NAME >/dev/null 2>&1
+}
+
+# Over the whole run, no docker command the updater ran carried the AES key or
+# the database password: anyone on the server can read a command line.
+check_no_secrets_on_command_lines() {
+  log "=== no secrets on docker command lines ==="
+  local calls; calls=$(wc -l < "$E2E_ARGV_LOG" | tr -d ' ')
+  if grep -q -e "$AES" -e payram123 "$E2E_ARGV_LOG"; then
+    fail "a secret reached a docker command line: $(grep -e "$AES" -e payram123 "$E2E_ARGV_LOG" | head -2 | cut -c1-200)"
+  else
+    pass "none of the updater's $calls docker commands carried the AES key or the database password"
+  fi
+}
+
 ensure_test_images() {
   for v in "$OLD" "$NEW"; do
     $REAL_DOCKER image inspect "payramapp/payram:${v}${ARCH}" >/dev/null 2>&1 || $REAL_DOCKER pull -q "payramapp/payram:${v}${ARCH}" >/dev/null
@@ -328,12 +485,15 @@ scenario_full_recovery() {
 
 write_config
 ensure_test_images
-[ $# -eq 0 ] && set -- rollback_after_migrations container_exits pull_fails concurrent_click happy_upgrade db_only_restore killed_mid_update sigterm_mid_update start_fails full_recovery
+[ $# -eq 0 ] && set -- rollback_after_migrations container_exits pull_fails concurrent_click manual_mode_token backup_fails \
+  happy_upgrade db_only_restore killed_mid_update sigterm_mid_update start_fails full_recovery \
+  interrupted_old_updater_job setup_script_install https_only_install auto_remove_refused
 for s in "$@"; do
   ensure_test_images
   log "=== $s ==="
   "scenario_$s"
 done
 stop_updater
+check_no_secrets_on_command_lines
 log "Done: $FAILURES failure(s)"
 exit $FAILURES

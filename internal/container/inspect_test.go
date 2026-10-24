@@ -371,6 +371,45 @@ fi
 	}
 }
 
+// TestExtractRuntimeState_AutoRemoveIsRefused: a container started with
+// --rm (the DigitalOcean image's systemd unit does this) is read as such, and
+// an update refuses it: Docker would delete it on stop, leaving nothing to
+// switch back to.
+func TestExtractRuntimeState_AutoRemoveIsRefused(t *testing.T) {
+	inspectJSON := `[{
+		"Id": "do123",
+		"Name": "/payram-mainnet",
+		"Image": "sha256:abc",
+		"Config": {"Image": "payramapp/payram:latest", "Env": []},
+		"HostConfig": {"AutoRemove": true, "RestartPolicy": {"Name": "no"}, "PortBindings": {}},
+		"Mounts": [],
+		"NetworkSettings": {"Networks": {}}
+	}]`
+	dockerScript := createMockDockerScript(t, `#!/bin/bash
+if [[ "$1" == "inspect" ]]; then
+	cat <<'EOF'
+`+inspectJSON+`
+EOF
+fi
+`)
+	defer os.Remove(dockerScript)
+
+	state, err := NewInspector(dockerScript, &mockLogger{}).ExtractRuntimeState(context.Background(), "payram-mainnet")
+	if err != nil {
+		t.Fatalf("ExtractRuntimeState: %v", err)
+	}
+	if !state.AutoRemove {
+		t.Fatal("AutoRemove not read from HostConfig")
+	}
+	err = CheckReplaceable(state)
+	if err == nil || !strings.Contains(err.Error(), "payram-mainnet") || !strings.Contains(err.Error(), "--rm") {
+		t.Fatalf("CheckReplaceable = %v, want a refusal naming payram-mainnet and --rm", err)
+	}
+	if err := CheckReplaceable(&RuntimeState{Name: "/payram"}); err != nil {
+		t.Fatalf("an ordinary container was refused: %v", err)
+	}
+}
+
 // TestParseImageTag tests image tag parsing.
 func TestParseImageTag(t *testing.T) {
 	tests := []struct {

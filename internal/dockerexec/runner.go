@@ -3,6 +3,7 @@ package dockerexec
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -136,9 +137,20 @@ func (r *Runner) Remove(ctx context.Context, container string) error {
 
 // Run executes a docker command with the provided arguments.
 func (r *Runner) Run(ctx context.Context, args []string) error {
+	return r.RunWithEnv(ctx, args, nil)
+}
+
+// RunWithEnv executes a docker command with env (KEY=VALUE) added to the
+// updater's own environment. A container's secrets go this way, named on the
+// command line only (`-e AES_KEY`): docker reads each value from its own
+// environment, which, unlike its command line, other users cannot read.
+func (r *Runner) RunWithEnv(ctx context.Context, args []string, env []string) error {
 	r.logCommand(args)
 
 	cmd := exec.CommandContext(ctx, r.DockerBin, args...)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		subcommand := "run"
@@ -361,10 +373,36 @@ func RedactArgs(args []string) []string {
 		case strings.HasPrefix(arg, "--env="):
 			redacted[i] = "--env=" + redactEnvValue(strings.TrimPrefix(arg, "--env="))
 		default:
-			redacted[i] = inlinePassword.ReplaceAllString(arg, "$1=***")
+			redacted[i] = RedactLine(arg)
 		}
 	}
 	return redacted
+}
+
+// loggedEnvValue matches an environment value on a docker command line that
+// was logged as one string (`-e KEY=VALUE`, `--env KEY=VALUE`, `--env=KEY=VALUE`).
+var loggedEnvValue = regexp.MustCompile(`((?:^|\s)(?:-e|--env)(?:\s+|=)[A-Za-z_][A-Za-z0-9_]*=)\S*`)
+
+// secretAssignment matches KEY=VALUE for keys that name a secret.
+var secretAssignment = regexp.MustCompile(`\b([A-Za-z0-9_]*(?:AES_KEY|PASSWORD|SECRET|TOKEN)[A-Za-z0-9_]*)=\S+`)
+
+// RedactLine hides the secret values a log line may carry: every docker
+// environment value, inline passwords and any KEY=VALUE whose key names a
+// secret. Updaters up to v0.2.3 logged whole docker command lines, AES_KEY
+// included; this cleans what they left in the job log.
+func RedactLine(line string) string {
+	line = loggedEnvValue.ReplaceAllString(line, "${1}***")
+	line = secretAssignment.ReplaceAllString(line, "$1=***")
+	return inlinePassword.ReplaceAllString(line, "$1=***")
+}
+
+// RedactLines applies RedactLine to every line of text.
+func RedactLines(text string) string {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		lines[i] = RedactLine(line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // redactEnvValue turns KEY=VALUE into KEY=***. A bare KEY (docker copies the

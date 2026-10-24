@@ -46,6 +46,10 @@ const (
 	// release policy allows (unknown version, downgrade, foreign image).
 	// Refused before anything was touched.
 	FailureTargetNotAllowed = "TARGET_NOT_ALLOWED"
+	// FailureContainerNotReplaceable: PayRam's container is set up so that
+	// the updater could not switch back to it (started with --rm). Refused
+	// before anything was touched.
+	FailureContainerNotReplaceable = "CONTAINER_NOT_REPLACEABLE"
 )
 
 // SwitchStage records how far the container switch got, so a restarted

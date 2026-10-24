@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/payram/payram-updater/internal/container"
 	"github.com/payram/payram-updater/internal/coreclient"
 	"github.com/payram/payram-updater/internal/dockerexec"
 	"github.com/payram/payram-updater/internal/jobs"
@@ -39,6 +40,8 @@ type fakeDocker struct {
 	// exitOnStart makes a container with this image stop right after start.
 	exitOnStart string
 	calls       []string
+	// createEnv is the environment each create got, by container name.
+	createEnv map[string][]string
 }
 
 func newFakeDocker() *fakeDocker {
@@ -46,7 +49,8 @@ func newFakeDocker() *fakeDocker {
 		containers: map[string]*fakeContainer{
 			"payram": {image: oldImage, running: true, status: "running", restart: "unless-stopped"},
 		},
-		fail: map[string]int{},
+		fail:      map[string]int{},
+		createEnv: map[string][]string{},
 	}
 }
 
@@ -59,11 +63,16 @@ func (d *fakeDocker) failing(op, name string) error {
 	return nil
 }
 
-func (d *fakeDocker) Run(_ context.Context, args []string) error {
+func (d *fakeDocker) RunWithEnv(_ context.Context, args []string, env []string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if len(args) < 3 || args[0] != "create" || args[1] != "--name" {
 		return fmt.Errorf("fake docker only creates: %v", args)
+	}
+	for i, arg := range args {
+		if i > 0 && args[i-1] == "-e" && strings.Contains(arg, "=") {
+			return fmt.Errorf("an environment value is on the docker command line, where every user can read it: %s", arg)
+		}
 	}
 	name := args[2]
 	d.calls = append(d.calls, "create "+name)
@@ -80,6 +89,7 @@ func (d *fakeDocker) Run(_ context.Context, args []string) error {
 		}
 	}
 	d.containers[name] = &fakeContainer{image: args[len(args)-1], status: "created", restart: restart}
+	d.createEnv[name] = env
 	return nil
 }
 
@@ -154,6 +164,9 @@ func (d *fakeDocker) UpdateRestartPolicy(_ context.Context, name, policy string)
 	defer d.mu.Unlock()
 	d.calls = append(d.calls, "update "+name+" "+policy)
 	if err := d.failing("update", name); err != nil {
+		return err
+	}
+	if err := d.failing("update", name+":"+policy); err != nil {
 		return err
 	}
 	c, ok := d.containers[name]
@@ -261,7 +274,17 @@ func newJob() *jobs.Job {
 	return job
 }
 
-var createNewArgs = []string{"create", "--name", "payram-next", "--restart", "unless-stopped", "-p", "443:443/tcp", newImage}
+// newSpec is the new version's container as the builder describes it: the
+// running container's settings, the AES key named in Options and valued in Env.
+func newSpec() *container.ContainerSpec {
+	return &container.ContainerSpec{
+		Options:       []string{"-p", "443:443/tcp", "-e", "AES_KEY", newImage},
+		Env:           []string{"AES_KEY=hot-wallet-key"},
+		RestartPolicy: "unless-stopped",
+		ExtraNetworks: []string{"monitoring"},
+		Image:         newImage,
+	}
+}
 
 // assertPayramRuns checks the promise every path must keep: exactly one
 // container named payram, running image, with restart policy, and no other
@@ -303,7 +326,7 @@ func (d *fakeDocker) describe() string {
 func runSwitch(t *testing.T, w *Switch, d *fakeDocker, probe Prober, job *jobs.Job) error {
 	t.Helper()
 	ctx := context.Background()
-	if err := w.CreateNext(ctx, job, createNewArgs, []string{"monitoring"}); err != nil {
+	if err := w.CreateNext(ctx, job, newSpec()); err != nil {
 		return err
 	}
 	err := w.Cutover(ctx, job, oldImage, "unless-stopped")
@@ -348,7 +371,8 @@ func TestSwitch_FailuresAlwaysEndWithTheOldVersionRunning(t *testing.T) {
 		{"create fails", func(d *fakeDocker, p *fakeProbe) { d.fail["create:payram-next"] = 1 }, jobs.FailureDockerCreateFailed, false},
 		{"network connect fails", func(d *fakeDocker, p *fakeProbe) { d.fail["connect:payram-next"] = 1 }, jobs.FailureDockerCreateFailed, false},
 		{"stop fails", func(d *fakeDocker, p *fakeProbe) { d.fail["stop:payram"] = 1 }, "DOCKER_ERROR", false},
-		{"restart policy change fails", func(d *fakeDocker, p *fakeProbe) { d.fail["update:payram"] = 1 }, "DOCKER_ERROR", true},
+		{"switching the old container's restart policy off fails", func(d *fakeDocker, p *fakeProbe) { d.fail["update:payram:no"] = 1 }, "DOCKER_ERROR", false},
+		{"giving the new container its restart policy fails", func(d *fakeDocker, p *fakeProbe) { d.fail["update:payram:unless-stopped"] = 1 }, "DOCKER_ERROR", true},
 		{"setting the old container aside fails", func(d *fakeDocker, p *fakeProbe) { d.fail["rename:payram"] = 1 }, "DOCKER_ERROR", true},
 		{"putting the new container in place fails", func(d *fakeDocker, p *fakeProbe) { d.fail["rename:payram-next"] = 1 }, "DOCKER_ERROR", true},
 		{"new container does not start", func(d *fakeDocker, p *fakeProbe) { d.fail["start:payram"] = 1 }, "DOCKER_ERROR", true},
@@ -383,6 +407,90 @@ func TestSwitch_FailuresAlwaysEndWithTheOldVersionRunning(t *testing.T) {
 	}
 }
 
+// TestSwitch_NewContainerCannotStartByItselfBeforeTheSwitch: until Cutover
+// starts it, the new container must not start on its own (a Docker or server
+// restart during the backup would otherwise run it next to the old one), and
+// its secrets reach docker through the environment only.
+func TestSwitch_NewContainerCannotStartByItselfBeforeTheSwitch(t *testing.T) {
+	d := newFakeDocker()
+	w, _, _ := newSwitch(d)
+	job := newJob()
+	if err := w.CreateNext(context.Background(), job, newSpec()); err != nil {
+		t.Fatalf("CreateNext: %v", err)
+	}
+	next := d.containers["payram-next"]
+	if next == nil || next.restart != "no" {
+		t.Fatalf("payram-next = %+v, want restart policy no until the switch", next)
+	}
+	if env := d.createEnv["payram-next"]; len(env) != 1 || env[0] != "AES_KEY=hot-wallet-key" {
+		t.Fatalf("create env = %v, want the AES key passed through the environment", env)
+	}
+
+	if err := w.Cutover(context.Background(), job, oldImage, "unless-stopped"); err != nil {
+		t.Fatalf("Cutover: %v", err)
+	}
+	if got := d.containers["payram"].restart; got != "unless-stopped" {
+		t.Fatalf("new payram restart = %s, want the old container's unless-stopped", got)
+	}
+	if got := d.containers["payram-previous"].restart; got != "no" {
+		t.Fatalf("payram-previous restart = %s, want no", got)
+	}
+	// The old container's policy goes off before it is stopped, so a Docker
+	// restart between the two cannot start it again.
+	stop, off := -1, -1
+	for i, call := range d.calls {
+		switch call {
+		case "stop payram":
+			stop = i
+		case "update payram no":
+			if off < 0 {
+				off = i
+			}
+		}
+	}
+	if off < 0 || stop < 0 || off > stop {
+		t.Fatalf("restart policy must be switched off before the stop; calls: %v", d.calls)
+	}
+}
+
+// TestRestore_StartsPayramEvenIfItsRestartPolicyCannotBeSetBack: putting the
+// restart policy back is retried after the start; failing at it must never
+// keep PayRam down.
+func TestRestore_StartsPayramEvenIfItsRestartPolicyCannotBeSetBack(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		failures    int
+		wantRestart string
+	}{
+		{"fails once, retried after the start", 1, "unless-stopped"},
+		{"keeps failing", 2, "no"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newFakeDocker()
+			w, rec, _ := newSwitch(d)
+			ctx := context.Background()
+			job := newJob()
+			if err := w.CreateNext(ctx, job, newSpec()); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Cutover(ctx, job, oldImage, "unless-stopped"); err != nil {
+				t.Fatal(err)
+			}
+			d.fail["update:payram:unless-stopped"] = tc.failures
+			if err := w.Restore(ctx, job); err != nil {
+				t.Fatalf("Restore: %v", err)
+			}
+			c := d.containers["payram"]
+			if c == nil || !c.running || c.image != oldImage || c.restart != tc.wantRestart {
+				t.Fatalf("payram = %+v, want the old version running with restart %s; %s", c, tc.wantRestart, d.describe())
+			}
+			if tc.failures > 1 && !strings.Contains(strings.Join(rec.lines, "\n"), "docker update --restart unless-stopped payram") {
+				t.Fatalf("no instruction to set the policy by hand: %v", rec.lines)
+			}
+		})
+	}
+}
+
 func TestSwitch_ExitedContainerFailsFastInsteadOfWaitingOutTheTimeout(t *testing.T) {
 	d := newFakeDocker()
 	d.exitOnStart = newImage
@@ -405,7 +513,7 @@ func TestSwitch_NothingIsChangedWhenProgressCannotBeSaved(t *testing.T) {
 	w, rec, _ := newSwitch(d)
 	rec.fail = true
 
-	err := w.CreateNext(context.Background(), newJob(), createNewArgs, nil)
+	err := w.CreateNext(context.Background(), newJob(), newSpec())
 	var stepErr *StepError
 	if !errors.As(err, &stepErr) || stepErr.Code != "STATE_SAVE_FAILED" {
 		t.Fatalf("got %v, want STATE_SAVE_FAILED", err)

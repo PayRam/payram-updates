@@ -13,8 +13,8 @@ import (
 	"github.com/payram/payram-updater/internal/logger"
 )
 
-// repairDockerWait is how long a starting updater waits for Docker before it
-// gives up repairing an interrupted update (Docker can come up after it).
+// repairDockerWait is how often a starting updater that is waiting for Docker
+// (to repair an interrupted update) says so in its log.
 const repairDockerWait = 5 * time.Minute
 
 // repairInterruptedUpgrade runs when the updater starts. If the last job is
@@ -36,7 +36,11 @@ func (s *Server) repairInterruptedUpgrade(ctx context.Context) {
 	if job == nil || !job.IsActive() {
 		return
 	}
-	if err := s.claimUpgradeSlot(); err != nil {
+	// The slot can be held for a moment by a request that is about to be
+	// refused (it sees this active job); a repair that gave up then would
+	// leave the job active, and every later update refused, until the next
+	// restart. So it waits for the slot.
+	if !s.waitForUpgradeSlot(ctx) {
 		return
 	}
 	s.repairing.Store(true)
@@ -102,18 +106,41 @@ func (s *Server) repairInterruptedUpgrade(ctx context.Context) {
 	s.putPayramBack(work, sw, job, jobs.FailureUpgradeInterrupted, "the updater was restarted in the middle of the update", stageReachedCutover(job.SwitchStage))
 }
 
-// waitForDocker waits until Docker answers. On timeout it ends the job with
-// what to do and returns false.
+// waitForUpgradeSlot claims the update slot, retrying while it is briefly
+// held. It returns false when the updater is shutting down.
+func (s *Server) waitForUpgradeSlot(ctx context.Context) bool {
+	for {
+		err := s.claimUpgradeSlot()
+		if err == nil {
+			return true
+		}
+		if errors.Is(err, errShuttingDown) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// waitForDocker waits until Docker answers, however long that takes: the job
+// stays active meanwhile, so if this updater stops first the next one repairs
+// it. (Ending the job here would leave PayRam stopped for good: a failed job
+// is never repaired, and the old container's restart policy is off.) It
+// returns false only when the updater is shutting down.
 func (s *Server) waitForDocker(ctx context.Context, job *jobs.Job) bool {
-	deadline := time.Now().Add(repairDockerWait)
+	started := time.Now()
+	nextWarning := started.Add(repairDockerWait)
 	for {
 		if err := backup.CheckDockerDaemon(context.Background(), s.config.DockerBin); err == nil {
 			return true
 		}
-		if time.Now().After(deadline) {
-			s.finishFailed(job, jobs.FailureUpgradeInterrupted, "",
-				"The updater restarted during the update, and Docker is not running, so PayRam could not be checked. Start Docker (`sudo systemctl start docker`), then restart the updater (`sudo systemctl restart payram-updater`); it finishes the check on its own.")
-			return false
+		if time.Now().After(nextWarning) {
+			logger.Warnf("Server", "waitForDocker", "Docker has not answered for %s; update %s is repaired once it does (start it with `sudo systemctl start docker`)", time.Since(started).Round(time.Minute), job.JobID)
+			s.jobStore.AppendLog(fmt.Sprintf("Docker is not running (%s so far); PayRam is checked and put right as soon as it is. Start it with `sudo systemctl start docker`.", time.Since(started).Round(time.Minute)))
+			nextWarning = time.Now().Add(repairDockerWait)
 		}
 		select {
 		case <-ctx.Done():
@@ -123,16 +150,19 @@ func (s *Server) waitForDocker(ctx context.Context, job *jobs.Job) bool {
 	}
 }
 
-// waitForContainerLock waits while a CLI restore holds the container lock.
+// waitForContainerLock waits while a CLI restore holds the container lock,
+// and retries if the lock file cannot be opened: giving up would leave the job
+// active and every later update refused.
 func (s *Server) waitForContainerLock(ctx context.Context) (func(), bool) {
+	warned := false
 	for {
 		release, err := jobs.AcquireContainerLock(s.config.StateDir)
 		if err == nil {
 			return release, true
 		}
-		if !errors.Is(err, jobs.ErrUpgradeLocked) {
+		if !errors.Is(err, jobs.ErrUpgradeLocked) && !warned {
 			logger.Error("Server", "waitForContainerLock", err)
-			return nil, false
+			warned = true
 		}
 		select {
 		case <-ctx.Done():
@@ -159,7 +189,8 @@ func (s *Server) repairJobFromOlderUpdater(ctx context.Context, job *jobs.Job) {
 
 	state, err := s.dockerRunner.State(ctx, name)
 	if err != nil {
-		s.finishFailed(job, jobs.FailureUpgradeInterrupted, "", fmt.Sprintf("The previous updater stopped during the update, and container %s could not be checked (%v). Run `docker ps -a` to see PayRam's container, or contact PayRam support.", name, err))
+		// PayRam's state is unknown here, so this is not "put back".
+		s.finishFailed(job, jobs.FailureRollbackFailed, jobs.FailureUpgradeInterrupted, fmt.Sprintf("The previous updater stopped during the update, and container %s could not be checked (%v), so PayRam may be down. Run `docker ps -a` to see PayRam's container, or contact PayRam support.", name, err))
 		return
 	}
 	if !state.Exists {

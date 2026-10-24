@@ -208,6 +208,21 @@ func TestPlanUpgrade_BreakpointCapping(t *testing.T) {
 			wantState:       jobs.JobStateReady,
 			wantResolved:    "1.9.9",
 		},
+		// --- arm64 builds report "<version>-arm64": the same release, not a pre-release ---
+		{
+			name:            "1.8.0-arm64 (past the breakpoint) to 1.9.9 goes straight to 1.9.9",
+			currentVersion:  "1.8.0-arm64",
+			requestedTarget: "1.9.9",
+			wantState:       jobs.JobStateReady,
+			wantResolved:    "1.9.9",
+		},
+		{
+			name:            "1.7.9-arm64 (the stepping stone) to 1.9.9 advances through 1.8.0 without re-installing 1.7.9",
+			currentVersion:  "1.7.9-arm64",
+			requestedTarget: "1.9.9",
+			wantState:       jobs.JobStateReady,
+			wantResolved:    "1.8.0",
+		},
 	}
 
 	manifestPath := buildManifestFile(t)
@@ -451,10 +466,11 @@ func TestPlanUpgrade_LatestResolution(t *testing.T) {
 	}
 }
 
-// TestHandleUpgradePlan_CurrentVersionWiredThrough verifies the HTTP handler reads
-// currentVersion from the request body and forwards it to PlanUpgrade so that
-// breakpoint capping works end-to-end over the API.
-func TestHandleUpgradePlan_CurrentVersionWiredThrough(t *testing.T) {
+// TestHandleUpgradePlan_UsesTheRunningVersionNotTheCallers verifies the HTTP
+// handler checks breakpoints and downgrades against the version PayRam runs,
+// whatever version the caller claims: a request claiming an old version must
+// not slip a downgrade past the check.
+func TestHandleUpgradePlan_UsesTheRunningVersionNotTheCallers(t *testing.T) {
 	releases := []string{"1.7.0", "1.7.5", "1.7.9", "1.8.0", "1.9.9"}
 	breakpoints := []map[string]string{
 		{"version": "1.8.0", "reason": "SSH required.", "docs": "https://docs.example.com/1.8.0"},
@@ -464,6 +480,7 @@ func TestHandleUpgradePlan_CurrentVersionWiredThrough(t *testing.T) {
 
 	tests := []struct {
 		name            string
+		running         string // what PayRam reports
 		body            string
 		wantFailureCode string
 		wantResolved    string
@@ -471,19 +488,28 @@ func TestHandleUpgradePlan_CurrentVersionWiredThrough(t *testing.T) {
 		{
 			// 1.7.5 → 1.9.9 with breakpoint at 1.8.0: below stepping stone → chains to 1.8.0 directly
 			name:         "crossing breakpoint chains to breakpoint version via API",
-			body:         `{"requestedTarget":"1.9.9","currentVersion":"1.7.5"}`,
+			running:      "1.7.5",
+			body:         `{"requestedTarget":"1.9.9"}`,
 			wantResolved: "1.8.0",
 		},
 		{
 			// 1.7.9 → 1.9.9 with breakpoint at 1.8.0: at stepping stone, advances through 1.8.0
 			name:         "at stepping stone via API advances through breakpoint",
-			body:         `{"requestedTarget":"1.9.9","currentVersion":"1.7.9"}`,
+			running:      "1.7.9",
+			body:         `{"requestedTarget":"1.9.9","currentVersion":"1.9.9"}`,
 			wantResolved: "1.8.0",
 		},
 		{
-			// no currentVersion sent: gate logic resolved internally from container; in tests no container is
-			// running so it falls back to empty, meaning no gate enforcement — targeting 1.9.9 is fine
-			name:         "no currentVersion, non-breakpoint target proceeds",
+			// PayRam runs 1.9.9; the caller claims 1.7.0 to get 1.8.0 installed
+			name:            "a claimed older version does not allow a downgrade",
+			running:         "1.9.9",
+			body:            `{"requestedTarget":"1.8.0","currentVersion":"1.7.0"}`,
+			wantFailureCode: jobs.FailureTargetNotAllowed,
+		},
+		{
+			// the running version cannot be told: gate logic is skipped
+			name:         "unknown running version, non-breakpoint target proceeds",
+			running:      "",
 			body:         `{"requestedTarget":"1.9.9"}`,
 			wantResolved: "1.9.9",
 		},
@@ -497,7 +523,8 @@ func TestHandleUpgradePlan_CurrentVersionWiredThrough(t *testing.T) {
 				FetchTimeoutSeconds: 5,
 			}
 			tmpDir := t.TempDir()
-			srv := &Server{config: cfg, jobStore: jobs.NewStore(tmpDir)}
+			running := tt.running
+			srv := &Server{config: cfg, jobStore: jobs.NewStore(tmpDir), versionLookup: func(context.Context) string { return running }}
 
 			req := httptest.NewRequest(http.MethodPost, "/upgrade/plan", strings.NewReader(tt.body))
 			w := httptest.NewRecorder()
@@ -522,9 +549,10 @@ func TestHandleUpgradePlan_CurrentVersionWiredThrough(t *testing.T) {
 	}
 }
 
-// TestHandleUpgradeRun_CurrentVersionWiredThrough verifies the /upgrade/run handler
-// also reads currentVersion and blocks appropriately before creating a job.
-func TestHandleUpgradeRun_CurrentVersionWiredThrough(t *testing.T) {
+// TestHandleUpgradeRun_UsesTheRunningVersionNotTheCallers verifies the
+// /upgrade/run handler applies the breakpoint for the version PayRam runs
+// before creating a job, ignoring the version the caller claims.
+func TestHandleUpgradeRun_UsesTheRunningVersionNotTheCallers(t *testing.T) {
 	releases := []string{"1.7.0", "1.7.5", "1.7.9", "1.8.0", "1.9.9"}
 	breakpoints := []map[string]string{
 		{"version": "1.8.0", "reason": "SSH required.", "docs": "https://docs.example.com/1.8.0"},
@@ -538,11 +566,12 @@ func TestHandleUpgradeRun_CurrentVersionWiredThrough(t *testing.T) {
 		FetchTimeoutSeconds: 5,
 	}
 	tmpDir := t.TempDir()
-	srv := &Server{config: cfg, jobStore: jobs.NewStore(tmpDir)}
+	srv := &Server{config: cfg, jobStore: jobs.NewStore(tmpDir), versionLookup: func(context.Context) string { return "1.7.9" }}
 	t.Cleanup(func() { srv.upgradeWg.Wait() })
 
-	// 1.7.9 → 1.9.9 with breakpoint at 1.8.0: at stepping stone → redirected to 1.8.0, job created.
-	body := strings.NewReader(`{"requestedTarget":"1.9.9","currentVersion":"1.7.9"}`)
+	// 1.7.9 → 1.9.9 with breakpoint at 1.8.0: at stepping stone → redirected to 1.8.0, job created
+	// (the claimed 1.8.0 would have skipped the breakpoint).
+	body := strings.NewReader(`{"requestedTarget":"1.9.9","currentVersion":"1.8.0"}`)
 	req := httptest.NewRequest(http.MethodPost, "/upgrade/run", body)
 	w := httptest.NewRecorder()
 	srv.HandleUpgradeRun()(w, req)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -104,6 +105,37 @@ func (s *Store) AppendLog(line string) error {
 	return nil
 }
 
+// RewriteLogs passes every line of the job log through clean and writes the
+// result back (atomically, root only) when anything changed. A missing log is
+// fine.
+func (s *Store) RewriteLogs(clean func(string) string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := os.ReadFile(s.logsPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read log file: %w", err)
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	changed := false
+	for i, line := range lines {
+		body := strings.TrimSuffix(line, "\n")
+		if cleaned := clean(body); cleaned != body {
+			lines[i] = cleaned + strings.TrimPrefix(line, body)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	if err := s.atomicWrite(s.logsPath(), []byte(strings.Join(lines, ""))); err != nil {
+		return fmt.Errorf("failed to rewrite log file: %w", err)
+	}
+	return nil
+}
+
 // ReadLogs reads all logs from the job's log file.
 // Returns empty string if no logs exist.
 func (s *Store) ReadLogs() (string, error) {
@@ -135,15 +167,14 @@ func (s *Store) ensureJobDir() error {
 	if err := os.MkdirAll(jobDir, 0700); err != nil {
 		return fmt.Errorf("failed to create job directory: %w", err)
 	}
-	// Directories made by older versions were world-readable.
+	// Directories made by older versions were world-readable. Tightening
+	// them is best effort: a filesystem that refuses chmod (root-squashed
+	// NFS, one without modes) must not stop every update from saving its
+	// progress.
 	for _, dir := range []string{filepath.Join(s.stateDir, "jobs"), jobDir} {
-		if err := os.Chmod(dir, 0700); err != nil {
-			return fmt.Errorf("failed to restrict %s: %w", dir, err)
-		}
+		_ = os.Chmod(dir, 0700)
 	}
-	if err := os.Chmod(s.logsPath(), 0600); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to restrict %s: %w", s.logsPath(), err)
-	}
+	_ = os.Chmod(s.logsPath(), 0600)
 	return nil
 }
 

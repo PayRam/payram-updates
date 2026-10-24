@@ -3,13 +3,16 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/payram/payram-updater/internal/cli"
 	"github.com/payram/payram-updater/internal/container"
+	"github.com/payram/payram-updater/internal/dockerexec"
 	"github.com/payram/payram-updater/internal/history"
 	"github.com/payram/payram-updater/internal/inspect"
 	"github.com/payram/payram-updater/internal/jobs"
@@ -36,12 +39,14 @@ type HistoryResponse struct {
 	Count  int             `json:"count"`
 }
 
-// PlanRequest represents the request body for POST /upgrade/plan.
+// PlanRequest represents the request body for POST /upgrade/plan. The running
+// version is never taken from the caller: it is looked up (see
+// lookupCurrentVersion), so the downgrade and breakpoint checks cannot be
+// moved by claiming an older one.
 type PlanRequest struct {
 	Mode            string `json:"mode"`
 	RequestedTarget string `json:"requestedTarget"`
 	Source          string `json:"source"`
-	CurrentVersion  string `json:"currentVersion"` // running version of the core container; enables breakpoint crossing detection
 }
 
 // PlanResponse represents the response for POST /upgrade/plan.
@@ -60,8 +65,7 @@ type PlanResponse struct {
 type RunRequest struct {
 	Mode            string `json:"mode"`
 	RequestedTarget string `json:"requestedTarget"`
-	Source          string `json:"source"`         // Origin of request, defaults to "UNKNOWN"
-	CurrentVersion  string `json:"currentVersion"` // running version of the core container; enables breakpoint crossing detection
+	Source          string `json:"source"` // Origin of request, defaults to "UNKNOWN"
 }
 
 func parseJobMode(value string) (jobs.JobMode, error) {
@@ -80,16 +84,71 @@ func parseJobMode(value string) (jobs.JobMode, error) {
 	}
 }
 
-// resolveMode decides a request's mode. MANUAL skips the release policy's
-// gates, so only the CLI on this machine may ask for it: a request that
-// arrives from the PayRam container (or anywhere else) is always DASHBOARD,
-// whatever its body says.
-func resolveMode(requestedMode, source string, fromThisMachine bool) (jobs.JobMode, error) {
-	if fromThisMachine && strings.EqualFold(strings.TrimSpace(source), "CLI") {
-		return parseJobMode(requestedMode)
-	}
+// errManualNeedsRoot refuses manual mode to a caller that is not root's CLI.
+var errManualNeedsRoot = errors.New("manual mode skips the release policy's checks, so only root's payram-updater command may use it: run it with sudo")
 
-	return jobs.JobModeDashboard, nil
+// resolveMode decides a request's mode. MANUAL skips the release policy's
+// gates, so only root's CLI may ask for it (fromRootCLI: a request from this
+// machine carrying the token only root can read). Any other request is
+// DASHBOARD, except that a request claiming to be the CLI and asking for
+// MANUAL without the token is refused, so the operator learns to use sudo
+// instead of silently getting the dashboard's checks.
+func resolveMode(requestedMode, source string, fromRootCLI bool) (jobs.JobMode, error) {
+	if !strings.EqualFold(strings.TrimSpace(source), "CLI") {
+		return jobs.JobModeDashboard, nil
+	}
+	mode, err := parseJobMode(requestedMode)
+	if err != nil {
+		return "", err
+	}
+	if mode == jobs.JobModeManual && !fromRootCLI {
+		return "", errManualNeedsRoot
+	}
+	return mode, nil
+}
+
+// isRootCLIRequest reports whether r comes from root's payram-updater command
+// on this machine.
+func (s *Server) isRootCLIRequest(r *http.Request) bool {
+	return network.IsLoopbackRequest(r) && cli.TokenMatches(s.cliToken, r.Header.Get(cli.TokenHeader))
+}
+
+// writeModeError answers a request whose mode was refused.
+func writeModeError(w http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	if errors.Is(err, errManualNeedsRoot) {
+		status = http.StatusForbidden
+	}
+	http.Error(w, sentence(err.Error()), status)
+}
+
+// lookupCurrentVersion asks the running PayRam which version it is (its API,
+// or its image label). "" when it cannot be told; the release checks that
+// need it are then skipped, as for an updater that never knew it.
+func (s *Server) lookupCurrentVersion(ctx context.Context) string {
+	if s.versionLookup != nil {
+		return s.versionLookup(ctx)
+	}
+	version, err := s.runningVersion(ctx, s.fetchPolicyInitVersion(ctx))
+	if err != nil {
+		logger.Warnf("Server", "lookupCurrentVersion", "Could not tell which version PayRam runs (%v); the breakpoint and downgrade checks are skipped for this request", err)
+		return ""
+	}
+	return version
+}
+
+// runningVersion is the version the PayRam container runs, from its API or
+// its image label. It has its own time budget (the policy fetch before it
+// has another).
+func (s *Server) runningVersion(ctx context.Context, initVersion string) (string, error) {
+	lookupCtx, cancel := context.WithTimeout(ctx, time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
+	defer cancel()
+	containerName, err := s.discoverContainerName(lookupCtx)
+	if err != nil {
+		return "", err
+	}
+	version, _, err := s.resolveCoreVersion(lookupCtx, containerName, initVersion)
+	return version, err
 }
 
 // maxRequestBody bounds a plan/run request body; both are a few fields.
@@ -181,7 +240,9 @@ func (s *Server) HandleUpgradeLogs() http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(logs))
+		// The log is cleaned when the updater starts; this also covers a
+		// line that slipped past that (the dashboard shows the log).
+		w.Write([]byte(dockerexec.RedactLines(logs)))
 	}
 }
 
@@ -399,9 +460,9 @@ func (s *Server) HandleUpgradePlan() http.HandlerFunc {
 			return
 		}
 
-		mode, err := resolveMode(req.Mode, req.Source, network.IsLoopbackRequest(r))
+		mode, err := resolveMode(req.Mode, req.Source, s.isRootCLIRequest(r))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeModeError(w, err)
 			return
 		}
 
@@ -415,22 +476,7 @@ func (s *Server) HandleUpgradePlan() http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 
-		// If caller did not supply currentVersion, resolve it from the running container.
-		// This allows payram-core to omit the field entirely while still getting full
-		// gate enforcement (breakpoints and stop points).
-		currentVersion := req.CurrentVersion
-		if currentVersion == "" {
-			resolveCtx, resolveCancel := context.WithTimeout(r.Context(), time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
-			defer resolveCancel()
-			if containerName, cnErr := s.discoverContainerName(resolveCtx); cnErr == nil {
-				initVersion := s.fetchPolicyInitVersion(resolveCtx)
-				if ver, _, verErr := s.resolveCoreVersion(resolveCtx, containerName, initVersion); verErr == nil {
-					currentVersion = ver
-				}
-			}
-		}
-
-		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, currentVersion)
+		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, s.lookupCurrentVersion(r.Context()))
 
 		// Build response
 		response := PlanResponse{
@@ -494,9 +540,9 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 			return
 		}
 
-		mode, err := resolveMode(req.Mode, req.Source, network.IsLoopbackRequest(r))
+		mode, err := resolveMode(req.Mode, req.Source, s.isRootCLIRequest(r))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeModeError(w, err)
 			return
 		}
 
@@ -552,20 +598,7 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 
-		// If caller did not supply currentVersion, resolve it from the running container.
-		currentVersion := req.CurrentVersion
-		if currentVersion == "" {
-			resolveCtx, resolveCancel := context.WithTimeout(r.Context(), time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
-			defer resolveCancel()
-			if containerName, cnErr := s.discoverContainerName(resolveCtx); cnErr == nil {
-				initVersion := s.fetchPolicyInitVersion(resolveCtx)
-				if ver, _, verErr := s.resolveCoreVersion(resolveCtx, containerName, initVersion); verErr == nil {
-					currentVersion = ver
-				}
-			}
-		}
-
-		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, currentVersion)
+		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, s.lookupCurrentVersion(r.Context()))
 		if plan.State == jobs.JobStateFailed {
 			// Planning failed - return error without creating a job
 			w.Header().Set("Content-Type", "application/json")

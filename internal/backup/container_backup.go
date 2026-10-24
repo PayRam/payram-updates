@@ -163,7 +163,7 @@ func (e *ContainerBackupExecutor) ExecuteBackup(ctx context.Context, containerNa
 		return failure
 	}
 
-	if err := secureBackupDir(e.BackupDir, e.Logger); err != nil {
+	if err := SecureBackupDir(e.BackupDir, e.Logger); err != nil {
 		return failedBackup(FailureBackupFailed, err.Error(), false)
 	}
 

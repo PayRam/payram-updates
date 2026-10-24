@@ -1,10 +1,11 @@
 // Package switchover replaces the PayRam container with another version
 // without ever leaving the merchant without one.
 //
-// The new container is created next to the running one (<name>-next), so a
-// bad image, mount or network is found while PayRam still runs. Only then is
-// the old container stopped and renamed aside (<name>-previous, restart policy
-// "no"), the new one renamed to <name> and started. Until the new version has
+// The new container is created next to the running one (<name>-next, restart
+// policy "no"), so a bad image, mount or network is found while PayRam still
+// runs. Only then is the old container stopped and renamed aside
+// (<name>-previous, restart policy "no"), the new one renamed to <name>, given
+// the old one's restart policy and started. Until the new version has
 // proven itself, the old container is kept; any failure puts it back.
 //
 // Restore never trusts the recorded stage alone: it reads which containers
@@ -18,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/payram/payram-updater/internal/container"
 	"github.com/payram/payram-updater/internal/coreclient"
 	"github.com/payram/payram-updater/internal/dockerexec"
 	"github.com/payram/payram-updater/internal/jobs"
@@ -25,7 +27,9 @@ import (
 
 // Docker is the part of the Docker CLI a switchover uses.
 type Docker interface {
-	Run(ctx context.Context, args []string) error
+	// RunWithEnv runs a docker command with env added to its environment
+	// (a container's secret values travel there, not on its command line).
+	RunWithEnv(ctx context.Context, args []string, env []string) error
 	Start(ctx context.Context, name string) error
 	Stop(ctx context.Context, name string) error
 	Remove(ctx context.Context, name string) error
@@ -174,10 +178,11 @@ func (w *Switch) ClearLeftovers(ctx context.Context, name string) error {
 	return nil
 }
 
-// CreateNext creates the new version's container next to the running one.
-// createArgs must create it under NextName(job.ContainerName). Nothing about
-// the running PayRam changes; on error the half-made container is removed.
-func (w *Switch) CreateNext(ctx context.Context, job *jobs.Job, createArgs []string, extraNetworks []string) error {
+// CreateNext creates the new version's container from spec next to the
+// running one, as NextName(job.ContainerName), with restart policy "no" until
+// Cutover starts it. Nothing about the running PayRam changes; on error the
+// half-made container is removed.
+func (w *Switch) CreateNext(ctx context.Context, job *jobs.Job, spec *container.ContainerSpec) error {
 	next := NextName(job.ContainerName)
 	job.NextContainer = next
 	job.SwitchStage = jobs.SwitchStagePrepared
@@ -186,11 +191,11 @@ func (w *Switch) CreateNext(ctx context.Context, job *jobs.Job, createArgs []str
 	}
 
 	w.logf("Creating the new version's container as %s (PayRam keeps running meanwhile)", next)
-	if err := w.Docker.Run(ctx, createArgs); err != nil {
+	if err := w.Docker.RunWithEnv(ctx, spec.CreateArgs(next), spec.Env); err != nil {
 		w.removeQuietly(ctx, next)
 		return &StepError{Code: jobs.FailureDockerCreateFailed, Message: fmt.Sprintf("The new version's container could not be created, so nothing was changed: %s", shortError(err))}
 	}
-	for _, network := range extraNetworks {
+	for _, network := range spec.ExtraNetworks {
 		if err := w.Docker.ConnectNetwork(ctx, network, next); err != nil {
 			w.removeQuietly(ctx, next)
 			return &StepError{Code: jobs.FailureDockerCreateFailed, Message: fmt.Sprintf("The new version's container could not join network %s, so nothing was changed: %s", network, shortError(err))}
@@ -201,9 +206,9 @@ func (w *Switch) CreateNext(ctx context.Context, job *jobs.Job, createArgs []str
 }
 
 // Cutover stops the running container, keeps it as PreviousName with its
-// restart policy switched off, and starts the new one under the original
-// name. currentImage and currentRestartPolicy describe the running container,
-// so Restore can put it back exactly.
+// restart policy switched off, and starts the new one under the original name
+// with the old one's restart policy. currentImage and currentRestartPolicy
+// describe the running container, so Restore can put it back exactly.
 func (w *Switch) Cutover(ctx context.Context, job *jobs.Job, currentImage, currentRestartPolicy string) error {
 	name := job.ContainerName
 	next := NextName(name)
@@ -217,18 +222,20 @@ func (w *Switch) Cutover(ctx context.Context, job *jobs.Job, currentImage, curre
 		return err
 	}
 
+	// The old container must not start by itself once it is stopped: with
+	// "always", Docker would start it again when it restarts, next to the
+	// new one, and two PayRam containers on one data folder run two Postgres
+	// servers on the same files. So its policy goes off before the stop.
+	// (Restore puts the policy back on every failure path from here.)
+	if err := w.Docker.UpdateRestartPolicy(ctx, name, "no"); err != nil {
+		return &StepError{Code: "DOCKER_ERROR", Message: fmt.Sprintf("Could not prepare PayRam's container for the switch: %s", shortError(err))}
+	}
 	w.logf("Stopping %s", name)
 	if err := w.Docker.Stop(ctx, name); err != nil {
 		return &StepError{Code: "DOCKER_ERROR", Message: fmt.Sprintf("PayRam could not be stopped for the update: %s", shortError(err))}
 	}
 
 	// From here PayRam is down until the new or the old container runs.
-	// The old container must not restart by itself while it is set aside:
-	// two PayRam containers on one data folder would run two Postgres
-	// servers on the same files.
-	if err := w.Docker.UpdateRestartPolicy(ctx, name, "no"); err != nil {
-		return &StepError{Code: "DOCKER_ERROR", Message: fmt.Sprintf("Could not set the old container aside: %s", shortError(err)), Changed: true}
-	}
 	if err := w.Docker.Rename(ctx, name, previous); err != nil {
 		return &StepError{Code: "DOCKER_ERROR", Message: fmt.Sprintf("Could not set the old container aside: %s", shortError(err)), Changed: true}
 	}
@@ -239,6 +246,9 @@ func (w *Switch) Cutover(ctx context.Context, job *jobs.Job, currentImage, curre
 	}
 	if err := w.Docker.Rename(ctx, next, name); err != nil {
 		return &StepError{Code: "DOCKER_ERROR", Message: fmt.Sprintf("Could not put the new container in place: %s", shortError(err)), Changed: true}
+	}
+	if err := w.Docker.UpdateRestartPolicy(ctx, name, currentRestartPolicy); err != nil {
+		return &StepError{Code: "DOCKER_ERROR", Message: fmt.Sprintf("Could not give the new container PayRam's restart policy (%s): %s", currentRestartPolicy, shortError(err)), Changed: true}
 	}
 	w.logf("Starting the new version as %s (the old one is kept as %s)", name, previous)
 	job.SwitchedAt = time.Now().UTC()
@@ -451,11 +461,20 @@ func (w *Switch) Restore(ctx context.Context, job *jobs.Job) error {
 		startedFresh = true
 	}
 
-	if job.PreviousRestartPolicy != "" {
-		if err := w.Docker.UpdateRestartPolicy(ctx, name, job.PreviousRestartPolicy); err != nil {
-			return fmt.Errorf("could not restore the restart policy of %s: %w", name, err)
-		}
+	// The restart policy is put back before the start, and retried after
+	// it: failing to restore it must not keep PayRam down.
+	policyRestored := job.PreviousRestartPolicy == ""
+	if !policyRestored {
+		policyRestored = w.Docker.UpdateRestartPolicy(ctx, name, job.PreviousRestartPolicy) == nil
 	}
+	defer func() {
+		if policyRestored {
+			return
+		}
+		if err := w.Docker.UpdateRestartPolicy(ctx, name, job.PreviousRestartPolicy); err != nil {
+			w.logf("Warning: PayRam runs, but its restart policy could not be set back to %s (%s). Set it with `docker update --restart %s %s`, or it will not start by itself after a reboot.", job.PreviousRestartPolicy, shortError(err), job.PreviousRestartPolicy, name)
+		}
+	}()
 	if startedFresh {
 		w.logf("Starting %s", name)
 		if err := w.Docker.Start(ctx, name); err != nil {

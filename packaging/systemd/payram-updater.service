@@ -11,6 +11,9 @@ Wants=docker.service network-online.target
 Type=simple
 User=root
 Group=root
+# systemd's default PATH has no /snap/bin, where a Docker installed as a snap
+# (offered by Ubuntu Server's installer) puts the docker command.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 EnvironmentFile=/etc/payram/updater.env
 ExecStart=/usr/local/bin/payram-updater serve
 Restart=always

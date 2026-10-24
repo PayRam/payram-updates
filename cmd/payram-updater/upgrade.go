@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 
@@ -28,42 +27,18 @@ func runDryRun() {
 		os.Exit(1)
 	}
 
-	port := getPort()
-	url := fmt.Sprintf("http://127.0.0.1:%d/upgrade/plan", port)
-
-	// Create request payload
-	payload := map[string]string{
+	status, body := postToDaemon("/upgrade/plan", map[string]string{
 		"mode":            string(req.Mode),
 		"requestedTarget": req.RequestedTarget,
 		"source":          "CLI",
-	}
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create request: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Send POST request
-	resp, err := http.Post(url, "application/json", bytes.NewReader(payloadBytes))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect to daemon: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Is the payram-updater daemon running?\n")
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read response: %v\n", err)
-		os.Exit(1)
-	}
+	})
 
 	// Pretty-print JSON
 	var prettyJSON bytes.Buffer
 	if err := json.Indent(&prettyJSON, body, "", "  "); err != nil {
 		// If JSON formatting fails, just print raw response
 		fmt.Println(string(body))
-		if resp.StatusCode != http.StatusOK {
+		if status != http.StatusOK {
 			os.Exit(1)
 		}
 		return
@@ -82,7 +57,7 @@ func runDryRun() {
 		}
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	if status != http.StatusOK {
 		os.Exit(1)
 	}
 }
@@ -104,34 +79,12 @@ func runRun() {
 		os.Exit(1)
 	}
 
-	port := getPort()
-
 	// Step 1: Call /upgrade/plan to validate and get resolved values
-	planURL := fmt.Sprintf("http://127.0.0.1:%d/upgrade/plan", port)
-	planPayload := map[string]string{
+	_, planBody := postToDaemon("/upgrade/plan", map[string]string{
 		"mode":            string(req.Mode),
 		"requestedTarget": req.RequestedTarget,
 		"source":          "CLI",
-	}
-	planPayloadBytes, err := json.Marshal(planPayload)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create request: %v\n", err)
-		os.Exit(1)
-	}
-
-	planResp, err := http.Post(planURL, "application/json", bytes.NewReader(planPayloadBytes))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect to daemon: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Is the payram-updater daemon running?\n")
-		os.Exit(1)
-	}
-	defer planResp.Body.Close()
-
-	planBody, err := io.ReadAll(planResp.Body)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read response: %v\n", err)
-		os.Exit(1)
-	}
+	})
 
 	// Parse plan response
 	var plan struct {
@@ -170,33 +123,14 @@ func runRun() {
 	confirmer.ConfirmOrExit(summary, *yes)
 
 	// Step 4: User confirmed - call /upgrade/run to start the job
-	runURL := fmt.Sprintf("http://127.0.0.1:%d/upgrade/run", port)
-	runPayload := map[string]string{
+	runStatus, runBody := postToDaemon("/upgrade/run", map[string]string{
 		"mode":            string(req.Mode),
 		"requestedTarget": req.RequestedTarget,
 		"source":          "CLI",
-	}
-	runPayloadBytes, err := json.Marshal(runPayload)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create request: %v\n", err)
-		os.Exit(1)
-	}
-
-	runResp, err := http.Post(runURL, "application/json", bytes.NewReader(runPayloadBytes))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect to daemon: %v\n", err)
-		os.Exit(1)
-	}
-	defer runResp.Body.Close()
-
-	runBody, err := io.ReadAll(runResp.Body)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read response: %v\n", err)
-		os.Exit(1)
-	}
+	})
 
 	// Handle conflict (409)
-	if runResp.StatusCode == http.StatusConflict {
+	if runStatus == http.StatusConflict {
 		var conflictResp struct {
 			Error string `json:"error"`
 			JobID string `json:"jobId"`
