@@ -52,5 +52,7 @@ updater-configs/
 docs/
 copy*
 
-# written by the history store when STATE_DIR is unset (tests, local runs)
-history.jsonl
+# written by the history store when STATE_DIR is unset and the updater runs
+# from the repository root. Only there: a test that writes one into a
+# package folder must show up in CI's clean-tree check.
+/history.jsonl

@@ -681,6 +681,9 @@ func TestHandleUpgradeRun_Success(t *testing.T) {
 	}
 	jobStore := jobs.NewStore(tmpDir)
 	server := New(cfg, jobStore)
+	// The update the request starts writes into tmpDir; let it end before
+	// the temp dir is removed (cleanups run last-in, first-out).
+	t.Cleanup(func() { server.upgradeWg.Wait() })
 
 	body := strings.NewReader(`{"requestedTarget":"v1.7.0","source":"CLI"}`)
 	req := httptest.NewRequest(http.MethodPost, "/upgrade/run", body)

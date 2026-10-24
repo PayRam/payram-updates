@@ -19,11 +19,15 @@ func TestCheckCleanupTarget_RefusesDangerousPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	cases := map[string]string{
-		"":                 "not configured",
-		"/":                "root directory",
-		home:               "home directory",
-		filepath.Dir(home): "home directory",
-		link:               "root directory",
+		"":   "not configured",
+		"/":  "root directory",
+		home: "home directory",
+		link: "root directory",
+	}
+	// As root, HOME is /root and its parent is the root directory, which is
+	// refused as such (checked above).
+	if parent := filepath.Dir(home); parent != "/" {
+		cases[parent] = "home directory"
 	}
 	for target, want := range cases {
 		err := checkCleanupTarget(target, target)
