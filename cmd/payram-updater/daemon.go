@@ -154,7 +154,7 @@ func runRestart() {
 	}
 
 	// Execute systemctl restart
-	cmd := exec.Command("sudo", systemctlPath, "restart", "payram-updater")
+	cmd := asRoot(systemctlPath, "restart", "payram-updater")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to restart service: %v\n", err)
@@ -171,11 +171,20 @@ func runRestart() {
 
 	// Show status
 	fmt.Println("\nService status:")
-	statusCmd := exec.Command("sudo", systemctlPath, "status", "payram-updater", "--no-pager", "-l")
+	statusCmd := asRoot(systemctlPath, "status", "payram-updater", "--no-pager", "-l")
 	statusOutput, _ := statusCmd.CombinedOutput()
 	if len(statusOutput) > 0 {
 		fmt.Println(string(statusOutput))
 	}
+}
+
+// asRoot runs a command as root: directly when this already is root (many
+// servers run as root and have no sudo installed), through sudo otherwise.
+func asRoot(name string, args ...string) *exec.Cmd {
+	if os.Geteuid() == 0 {
+		return exec.Command(name, args...)
+	}
+	return exec.Command("sudo", append([]string{name}, args...)...)
 }
 
 func checkPayramContainer(cfg *config.Config) error {

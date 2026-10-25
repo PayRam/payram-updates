@@ -1,10 +1,13 @@
 package network
 
 import (
+	"context"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestAllowedIPsMiddleware_AllowedIP(t *testing.T) {
@@ -117,5 +120,47 @@ func TestGetClientIP(t *testing.T) {
 				t.Errorf("expected IP %s, got %s", tt.expectedIP, ip)
 			}
 		})
+	}
+}
+
+func TestAllowList_LooksTheContainerUpAgainWhenItsAddressChanges(t *testing.T) {
+	current := []string{"172.17.0.2"}
+	lookups := 0
+	list := NewAllowList(func(context.Context) ([]string, error) {
+		lookups++
+		return current, nil
+	}, 0, log.New(io.Discard, "", 0))
+
+	if !list.Allows("172.17.0.2") {
+		t.Fatal("the container's address must be allowed")
+	}
+	// An update recreated the container with a new address.
+	current = []string{"172.17.0.3"}
+	if !list.Allows("172.17.0.3") {
+		t.Fatal("the recreated container's new address must be allowed after a lookup")
+	}
+	if list.Allows("172.17.0.2") {
+		t.Fatal("the old address must no longer be allowed")
+	}
+	if !list.Allows("127.0.0.1") || !list.Allows("::1") {
+		t.Fatal("this machine is always allowed")
+	}
+	if lookups < 2 {
+		t.Fatalf("lookups = %d, want a fresh lookup for the unknown address", lookups)
+	}
+}
+
+func TestAllowList_LookupsAreRateLimited(t *testing.T) {
+	lookups := 0
+	list := NewAllowList(func(context.Context) ([]string, error) {
+		lookups++
+		return []string{"172.17.0.2"}, nil
+	}, time.Hour, log.New(io.Discard, "", 0))
+
+	for i := 0; i < 50; i++ {
+		list.Allows("10.9.9.9")
+	}
+	if lookups != 1 {
+		t.Fatalf("lookups = %d, want 1 (an unknown address must not trigger a docker inspect per request)", lookups)
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/payram/payram-updater/internal/dockerexec"
 )
 
 const (
@@ -87,14 +89,32 @@ func (d *DockerInspector) CheckDaemon(ctx context.Context) error {
 	return nil
 }
 
-// ContainerExists checks if a container exists (running or stopped).
+// ContainerExists checks if a container exists (running or stopped). Any
+// docker failure other than "no such container" is returned as an error, so
+// a daemon problem is not mistaken for a missing container.
 func (d *DockerInspector) ContainerExists(ctx context.Context, container string) (bool, error) {
-	_, err := d.Executor.Execute(ctx, d.DockerBin, []string{"inspect", container}, nil)
+	output, err := d.Executor.Execute(ctx, d.DockerBin, []string{"inspect", container}, nil)
 	if err != nil {
-		// Container doesn't exist - executor returns error for non-zero exit
-		return false, nil
+		if dockerexec.IsNotFound(string(output)) {
+			return false, nil
+		}
+		return false, fmt.Errorf("docker inspect %s failed: %w: %s", container, err, strings.TrimSpace(string(output)))
 	}
 	return true, nil
+}
+
+// ContainerRunning reports whether a container exists and is running.
+func (d *DockerInspector) ContainerRunning(ctx context.Context, container string) (bool, error) {
+	output, err := d.Executor.Execute(ctx, d.DockerBin,
+		[]string{"inspect", "--format", "{{.State.Running}}", container}, nil)
+	if err != nil {
+		outputStr := string(output)
+		if dockerexec.IsNotFound(outputStr) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to inspect container: %w: %s", err, strings.TrimSpace(outputStr))
+	}
+	return strings.TrimSpace(string(output)) == "true", nil
 }
 
 // GetContainerEnv extracts environment variables from a running container.
@@ -104,8 +124,7 @@ func (d *DockerInspector) GetContainerEnv(ctx context.Context, container string)
 		[]string{"inspect", "--format", "{{json .Config.Env}}", container}, nil)
 	if err != nil {
 		outputStr := string(output)
-		if strings.Contains(outputStr, "No such object") ||
-			strings.Contains(outputStr, "No such container") {
+		if dockerexec.IsNotFound(outputStr) {
 			return nil, fmt.Errorf("container not found: %s", container)
 		}
 		return nil, fmt.Errorf("failed to inspect container: %w: %s", err, outputStr)
@@ -203,9 +222,9 @@ func PersistDBCredentials(backupDir string, config *ContainerDBConfig) error {
 		return fmt.Errorf("refusing to persist credentials for non-local database: %s", config.Host)
 	}
 
-	// Ensure state directory exists
+	// Ensure state directory exists; it holds the database password.
 	stateDir := filepath.Join(backupDir, "../state")
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return fmt.Errorf("failed to create state directory: %w", err)
 	}
 
@@ -221,9 +240,13 @@ func PersistDBCredentials(backupDir string, config *ContainerDBConfig) error {
 		content += fmt.Sprintf("POSTGRES_SSLMODE=%s\n", config.SSLMode)
 	}
 
-	// Write with restricted permissions
+	// Write with restricted permissions. WriteFile keeps the mode of an
+	// existing file, so tighten it explicitly.
 	if err := os.WriteFile(dbEnvPath, []byte(content), DBEnvFilePerms); err != nil {
 		return fmt.Errorf("failed to write db.env: %w", err)
+	}
+	if err := os.Chmod(dbEnvPath, DBEnvFilePerms); err != nil {
+		return fmt.Errorf("failed to restrict db.env permissions: %w", err)
 	}
 
 	return nil

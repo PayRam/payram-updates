@@ -44,15 +44,19 @@ func (s *Store) Append(event Event) error {
 		event.ID = fmt.Sprintf("evt-%d", time.Now().UnixNano())
 	}
 
-	if err := os.MkdirAll(filepath.Dir(s.path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.path), 0700); err != nil {
 		return fmt.Errorf("failed to create history directory: %w", err)
 	}
 
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// Root only: events name backup files and database hosts.
+	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open history file: %w", err)
 	}
 	defer f.Close()
+	if err := f.Chmod(0600); err != nil {
+		return fmt.Errorf("failed to restrict history file: %w", err)
+	}
 
 	data, err := json.Marshal(event)
 	if err != nil {

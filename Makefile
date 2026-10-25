@@ -13,6 +13,14 @@ GOFLAGS := -v
 COVERAGE_FILE := coverage.out
 COVERAGE_HTML := coverage.html
 
+# Release build settings. VERSION is stamped into the binary (payram-updater version);
+# the release workflow passes the tag, local builds describe the checkout.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+RELEASE_TARGETS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
+RELEASE_LDFLAGS := -s -w -X main.version=$(VERSION)
+# sha256sum on Linux runners, shasum on macOS; both print "<sum>  <file>".
+SHA256 := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "shasum -a 256")
+
 # Colors for help text
 CYAN := \033[36m
 RESET := \033[0m
@@ -81,19 +89,49 @@ build: ## Build the payram-updater binary
 	@echo "Build complete: $(BUILD_DIR)/$(BINARY_NAME)"
 
 .PHONY: build-release
-build-release: ## Build release binaries for all platforms
-	@echo "Building release binaries..."
+build-release: ## Build static release binaries for all platforms, plus SHA256SUMS (VERSION=<tag> to override)
+	@echo "Building release binaries ($(VERSION))..."
+	@rm -rf $(BUILD_DIR)/release
 	@mkdir -p $(BUILD_DIR)/release
-	@echo "Building for Linux AMD64..."
-	@GOOS=linux GOARCH=amd64 $(GO) build -o $(BUILD_DIR)/release/$(BINARY_NAME)-linux-amd64 $(MAIN_PATH)
-	@echo "Building for Linux ARM64..."
-	@GOOS=linux GOARCH=arm64 $(GO) build -o $(BUILD_DIR)/release/$(BINARY_NAME)-linux-arm64 $(MAIN_PATH)
-	@echo "Building for macOS AMD64..."
-	@GOOS=darwin GOARCH=amd64 $(GO) build -o $(BUILD_DIR)/release/$(BINARY_NAME)-darwin-amd64 $(MAIN_PATH)
-	@echo "Building for macOS ARM64 (Apple Silicon)..."
-	@GOOS=darwin GOARCH=arm64 $(GO) build -o $(BUILD_DIR)/release/$(BINARY_NAME)-darwin-arm64 $(MAIN_PATH)
+	@set -euo pipefail; \
+	for target in $(RELEASE_TARGETS); do \
+		os=$${target%/*}; arch=$${target#*/}; \
+		out=$(BUILD_DIR)/release/$(BINARY_NAME)-$$os-$$arch; \
+		echo "Building for $$os/$$arch..."; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath -ldflags "$(RELEASE_LDFLAGS)" -o $$out $(MAIN_PATH); \
+	done
+	@echo "Writing checksums (per-binary .sha256 for older installers, plus SHA256SUMS)..."
+	@set -euo pipefail; cd $(BUILD_DIR)/release; \
+	for target in $(RELEASE_TARGETS); do \
+		f=$(BINARY_NAME)-$${target%/*}-$${target#*/}; \
+		$(SHA256) "$$f" > "$$f.sha256"; \
+		cat "$$f.sha256" >> SHA256SUMS; \
+	done
 	@echo "Release binaries built in $(BUILD_DIR)/release/"
 	@ls -lh $(BUILD_DIR)/release/
+
+.PHONY: check-release
+check-release: ## Verify release binaries: all present, checksums match, Linux ones static, version stamped
+	@set -euo pipefail; cd $(BUILD_DIR)/release; \
+	for target in $(RELEASE_TARGETS); do \
+		f=$(BINARY_NAME)-$${target%/*}-$${target#*/}; \
+		for need in "$$f" "$$f.sha256"; do \
+			if [ ! -s "$$need" ]; then echo "ERROR: missing $$need"; exit 1; fi; \
+		done; \
+	done; \
+	$(SHA256) -c SHA256SUMS; \
+	for f in $(BINARY_NAME)-linux-*; do \
+		case $$f in *.sha256) continue ;; esac; \
+		if ! file "$$f" | grep -q 'statically linked'; then \
+			echo "ERROR: $$f is not statically linked (it would need the server's glibc):"; file "$$f"; exit 1; \
+		fi; \
+	done; \
+	native=$(BINARY_NAME)-$$($(GO) env GOOS)-$$($(GO) env GOARCH); \
+	got=$$(./$$native version); \
+	if [ "$$got" != "$(VERSION)" ]; then \
+		echo "ERROR: $$native version printed '$$got', expected '$(VERSION)'"; exit 1; \
+	fi; \
+	echo "Release binaries OK ($(VERSION))"
 
 ##@ Run
 

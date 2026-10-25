@@ -104,6 +104,15 @@ func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTa
 		plan.Manifest.Image.Repo = s.config.ImageRepoOverride
 	}
 
+	// The manifest is fetched over the network and names the image every
+	// merchant's next update runs: only PayRam's own image is accepted.
+	if !s.isAllowedImageRepo(plan.Manifest.Image.Repo) {
+		plan.State = jobs.JobStateFailed
+		plan.FailureCode = jobs.FailureTargetNotAllowed
+		plan.Message = fmt.Sprintf("The update instructions name the image %q, which is not PayRam's; nothing was changed", plan.Manifest.Image.Repo)
+		return plan
+	}
+
 	// Step 3: Resolve target
 	// If "latest" is requested, resolve it from the policy
 	resolvedTarget := requestedTarget
@@ -141,8 +150,9 @@ func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTa
 	// When both kinds exist, the lowest-version gate wins.
 	// When currentVersion is empty, gate logic is skipped.
 	if mode == jobs.JobModeDashboard && policyData != nil && currentVersion != "" {
+		// "3.9.0-arm64" is the arm64 build of 3.9.0, not a pre-release of it.
 		normalizeVer := func(v string) string {
-			return strings.TrimPrefix(strings.TrimSpace(v), "v")
+			return baseVersionTag(strings.TrimPrefix(strings.TrimSpace(v), "v"))
 		}
 
 		cur, curErr := goversion.NewVersion(normalizeVer(currentVersion))
@@ -230,6 +240,23 @@ func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTa
 		}
 	}
 
+	// A dashboard update only ever installs a published release, and never
+	// an older one than PayRam runs (older code on a migrated database).
+	if mode == jobs.JobModeDashboard && policyData != nil && !s.config.DebugVersionMode {
+		if !isPublishedRelease(policyData.Releases, resolvedTarget) {
+			plan.State = jobs.JobStateFailed
+			plan.FailureCode = jobs.FailureTargetNotAllowed
+			plan.Message = fmt.Sprintf("Version %s is not a published PayRam release; nothing was changed", resolvedTarget)
+			return plan
+		}
+		if isOlderVersion(resolvedTarget, currentVersion) {
+			plan.State = jobs.JobStateFailed
+			plan.FailureCode = jobs.FailureTargetNotAllowed
+			plan.Message = fmt.Sprintf("Version %s is older than the running %s; the dashboard does not downgrade PayRam. Nothing was changed", resolvedTarget, currentVersion)
+			return plan
+		}
+	}
+
 	plan.ResolvedTarget = resolvedTarget
 	plan.State = jobs.JobStateReady
 	plan.Message = "Upgrade plan validated successfully"
@@ -240,4 +267,64 @@ func (s *Server) PlanUpgrade(ctx context.Context, mode jobs.JobMode, requestedTa
 	}
 
 	return plan
+}
+
+// hops lists the versions an update passes through: the stepping stone of a
+// breakpoint (if any), then the target. Tags carry no architecture suffix.
+func (p *UpgradePlan) hops() []string {
+	if p.SteppingStone != "" {
+		return []string{p.SteppingStone, p.ResolvedTarget}
+	}
+	return []string{p.ResolvedTarget}
+}
+
+// policyInitVersion is the policy's updater_api_init_version ("" without a
+// policy): targets below it have no /api/v1/health and are probed the old way.
+func (p *UpgradePlan) policyInitVersion() string {
+	if p.policyData == nil {
+		return ""
+	}
+	return strings.TrimSpace(p.policyData.UpdaterAPIInitVersion)
+}
+
+// isAllowedImageRepo accepts PayRam's image (and IMAGE_REPO_OVERRIDE, the
+// testing repo an operator set on this machine).
+func (s *Server) isAllowedImageRepo(repo string) bool {
+	normalized := normalizeImageRepo(repo)
+	if normalized == "payramapp/payram" {
+		return true
+	}
+	return s.config.ImageRepoOverride != "" && normalized == normalizeImageRepo(s.config.ImageRepoOverride)
+}
+
+func normalizeImageRepo(repo string) string {
+	repo = strings.TrimSpace(repo)
+	for _, prefix := range []string{"docker.io/", "index.docker.io/", "registry-1.docker.io/"} {
+		repo = strings.TrimPrefix(repo, prefix)
+	}
+	return strings.TrimPrefix(repo, "library/")
+}
+
+func normalizeReleaseVersion(v string) string {
+	return strings.TrimPrefix(strings.TrimSpace(v), "v")
+}
+
+func isPublishedRelease(releases []string, target string) bool {
+	want := normalizeReleaseVersion(target)
+	for _, release := range releases {
+		if normalizeReleaseVersion(release) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// isOlderVersion reports target < current; false when either is not a version.
+func isOlderVersion(target, current string) bool {
+	tgt, err1 := goversion.NewVersion(baseVersionTag(normalizeReleaseVersion(target)))
+	cur, err2 := goversion.NewVersion(baseVersionTag(normalizeReleaseVersion(current)))
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return tgt.LessThan(cur)
 }

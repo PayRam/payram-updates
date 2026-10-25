@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -22,6 +23,98 @@ import (
 	"github.com/payram/payram-updater/internal/recovery"
 )
 
+// resolveTargetContainer names PayRam's container: TARGET_CONTAINER_NAME or
+// the manifest's container_name, else the container the last job worked on,
+// else the running PayRam container found by its image.
+func resolveTargetContainer(ctx context.Context, cfg *config.Config, job *jobs.Job) (string, error) {
+	manifestClient := manifest.NewClient(time.Duration(cfg.FetchTimeoutSeconds) * time.Second)
+	manifestData, _ := manifestClient.Fetch(ctx, cfg.RuntimeManifestURL)
+
+	resolved, err := container.NewResolver(cfg.TargetContainerName, cfg.DockerBin, log.Default()).Resolve(manifestData)
+	if err == nil {
+		return resolved.Name, nil
+	}
+	if resErr, ok := err.(*container.ResolutionError); !ok || resErr.GetFailureCode() != "CONTAINER_NAME_UNRESOLVED" {
+		return "", err
+	}
+	if job != nil && job.ContainerName != "" {
+		return job.ContainerName, nil
+	}
+
+	imagePattern := "payramapp/payram:"
+	if cfg.ImageRepoOverride != "" {
+		imagePattern = cfg.ImageRepoOverride + ":"
+	}
+	discovered, discoverErr := container.NewDiscoverer(cfg.DockerBin, imagePattern, log.Default()).DiscoverPayramContainer(ctx)
+	if discoverErr != nil {
+		return "", err
+	}
+	return discovered.Name, nil
+}
+
+// resolveTargetContainerOrDefault is resolveTargetContainer for the read-only
+// commands: when PayRam's container cannot be named they go on with the
+// standard name, so the merchant still gets a diagnosis.
+func resolveTargetContainerOrDefault(ctx context.Context, cfg *config.Config, job *jobs.Job) string {
+	name, err := resolveTargetContainer(ctx, cfg, job)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: could not resolve the target container (%v); using %q.\n", err, recovery.DefaultContainerName)
+		fmt.Fprintf(os.Stderr, "Set TARGET_CONTAINER_NAME in /etc/payram/updater.env if PayRam's container has another name.\n")
+		name = recovery.DefaultContainerName
+	}
+	fmt.Printf("Target container resolved as: %s\n\n", name)
+	return name
+}
+
+// resolveCoreBaseURL picks the address to reach PayRam on. CORE_BASE_URL wins
+// when set. Otherwise it takes the first of these that answers: the URL the
+// last job used, the discovered one, and PayRam's standard HTTPS and HTTP
+// addresses, so a wrong guess (such as the unpublished port 8080) never makes
+// a healthy PayRam look down.
+func resolveCoreBaseURL(ctx context.Context, cfg *config.Config, containerName string, job *jobs.Job) string {
+	if cfg.CoreBaseURL != "" {
+		return cfg.CoreBaseURL
+	}
+
+	candidates := []func() string{
+		func() string {
+			if job == nil {
+				return ""
+			}
+			return job.CoreBaseURL
+		},
+		func() string { return discoverCoreBaseURLWithContainer(ctx, cfg, containerName) },
+		func() string { return "https://127.0.0.1" },
+		func() string { return "http://127.0.0.1" },
+	}
+	first := ""
+	tried := map[string]bool{}
+	for _, candidate := range candidates {
+		baseURL := candidate()
+		if baseURL == "" || tried[baseURL] {
+			continue
+		}
+		tried[baseURL] = true
+		if first == "" {
+			first = baseURL
+		}
+		if coreAnswers(ctx, baseURL) {
+			return baseURL
+		}
+	}
+	return first
+}
+
+// coreAnswers reports whether PayRam replies to a health check at baseURL.
+func coreAnswers(ctx context.Context, baseURL string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if _, err := coreclient.NewClient(baseURL).Health(probeCtx); err == nil {
+		return true
+	}
+	return corecompat.LegacyHealth(probeCtx, baseURL) == nil
+}
+
 func runInspect() {
 	// Load configuration
 	cfg, err := config.Load()
@@ -32,54 +125,19 @@ func runInspect() {
 
 	// Initialize job store (read-only)
 	jobStore := jobs.NewStore(cfg.StateDir)
+	latestJob := loadLatestJob(jobStore)
 
-	// Resolve container name
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	// Fetch manifest to get container name if not set in env
-	manifestClient := manifest.NewClient(time.Duration(cfg.FetchTimeoutSeconds) * time.Second)
-	manifestData, _ := manifestClient.Fetch(ctx, cfg.RuntimeManifestURL)
-
-	// Use imagePattern for discovery (default to payramapp/payram if not overridden)
-	imagePattern := "payramapp/payram:"
-	if cfg.ImageRepoOverride != "" {
-		imagePattern = cfg.ImageRepoOverride + ":"
-	}
-
-	resolver := container.NewResolver(cfg.TargetContainerName, cfg.DockerBin, log.Default())
-	resolved, err := resolver.Resolve(manifestData)
-	if err != nil {
-		if resErr, ok := err.(*container.ResolutionError); ok && resErr.GetFailureCode() == "CONTAINER_NAME_UNRESOLVED" {
-			discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, log.Default())
-			discovered, discoverErr := discoverer.DiscoverPayramContainer(ctx)
-			if discoverErr != nil {
-				fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Set TARGET_CONTAINER_NAME environment variable or ensure manifest has container_name\n")
-				os.Exit(1)
-			}
-			containerName := discovered.Name
-			fmt.Printf("Target container discovered as: %s\n\n", containerName)
-			resolved = &container.ResolvedContainer{Name: containerName}
-		} else {
-			fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
-			fmt.Fprintf(os.Stderr, "Set TARGET_CONTAINER_NAME environment variable or ensure manifest has container_name\n")
-			os.Exit(1)
-		}
-	}
-	containerName := resolved.Name
-	if containerName != "" {
-		fmt.Printf("Target container resolved as: %s\n\n", containerName)
-	}
-
-	// Determine CoreBaseURL: if not provided, discover it using the resolved container name
-	coreBaseURL := discoverCoreBaseURLWithContainer(ctx, cfg, containerName)
+	containerName := resolveTargetContainerOrDefault(ctx, cfg, latestJob)
+	coreBaseURL := resolveCoreBaseURL(ctx, cfg, containerName, latestJob)
 
 	inspector := inspect.NewInspector(
 		jobStore,
 		cfg.DockerBin,
 		containerName,
-		coreBaseURL, // Use resolved CoreBaseURL
+		coreBaseURL,
 		cfg.PolicyURL,
 		cfg.RuntimeManifestURL,
 		cfg.DebugVersionMode,
@@ -116,17 +174,7 @@ func runInspect() {
 	}
 
 	if result.RecoveryPlaybook != nil {
-		fmt.Println("\nRECOVERY PLAYBOOK:")
-		fmt.Printf("  Code: %s\n", result.RecoveryPlaybook.Code)
-		fmt.Printf("  Title: %s\n", result.RecoveryPlaybook.Title)
-		fmt.Printf("  Severity: %s\n", result.RecoveryPlaybook.Severity)
-		if result.RecoveryPlaybook.DataRisk != recovery.DataRiskNone {
-			fmt.Printf("  Data Risk: %s\n", result.RecoveryPlaybook.DataRisk)
-		}
-		fmt.Println("\n  Steps:")
-		for _, step := range result.RecoveryPlaybook.SSHSteps {
-			fmt.Printf("    %s\n", step)
-		}
+		printPlaybookSteps("RECOVERY PLAYBOOK", result.RecoveryPlaybook)
 	}
 
 	fmt.Println(strings.Repeat("=", 60))
@@ -134,6 +182,25 @@ func runInspect() {
 	// Exit with non-zero if BROKEN
 	if result.OverallState == inspect.StateBroken {
 		os.Exit(1)
+	}
+}
+
+// printPlaybookSteps prints a playbook's summary and its numbered steps.
+func printPlaybookSteps(heading string, playbook *recovery.Playbook) {
+	fmt.Printf("\n%s:\n", heading)
+	fmt.Printf("  Code: %s\n", playbook.Code)
+	if playbook.CauseCode != "" {
+		fmt.Printf("  Cause: %s\n", playbook.CauseCode)
+	}
+	fmt.Printf("  Title: %s\n", playbook.Title)
+	fmt.Printf("  Severity: %s\n", playbook.Severity)
+	if playbook.DataRisk != recovery.DataRiskNone {
+		fmt.Printf("  Data Risk: %s\n", playbook.DataRisk)
+	}
+	fmt.Printf("\n  %s\n", playbook.UserMessage)
+	fmt.Println("\n  Steps:")
+	for _, step := range playbook.SSHSteps {
+		fmt.Printf("    %s\n", step)
 	}
 }
 
@@ -145,61 +212,19 @@ func runRecover() {
 		os.Exit(1)
 	}
 
-	// Initialize job store
 	jobStore := jobs.NewStore(cfg.StateDir)
+	latestJob := loadLatestJob(jobStore)
 
-	// Create docker runner
+	// recover only reads container state; it never stops, removes or starts one.
 	runner := &dockerexec.Runner{DockerBin: cfg.DockerBin, Logger: log.Default()}
 
-	// Resolve container name
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Fetch manifest to get container name if not set in env
-	manifestClient := manifest.NewClient(time.Duration(cfg.FetchTimeoutSeconds) * time.Second)
-	manifestData, _ := manifestClient.Fetch(ctx, cfg.RuntimeManifestURL)
+	containerName := resolveTargetContainerOrDefault(ctx, cfg, latestJob)
+	coreBaseURL := resolveCoreBaseURL(ctx, cfg, containerName, latestJob)
 
-	// Use imagePattern for discovery (default to payramapp/payram if not overridden)
-	imagePattern := "payramapp/payram:"
-	if cfg.ImageRepoOverride != "" {
-		imagePattern = cfg.ImageRepoOverride + ":"
-	}
-
-	resolver := container.NewResolver(cfg.TargetContainerName, cfg.DockerBin, log.Default())
-	resolved, err := resolver.Resolve(manifestData)
-	if err != nil {
-		if resErr, ok := err.(*container.ResolutionError); ok && resErr.GetFailureCode() == "CONTAINER_NAME_UNRESOLVED" {
-			discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, log.Default())
-			discovered, discoverErr := discoverer.DiscoverPayramContainer(ctx)
-			if discoverErr != nil {
-				fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Set TARGET_CONTAINER_NAME environment variable or ensure manifest has container_name\n")
-				os.Exit(1)
-			}
-			fmt.Printf("Target container discovered as: %s\n\n", discovered.Name)
-			resolved = &container.ResolvedContainer{Name: discovered.Name}
-		} else {
-			fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
-			fmt.Fprintf(os.Stderr, "Set TARGET_CONTAINER_NAME environment variable or ensure manifest has container_name\n")
-			os.Exit(1)
-		}
-	}
-	containerName := resolved.Name
-	fmt.Printf("Target container resolved as: %s\n\n", containerName)
-
-	// Determine CoreBaseURL: if not provided, discover it dynamically
-	coreBaseURL := discoverCoreBaseURLOrDefault(ctx, cfg)
-
-	// Create recoverer
-	recoverer := recover.NewRecoverer(
-		jobStore,
-		runner,
-		containerName,
-		coreBaseURL, // Use resolved CoreBaseURL
-	)
-
-	// Run recovery (reuse the context from container resolution)
-	result, err := recoverer.Run(ctx)
+	result, err := recover.NewRecoverer(jobStore, runner, containerName, coreBaseURL).Run(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Recovery failed: %v\n", err)
 		os.Exit(1)
@@ -217,9 +242,9 @@ func runRecover() {
 	fmt.Println()
 	fmt.Println(strings.Repeat("=", 60))
 	if result.Success {
-		fmt.Println("✅ RECOVERY SUCCESSFUL")
+		fmt.Println("NOTHING TO RECOVER")
 	} else {
-		fmt.Println("❌ RECOVERY REFUSED/FAILED")
+		fmt.Println("ACTION NEEDED")
 	}
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Printf("\nMessage: %s\n", result.Message)
@@ -228,16 +253,59 @@ func runRecover() {
 		fmt.Printf("\nReason: %s\n", result.Refusals)
 	}
 
-	if result.Action != "" {
-		fmt.Printf("\nAction taken: %s\n", result.Action)
+	if result.Playbook != nil {
+		printPlaybookSteps("RECOVERY STEPS", result.Playbook)
 	}
 
 	fmt.Println(strings.Repeat("=", 60))
 
-	// Exit with non-zero if recovery failed
+	// Exit with non-zero if the merchant has something to do
 	if !result.Success {
 		os.Exit(1)
 	}
+}
+
+// syncRefusal explains why sync must not overwrite the latest job, or returns
+// "" when it may. Overwriting an active job would hide a running update (and
+// let a second one start) or erase what an interrupted one needs to be put back.
+func syncRefusal(job *jobs.Job, now time.Time) string {
+	if job == nil || !job.IsActive() {
+		return ""
+	}
+	silentFor := now.Sub(job.UpdatedAt).Round(time.Second)
+	if recovery.IsStale(job, now) {
+		return fmt.Sprintf("The last update (state %s) stopped making progress %s ago. sync will not write over an interrupted update.\n"+
+			"Restart the updater instead: sudo systemctl restart payram-updater. It puts PayRam back on its own.", job.State, silentFor)
+	}
+	return fmt.Sprintf("An update is running right now (state %s, last progress %s ago). sync would overwrite it and let a second update start.\n"+
+		"Wait for it to finish, then check with: payram-updater status", job.State, silentFor)
+}
+
+// syncedJob records that PayRam runs version, keeping the backup and switch
+// bookkeeping of the job it replaces so nothing that job knew is lost.
+func syncedJob(existing *jobs.Job, version, containerName, coreBaseURL string, now time.Time) *jobs.Job {
+	previousVersion := "unknown"
+	job := jobs.NewJob(fmt.Sprintf("sync-%d", now.UnixNano()), jobs.JobModeManual, version)
+	if existing != nil {
+		previousVersion = existing.ResolvedTarget
+		job.BackupPath = existing.BackupPath
+		job.ContainerName = existing.ContainerName
+		job.FromVersion = existing.FromVersion
+		job.SwitchStage = existing.SwitchStage
+		job.NextContainer = existing.NextContainer
+		job.PreviousContainer = existing.PreviousContainer
+		job.PreviousImage = existing.PreviousImage
+		job.PreviousRestartPolicy = existing.PreviousRestartPolicy
+		job.QuiescedPrograms = existing.QuiescedPrograms
+	}
+	if job.ContainerName == "" {
+		job.ContainerName = containerName
+	}
+	job.CoreBaseURL = coreBaseURL // just answered sync's health check
+	job.ResolvedTarget = version
+	job.State = jobs.JobStateReady
+	job.Message = fmt.Sprintf("Synced from external upgrade (was %s, now %s)", previousVersion, version)
+	return job
 }
 
 func runSync() {
@@ -248,45 +316,45 @@ func runSync() {
 		os.Exit(1)
 	}
 
+	// Hold the container lock while deciding and writing, so no update can
+	// start between the check below and the save.
+	release, err := jobs.AcquireContainerLock(cfg.StateDir)
+	if err != nil {
+		if errors.Is(err, jobs.ErrUpgradeLocked) {
+			fmt.Fprintln(os.Stderr, "An update or restore is changing PayRam right now. Wait for it to finish, then run sync again.")
+		} else {
+			fmt.Fprintf(os.Stderr, "Failed to take the updater lock: %v\n", err)
+		}
+		os.Exit(1)
+	}
+	defer release()
+
+	// Never write over an update that is running or was interrupted.
+	jobStore := jobs.NewStore(cfg.StateDir)
+	existingJob, err := jobStore.LoadLatest()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read the updater's state: %v\n", err)
+		fmt.Fprintf(os.Stderr, "sync will not overwrite a state file it cannot read.\n")
+		os.Exit(1)
+	}
+	if refusal := syncRefusal(existingJob, time.Now().UTC()); refusal != "" {
+		fmt.Fprintln(os.Stderr, refusal)
+		os.Exit(1)
+	}
+
 	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	// Fetch manifest to get container name if not set in env
-	manifestClient := manifest.NewClient(time.Duration(cfg.FetchTimeoutSeconds) * time.Second)
-	manifestData, _ := manifestClient.Fetch(ctx, cfg.RuntimeManifestURL)
-
-	// Use imagePattern for discovery (default to payramapp/payram if not overridden)
-	imagePattern := "payramapp/payram:"
-	if cfg.ImageRepoOverride != "" {
-		imagePattern = cfg.ImageRepoOverride + ":"
-	}
-
-	// Resolve container name
-	resolver := container.NewResolver(cfg.TargetContainerName, cfg.DockerBin, log.Default())
-	resolved, err := resolver.Resolve(manifestData)
+	containerName, err := resolveTargetContainer(ctx, cfg, existingJob)
 	if err != nil {
-		if resErr, ok := err.(*container.ResolutionError); ok && resErr.GetFailureCode() == "CONTAINER_NAME_UNRESOLVED" {
-			discoverer := container.NewDiscoverer(cfg.DockerBin, imagePattern, log.Default())
-			discovered, discoverErr := discoverer.DiscoverPayramContainer(ctx)
-			if discoverErr != nil {
-				fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Set TARGET_CONTAINER_NAME environment variable or ensure manifest has container_name\n")
-				os.Exit(1)
-			}
-			fmt.Printf("Target container discovered as: %s\n\n", discovered.Name)
-			resolved = &container.ResolvedContainer{Name: discovered.Name}
-		} else {
-			fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
-			os.Exit(1)
-		}
+		fmt.Fprintf(os.Stderr, "Failed to resolve target container: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Set TARGET_CONTAINER_NAME environment variable or ensure manifest has container_name\n")
+		os.Exit(1)
 	}
-	containerName := resolved.Name
 	fmt.Printf("Target container resolved as: %s\n\n", containerName)
 
-	// Determine CoreBaseURL: if not provided, discover it dynamically
-	coreBaseURL := discoverCoreBaseURLOrDefault(ctx, cfg)
-
+	coreBaseURL := resolveCoreBaseURL(ctx, cfg, containerName, existingJob)
 	coreClient := coreclient.NewClient(coreBaseURL)
 
 	// Fetch policy init point (if available)
@@ -347,30 +415,18 @@ func runSync() {
 		healthDB = healthResp.DB
 	}
 
-	// Load existing job to check if sync is needed
-	jobStore := jobs.NewStore(cfg.StateDir)
-	existingJob, _ := jobStore.LoadLatest()
-
 	if existingJob != nil && existingJob.State == jobs.JobStateReady && existingJob.ResolvedTarget == currentVersion {
 		fmt.Printf("Internal state already matches running version (%s). No sync needed.\n", currentVersion)
 		return
 	}
 
-	// Determine previous version for display
+	// Record the running version, keeping what the previous job knew.
+	syncJob := syncedJob(existingJob, currentVersion, containerName, coreBaseURL, time.Now().UTC())
 	previousVersion := "unknown"
 	if existingJob != nil {
 		previousVersion = existingJob.ResolvedTarget
 	}
 
-	// Create a synthetic job to reflect the external upgrade
-	// Generate a unique job ID
-	jobID := fmt.Sprintf("sync-%d", time.Now().UnixNano())
-	syncJob := jobs.NewJob(jobID, jobs.JobModeManual, currentVersion)
-	syncJob.ResolvedTarget = currentVersion
-	syncJob.State = jobs.JobStateReady
-	syncJob.Message = fmt.Sprintf("Synced from external upgrade (was %s, now %s)", previousVersion, versionResp.Version)
-
-	// Save the synthetic job
 	if err := jobStore.Save(syncJob); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to save sync job: %v\n", err)
 		os.Exit(1)
@@ -384,7 +440,7 @@ func runSync() {
 
 	// Output success
 	fmt.Println(strings.Repeat("=", 60))
-	fmt.Println("✅ SYNC SUCCESSFUL")
+	fmt.Println("SYNC SUCCESSFUL")
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Printf("\nPrevious tracked version: %s\n", previousVersion)
 	fmt.Printf("Current running version:  %s\n", currentVersion)

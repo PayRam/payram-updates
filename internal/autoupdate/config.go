@@ -49,9 +49,9 @@ func Save(path string, settings *Settings) error {
 		return fmt.Errorf("auto_update_interval_hours must be at least 1 when auto updates are enabled")
 	}
 
-	// Ensure parent directory exists
+	// Ensure parent directory exists (the state directory: root only)
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 

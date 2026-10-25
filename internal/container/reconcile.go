@@ -198,11 +198,15 @@ func (r *Reconciler) ReconcileMounts(inspected []Mount, manifestMounts []manifes
 			continue
 		}
 
-		// Determine mount type
-		mountType := "volume"
+		// The manifest is fetched over the network. It may ask for a new
+		// Docker volume, but never for a host folder: a bind mount such as
+		// "/:/host" would hand the whole server to whatever image runs next.
 		if manifestMount.Source != "" {
-			mountType = "bind"
+			r.logger.Printf("Ignoring manifest mount %s -> %s: an update never mounts a new host folder into PayRam",
+				manifestMount.Source, manifestMount.Destination)
+			continue
 		}
+		mountType := "volume"
 
 		// Determine read-write mode
 		isRW := true

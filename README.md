@@ -4,24 +4,58 @@ Manages PayRam runtime upgrades with automated rollback and recovery capabilitie
 
 ## Quick Start
 
-Download and run the installation script:
+Install the updater, or upgrade an existing one, with one command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | sudo bash
-```
-
-Checksum verification (required): the installer verifies the downloaded binary using a published checksum. You can also pass a checksum explicitly:
-
-```bash
-PAYRAM_UPDATER_SHA256="<sha256>" curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | sudo -E bash
 ```
 
 Verify the service is running:
 
 ```bash
 sudo systemctl status payram-updater
+payram-updater version
 payram-updater status
 ```
+
+### Upgrading the updater
+
+Run the same command again. It is safe to re-run at any time:
+
+- **Your settings are kept.** Settings already in `/etc/payram/updater.env` are never changed or removed. Settings the file does not have yet are added with their defaults, after a copy of the file is saved to `/etc/payram/installer-backups/`. If you pass a value (for example `UPDATER_PORT=3000`) that the file already sets differently, the installer says so and keeps the file's value; edit the file to change it.
+- **The service definition is refreshed.** `/etc/systemd/system/payram-updater.service` is rewritten on every run (the old one is saved to `/etc/payram/installer-backups/` when it differs). Put local changes in a drop-in instead: `sudo systemctl edit payram-updater`.
+- **A running PayRam update is never interrupted.** Before it restarts anything, the installer checks the updater's status. If an update is in progress it waits for it to finish (checking every 10 seconds, up to 30 minutes). If it is still running after that, the installer stops without changing anything.
+- **The new binary has to prove itself.** It is checksum-verified and run once on your server before it replaces the current one, which is kept as `/usr/local/bin/payram-updater.previous`. After the restart the updater must answer on `http://127.0.0.1:2567/health` within 60 seconds. If it does not, the previous binary is put back and restarted, and the installer exits with an error saying so.
+
+### Installer options
+
+Pass options to `bash` (through `sudo`), not to `curl`. A variable placed before `curl` only reaches `curl`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | sudo PAYRAM_UPDATER_VERSION=v1.2.3 bash
+```
+
+| Option | Default | What it does |
+|--------|---------|--------------|
+| `PAYRAM_UPDATER_VERSION` | latest release | Install this release tag |
+| `PAYRAM_UPDATER_SHA256` | the release's `.sha256` file | Expected SHA-256 of the binary, given out of band |
+| `ENABLE_SERVICE` | `true` | `false` installs without enabling or restarting the service |
+| `FORCE_REINSTALL` | `false` | Skip the prompts (the env file is still kept and merged, never regenerated) |
+| `QUIET` | `false` | No progress output (errors are still printed) |
+| `UPDATER_PORT`, `POLICY_URL`, `RUNTIME_MANIFEST_URL`, `EXECUTION_MODE`, ... | see [Configuration](#configuration) | Written to a new env file, or added when the file does not have them |
+
+### Pinning a version and its checksum
+
+The installer always checks the downloaded binary against a SHA-256 checksum and refuses to install it if the checksum is missing or does not match. Every release publishes a `SHA256SUMS` file with the checksums of all binaries, plus a `<binary>.sha256` file next to each binary.
+
+To pin everything, take the installer script from the same tag and give the checksum you got separately (for example from that release's `SHA256SUMS`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/<tag>/setup_payram_updater.sh \
+  | sudo PAYRAM_UPDATER_VERSION=<tag> PAYRAM_UPDATER_SHA256=<sha256 of payram-updater-linux-amd64> bash
+```
+
+Use the binary name for your server: `payram-updater-linux-amd64`, `payram-updater-linux-arm64`, `payram-updater-darwin-amd64` or `payram-updater-darwin-arm64`. Release binaries are statically linked, so they do not depend on your distribution's glibc. Tags published before this installer contain the older script, which does not have the safety checks above.
 
 ## What It Does
 
@@ -39,9 +73,14 @@ The PayRam Updater is a background service that:
 payram-updater status
 ```
 
-### Check service health  
+### Check which version is installed
 ```bash
-payram-updater health
+payram-updater version
+```
+
+### Check service health
+```bash
+curl http://127.0.0.1:2567/health
 ```
 
 Returns:
@@ -73,21 +112,23 @@ Requires `sudo` access and systemd.
 
 ## Performing Upgrades
 
+Manual mode (the default for these commands) needs root: run them with `sudo`.
+
 ### Validate an upgrade (dry-run)
 ```bash
-payram-updater dry-run --to latest
+sudo payram-updater dry-run --to latest
 ```
 
 ### Execute an upgrade
 
 Upgrade to the latest version (manual mode):
 ```bash
-payram-updater run --to latest
+sudo payram-updater run --to latest
 ```
 
 Dashboard-controlled upgrade:
 ```bash
-payram-updater run --mode dashboard --to latest
+sudo payram-updater run --mode dashboard --to latest
 ```
 
 You'll see a confirmation prompt before the upgrade starts:
@@ -109,12 +150,12 @@ Proceed? (y/N):
 
 ### Skip confirmation (for automation)
 ```bash
-payram-updater run --to 1.7.8 --yes
+sudo payram-updater run --to 1.7.8 --yes
 ```
 
 ### Upgrade to a specific version
 ```bash
-payram-updater run --to 1.7.8
+sudo payram-updater run --to 1.7.8
 ```
 
 ## Upgrade Modes
@@ -125,6 +166,9 @@ payram-updater run --to 1.7.8
 - Can use "latest" to get newest version from policy
 - For operator-initiated upgrades
 - Use when you need to override policy restrictions
+- Only root's `payram-updater` command can use it (the updater checks a token
+  in its state directory that only root can read), so run it with `sudo`; no
+  other program on the server and not the PayRam container can ask for it
 
 **Dashboard Mode** (recommended for automated upgrades)
 - Uses policy-controlled version selection
@@ -134,6 +178,20 @@ payram-updater run --to 1.7.8
 - Enable with `--mode dashboard`
 
 ## Recovery & Troubleshooting
+
+An update never deletes payment data, and whatever fails, the updater's aim is
+that PayRam ends up running. The new version is started next to the running
+one; if it fails its checks, the updater switches back to the previous version
+on its own. Before anything else after a failed update, check whether PayRam
+answers:
+
+```bash
+curl -sk https://127.0.0.1/api/v1/health   # HTTPS installs
+curl -s http://127.0.0.1/api/v1/health     # HTTP-only installs
+```
+
+A reply containing `"status":"ok"` means PayRam is running: nothing needs
+restoring.
 
 ### Diagnose system health
 ```bash
@@ -145,19 +203,59 @@ This shows:
 - Detected issues and their severity
 - Recovery recommendations
 
-### Attempt automatic recovery
+### Check what needs recovering
 ```bash
 payram-updater recover
 ```
 
-This will attempt to recover from a failed upgrade automatically. Some failures (like database migration errors) require manual intervention for safety.
+Reads the last update and tells you what, if anything, to do. It only reads:
+it never stops, removes or restarts a container. When PayRam was not changed
+or was already put back, it confirms PayRam's container is running and says
+so; when a person has to look, it prints the recovery steps.
 
 ### View recovery guidance
 ```bash
 curl http://127.0.0.1:2567/upgrade/playbook
 ```
 
-Shows detailed recovery steps for the current failure.
+Shows detailed recovery steps for the current failure. Every playbook starts
+with read-only checks. Restoring a backup is only ever offered as the last
+step, to do only if PayRam support asks you to: it removes every payment,
+deposit and payout recorded after the backup was taken.
+
+### What a failed update means
+
+| Code | Is PayRam running? | What to do |
+|------|--------------------|------------|
+| `UPGRADE_ROLLED_BACK` | Yes, on the version it had before. The new version failed (the cause is shown) and the updater switched back. The database was not restored, so payments recorded during the update are kept. | Nothing to recover. Send the updater logs to PayRam support, then retry later. |
+| `ROLLBACK_FAILED` | Maybe not. The new version failed and switching back failed too. | Follow the playbook: it shows how to start `<name>-previous`, the version that ran before. Do not restore a backup unless support asks. |
+| `UPGRADE_INTERRUPTED` | Yes. The updater stopped mid-update (restart, crash, reboot) and put PayRam back when it came up. | Retry the update. |
+| `DOCKER_CREATE_FAILED`, `TARGET_NOT_ALLOWED`, `DOCKER_PULL_FAILED`, `BACKUP_FAILED`, `BACKUP_TIMEOUT`, `DISK_SPACE_LOW`, `POLICY_FETCH_FAILED`, `MANIFEST_FETCH_FAILED`, ... | Yes, unchanged: the update stopped before PayRam was touched. | Fix the cause shown in the playbook and retry. |
+| `HEALTHCHECK_FAILED`, `VERSION_MISMATCH`, `DOCKER_ERROR` (from older updater versions) | Often yes: check first. Updater v0.2.3 reports `HEALTHCHECK_FAILED` on every install that publishes only ports 80/443, even when PayRam is healthy. | Run the health check above. If it replies ok, run `payram-updater sync` and you are done. |
+
+During an update the updater saves its progress at least every 30 seconds. If
+`payram-updater status` shows an update in progress whose `updatedAt` has not
+changed for more than 5 minutes, the updater has stopped working on it: restart
+it with `sudo systemctl restart payram-updater`. When it starts, it puts PayRam
+back on its own. `payram-updater sync` refuses to run while an update is in
+progress or interrupted.
+
+### Freeing disk space safely
+
+The updater keeps the previous PayRam container and its image so it can switch
+back. To free space, use `docker image prune` (untagged layers only) and
+`docker builder prune`, and check `sudo du -sh /var/lib/payram/backups
+/var/log/journal`. Do not run `docker system prune`, `docker container prune`
+or any prune with `-a`: they delete what a switch-back needs.
+
+### Database commands
+
+PayRam's bundled database is never published on the host. Run database
+commands inside the container, for example:
+
+```bash
+docker exec payram sh -c 'pg_isready -U "${POSTGRES_USER:-${POSTGRES_USERNAME:-payram}}" -d "${POSTGRES_DB:-${POSTGRES_DATABASE:-payram}}"'
+```
 
 ## Database Backups
 
@@ -182,30 +280,32 @@ payram-updater backup restore --file /path/to/backup.dump
 
 ## Configuration
 
-The service is configured via environment variables in `/etc/payram/updater.env`.
+The service is configured via environment variables in `/etc/payram/updater.env`. The installer writes it on a new install and only adds missing settings afterwards. See `packaging/examples/updater.env.example` for a complete, commented template.
 
 ### Core Settings
 
-| Setting | Default | Description |
+| Setting | Default (as written by the installer) | Description |
 |---------|---------|-------------|
 | `UPDATER_PORT` | `2567` | HTTP API port |
-| `POLICY_URL` | Required | Upgrade policy JSON URL |
-| `RUNTIME_MANIFEST_URL` | Required | Container manifest JSON URL |
-| `STATE_DIR` | `/var/lib/payram-updater` | Job state persistence directory |
+| `POLICY_URL` | `https://raw.githubusercontent.com/PayRam/payram-scripts/refs/heads/main/updater-configs/upgrade-policy.json` | Upgrade policy JSON URL (required) |
+| `RUNTIME_MANIFEST_URL` | `https://raw.githubusercontent.com/PayRam/payram-scripts/refs/heads/main/updater-configs/runtime-manifest.json` | Container manifest JSON URL (required) |
+| `EXECUTION_MODE` | `execute` | `execute` performs upgrades; `dry-run` only validates them |
+| `STATE_DIR` | `/var/lib/payram-updater` | Job state, logs and history |
 | `FETCH_TIMEOUT_SECONDS` | `10` | HTTP request timeout |
+| `HEALTH_CHECK_TIMEOUT_SECONDS` | `600` | How long an upgrade waits for the new PayRam version to report healthy before switching back |
 | `DOCKER_BIN` | `docker` | Docker binary path |
+| `SUPERVISOR_EXCLUDE` | `postgres,postgresql` | Programs in the PayRam container never stopped for the pre-upgrade backup |
+| `SUPERVISOR_INCLUDE` | (empty) | If set, only these programs are stopped |
 
 ### Database Backup Settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `BACKUP_DIR` | `data/backups` | Backup storage directory |
+| `BACKUP_DIR` | `/var/lib/payram/backups` | Backup storage directory |
 | `BACKUP_RETENTION` | `10` | Number of backups to keep |
-| `PG_HOST` | `127.0.0.1` | PostgreSQL host |
-| `PG_PORT` | `5432` | PostgreSQL port |
-| `PG_DB` | `payram` | Database name |
-| `PG_USER` | `payram` | Database user |
-| `PG_PASSWORD` | (empty) | Database password |
+| `BACKUP_TIMEOUT_SECONDS` | `600` | Time limit for the pre-upgrade backup |
+
+The database credentials are read from the PayRam container, so no `PG_*` settings are needed.
 
 ### Advanced Settings
 
@@ -215,13 +315,17 @@ The service is configured via environment variables in `/etc/payram/updater.env`
 | `IMAGE_REPO_OVERRIDE` | (none) | Override image repository for testing |
 | `TARGET_CONTAINER_NAME` | (auto-detect) | Override target container name |
 
-To reconfigure:
+To reconfigure, edit the file and restart the service. Check `payram-updater status` first: restart only when no update is in progress.
 ```bash
 sudo nano /etc/payram/updater.env
+payram-updater status
 sudo systemctl restart payram-updater
 ```
 
-See `packaging/examples/updater.env.example` for a complete configuration template.
+To change the service itself (for example to add an environment variable or a resource limit), use a drop-in, which the installer leaves alone:
+```bash
+sudo systemctl edit payram-updater
+```
 
 ## View Service Logs
 
@@ -296,17 +400,42 @@ For complete API documentation, see [API.md](API.md).
 ## Uninstall
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/PayRam/payram-updates/main/setup_payram_updater.sh | sudo bash -s -- --uninstall
+```
+
+This removes only the updater's own files: the binary (and `payram-updater.previous`), the service, `/etc/payram/updater.env` (and `/etc/payram/installer-backups/`) and the state directory `/var/lib/payram-updater`. If an update is in progress it waits for it to finish before stopping the updater. Add `--yes` to skip the confirmation prompt.
+
+**Your database backups in `/var/lib/payram/backups` are kept.** To delete them as well, add `--remove-backups`; that removes only that folder.
+
+To uninstall by hand:
+
+```bash
+payram-updater status    # make sure no update is in progress
 sudo systemctl stop payram-updater
 sudo systemctl disable payram-updater
 sudo rm /etc/systemd/system/payram-updater.service
-sudo rm /usr/local/bin/payram-updater
-sudo rm -rf /etc/payram /var/lib/payram-updater /var/lib/payram /var/log/payram-updater
 sudo systemctl daemon-reload
+sudo rm -f /usr/local/bin/payram-updater /usr/local/bin/payram-updater.previous
+sudo rm -rf /etc/payram/updater.env /etc/payram/installer-backups /var/lib/payram-updater
 ```
+
+Do not remove `/var/lib/payram`: it holds the database backups (`/var/lib/payram/backups`). Delete that folder only if you are sure you no longer need them.
+
+## Testing a release
+
+Run all three before publishing an updater release:
+
+```bash
+go test -race ./...      # unit and integration tests
+test/e2e/run.sh          # real PayRam containers through every update path (about 90 minutes)
+test/installer/run.sh    # the installer on fresh Linux servers, and over the released v0.2.3 (about 15 minutes)
+```
+
+See [test/e2e/README.md](test/e2e/README.md) and [test/installer/README.md](test/installer/README.md).
 
 ## Support
 
 For issues or questions:
 - Check logs: `sudo journalctl -u payram-updater -f`
 - Run diagnostics: `payram-updater inspect`
-- Contact: [sales@payram.com](mailto:sales@payram.com)
+- Contact PayRam support: Telegram [t.me/PayRamChat](https://t.me/PayRamChat) or [support@payram.com](mailto:support@payram.com). Attach `payram-updater status`, `payram-updater logs` and `sudo journalctl -u payram-updater --since "6 hours ago" --no-pager`.

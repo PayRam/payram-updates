@@ -10,6 +10,7 @@ import (
 
 	"github.com/payram/payram-updater/internal/coreclient"
 	"github.com/payram/payram-updater/internal/corecompat"
+	"github.com/payram/payram-updater/internal/dockerexec"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/manifest"
 	"github.com/payram/payram-updater/internal/policy"
@@ -86,6 +87,17 @@ type Inspector struct {
 	policyInitSet bool
 	debugMode     bool
 	releaseOrder  []string // For debug mode version ordering
+	now           func() time.Time
+}
+
+// containerFacts is what checkContainer learned, for the recommendations.
+type containerFacts struct {
+	checked        bool   // Docker answered the inspect
+	exists         bool   // PayRam's container exists
+	status         string // its Docker status: running, exited, created, ...
+	previousName   string // the old container the switch renames aside
+	previousExists bool
+	previousStatus string
 }
 
 // NewInspector creates a new inspector with the given configuration.
@@ -106,6 +118,7 @@ func NewInspector(
 		policyURL:     policyURL,
 		manifestURL:   manifestURL,
 		debugMode:     debugMode,
+		now:           time.Now,
 	}
 }
 
@@ -125,7 +138,7 @@ func (i *Inspector) Run(ctx context.Context) *InspectResult {
 	i.checkDockerDaemon(ctx, result)
 
 	// Check 3: Container existence and running state
-	i.checkContainer(ctx, result)
+	facts := i.checkContainer(ctx, result)
 
 	// Check 4: Policy readability
 	i.checkPolicy(ctx, result)
@@ -143,7 +156,7 @@ func (i *Inspector) Run(ctx context.Context) *InspectResult {
 	i.checkUpdateAvailability(ctx, result)
 
 	// Generate recommendations based on state
-	i.generateRecommendations(result)
+	i.generateRecommendations(result, facts)
 
 	return result
 }
@@ -179,43 +192,64 @@ func (i *Inspector) checkLastJob(result *InspectResult) {
 			Status:  "FAILED",
 			Message: fmt.Sprintf("Last upgrade failed: %s - %s", job.FailureCode, job.Message),
 		}
-		result.Issues = append(result.Issues, Issue{
-			Component:   "upgrade",
-			Description: fmt.Sprintf("Last upgrade failed with code %s: %s", job.FailureCode, job.Message),
-			Severity:    "CRITICAL",
-		})
-		result.OverallState = StateBroken
 
 		// Attach recovery playbook (rendered with runtime context if available)
-		ctx := i.buildPlaybookContext(job.BackupPath)
-		playbook := recovery.RenderPlaybook(job.FailureCode, ctx)
+		playbook := recovery.RenderJobPlaybook(job, i.buildPlaybookContext())
 		result.RecoveryPlaybook = &playbook
-	case jobs.JobStateBackingUp, jobs.JobStateExecuting, jobs.JobStateVerifying:
+
+		// A failure that left PayRam unchanged or put it back is not a broken
+		// system: PayRam runs. Only an uncertain outcome is.
+		if playbook.PayRamState == recovery.PayRamUncertain {
+			result.Issues = append(result.Issues, Issue{
+				Component:   "upgrade",
+				Description: fmt.Sprintf("Last upgrade failed with code %s: %s", job.FailureCode, job.Message),
+				Severity:    "CRITICAL",
+			})
+			result.OverallState = StateBroken
+		} else {
+			result.Issues = append(result.Issues, Issue{
+				Component:   "upgrade",
+				Description: fmt.Sprintf("Last upgrade failed with code %s (PayRam was left running): %s", job.FailureCode, job.Message),
+				Severity:    "WARNING",
+			})
+			if result.OverallState == StateOK {
+				result.OverallState = StateDegraded
+			}
+		}
+	case jobs.JobStatePolicyFetching, jobs.JobStateManifestFetching,
+		jobs.JobStateBackingUp, jobs.JobStateExecuting, jobs.JobStateVerifying:
+		silentFor := i.now().Sub(job.UpdatedAt).Round(time.Second)
+		if !recovery.IsStale(job, i.now()) {
+			// A running update saves progress at least every 30 seconds.
+			result.Checks["lastJob"] = CheckResult{
+				Status:  "WARNING",
+				Message: fmt.Sprintf("Upgrade in progress: %s (last progress %s ago)", job.State, silentFor),
+			}
+			result.Issues = append(result.Issues, Issue{
+				Component:   "upgrade",
+				Description: fmt.Sprintf("An upgrade is running (state: %s)", job.State),
+				Severity:    "INFO",
+			})
+			if result.OverallState == StateOK {
+				result.OverallState = StateDegraded
+			}
+			return
+		}
+
 		result.Checks["lastJob"] = CheckResult{
-			Status:  "WARNING",
-			Message: fmt.Sprintf("Upgrade in progress: %s", job.State),
+			Status:  "FAILED",
+			Message: fmt.Sprintf("Upgrade stopped responding in state %s (no progress for %s)", job.State, silentFor),
 		}
 		result.Issues = append(result.Issues, Issue{
 			Component:   "upgrade",
-			Description: fmt.Sprintf("Upgrade is still in state: %s", job.State),
-			Severity:    "WARNING",
+			Description: fmt.Sprintf("The upgrade in state %s has made no progress for %s; the updater has stopped working on it", job.State, silentFor),
+			Severity:    "CRITICAL",
 		})
 		if result.OverallState == StateOK {
 			result.OverallState = StateDegraded
 		}
 
-		// Attach a stale-state recovery playbook so clients know how to recover.
-		var staleCode string
-		switch job.State {
-		case jobs.JobStateBackingUp:
-			staleCode = "STALE_BACKING_UP"
-		case jobs.JobStateExecuting:
-			staleCode = "STALE_EXECUTING"
-		case jobs.JobStateVerifying:
-			staleCode = "STALE_VERIFYING"
-		}
-		pbCtx := i.buildPlaybookContext(job.BackupPath)
-		playbook := recovery.RenderPlaybook(staleCode, pbCtx)
+		playbook := recovery.RenderPlaybook(recovery.StalePlaybookCode(job.State), i.buildPlaybookContext().WithJob(job))
 		result.RecoveryPlaybook = &playbook
 	default:
 		result.Checks["lastJob"] = CheckResult{
@@ -248,27 +282,47 @@ func (i *Inspector) checkDockerDaemon(ctx context.Context, result *InspectResult
 	}
 }
 
-func (i *Inspector) checkContainer(ctx context.Context, result *InspectResult) {
-	// Check if container exists
-	cmd := exec.CommandContext(ctx, i.dockerBin, "inspect", "--format", "{{.State.Status}}", i.containerName)
-	output, err := cmd.Output()
+func (i *Inspector) checkContainer(ctx context.Context, result *InspectResult) containerFacts {
+	facts := containerFacts{previousName: i.containerName + "-previous"}
+	if result.LastJob != nil && result.LastJob.PreviousContainer != "" {
+		facts.previousName = result.LastJob.PreviousContainer
+	}
+
+	status, exists, err := i.containerStatus(ctx, i.containerName)
 	if err != nil {
+		result.Checks["container"] = CheckResult{
+			Status:  "UNKNOWN",
+			Message: fmt.Sprintf("Could not check container '%s': %v", i.containerName, err),
+		}
+		return facts
+	}
+	facts.checked = true
+	facts.exists = exists
+	facts.status = status
+	if !exists || status != "running" {
+		facts.previousStatus, facts.previousExists, _ = i.containerStatus(ctx, facts.previousName)
+	}
+
+	if !exists {
 		result.Checks["container"] = CheckResult{
 			Status:  "WARNING",
 			Message: fmt.Sprintf("Container '%s' does not exist", i.containerName),
 		}
+		description := fmt.Sprintf("Container '%s' is missing", i.containerName)
+		if facts.previousExists {
+			description += fmt.Sprintf("; '%s' (the version before the last update) exists and is %s", facts.previousName, facts.previousStatus)
+		}
 		result.Issues = append(result.Issues, Issue{
 			Component:   "container",
-			Description: fmt.Sprintf("Container '%s' is missing", i.containerName),
-			Severity:    "WARNING",
+			Description: description,
+			Severity:    "CRITICAL",
 		})
 		if result.OverallState == StateOK {
 			result.OverallState = StateDegraded
 		}
-		return
+		return facts
 	}
 
-	status := strings.TrimSpace(string(output))
 	if status == "running" {
 		// Get image info
 		imgCmd := exec.CommandContext(ctx, i.dockerBin, "inspect", "--format", "{{.Config.Image}}", i.containerName)
@@ -293,6 +347,25 @@ func (i *Inspector) checkContainer(ctx context.Context, result *InspectResult) {
 			result.OverallState = StateDegraded
 		}
 	}
+	return facts
+}
+
+// containerStatus returns a container's Docker status ("running", "exited",
+// ...) and whether it exists. err is set only when Docker itself could not
+// answer, so a missing container is never confused with a Docker outage.
+func (i *Inspector) containerStatus(ctx context.Context, name string) (string, bool, error) {
+	output, err := exec.CommandContext(ctx, i.dockerBin, "inspect", "--format", "{{.State.Status}}", name).CombinedOutput()
+	if err != nil {
+		text := strings.TrimSpace(string(output))
+		if dockerexec.IsNotFound(text) {
+			return "", false, nil
+		}
+		if text == "" {
+			return "", false, err
+		}
+		return "", false, fmt.Errorf("%w: %s", err, text)
+	}
+	return strings.TrimSpace(string(output)), true, nil
 }
 
 func (i *Inspector) checkPolicy(ctx context.Context, result *InspectResult) {
@@ -856,47 +929,35 @@ func (i *Inspector) compareVersions(v1, v2 string) int {
 	return 0
 }
 
-func (i *Inspector) generateRecommendations(result *InspectResult) {
+func (i *Inspector) generateRecommendations(result *InspectResult, facts containerFacts) {
 	// Priority-based recommendations
 	priority := 1
+	add := func(action, description string) {
+		result.Recommendations = append(result.Recommendations, Recommendation{
+			Action:      action,
+			Description: description,
+			Priority:    priority,
+		})
+		priority++
+	}
 
-	// If last job failed with MIGRATION_FAILED
-	if result.LastJob != nil && result.LastJob.State == jobs.JobStateFailed {
-		switch result.LastJob.FailureCode {
-		case "MIGRATION_FAILED":
-			result.Recommendations = append(result.Recommendations, Recommendation{
-				Action:      "restore_db",
-				Description: "CRITICAL: Restore database from backup before any further action",
-				Priority:    priority,
-			})
-			priority++
-			result.Recommendations = append(result.Recommendations, Recommendation{
-				Action:      "manual_rollback",
-				Description: "After DB restore, manually run the previous known-good image version",
-				Priority:    priority,
-			})
-			priority++
-		case "DOCKER_ERROR", "HEALTHCHECK_FAILED":
-			result.Recommendations = append(result.Recommendations, Recommendation{
-				Action:      "recover",
-				Description: "Run 'payram-updater recover' to attempt automatic recovery",
-				Priority:    priority,
-			})
-			priority++
-		case "POLICY_FETCH_FAILED", "MANIFEST_FETCH_FAILED", "DOCKER_PULL_FAILED", "CONCURRENCY_BLOCKED":
-			result.Recommendations = append(result.Recommendations, Recommendation{
-				Action:      "retry",
-				Description: "This failure is likely temporary. Retry the upgrade.",
-				Priority:    priority,
-			})
-			priority++
+	job := result.LastJob
+	stale := recovery.IsStale(job, i.now())
+	updateRunning := job != nil && job.IsActive() && !stale
+
+	switch {
+	case updateRunning:
+		add("wait", fmt.Sprintf("An update is running (state %s). Wait for it to finish; do not restart PayRam or the updater meanwhile.", job.State))
+	case stale:
+		add("restart_updater", fmt.Sprintf("The update in state %s has made no progress for more than %d minutes. Restart the updater: sudo systemctl restart payram-updater. It puts PayRam back on its own.", job.State, int(recovery.HeartbeatStaleAfter.Minutes())))
+	case job != nil && job.State == jobs.JobStateFailed && result.RecoveryPlaybook != nil:
+		switch result.RecoveryPlaybook.PayRamState {
+		case recovery.PayRamUnchanged:
+			add("retry", "PayRam was not changed by the failed update. Fix the cause shown in the recovery playbook, then retry the update.")
+		case recovery.PayRamRestored:
+			add("send_logs", "The updater put PayRam back on the version it had before the update. Send the updater logs to PayRam support, then retry the update later.")
 		default:
-			result.Recommendations = append(result.Recommendations, Recommendation{
-				Action:      "wait",
-				Description: "Investigate the failure before taking action",
-				Priority:    priority,
-			})
-			priority++
+			add("check_health", "First check whether PayRam is healthy (step 1 of the recovery playbook), then follow the playbook. Do not restore a backup unless PayRam support asks you to.")
 		}
 	}
 
@@ -916,68 +977,57 @@ func (i *Inspector) generateRecommendations(result *InspectResult) {
 		if versionCheck.Status == "WARNING" && strings.Contains(versionCheck.Message, "External upgrade detected") {
 			healthCheck, healthOK := result.Checks["health"]
 			if healthOK && healthCheck.Status == "OK" {
-				result.Recommendations = append(result.Recommendations, Recommendation{
-					Action:      "sync",
-					Description: "Run 'payram-updater sync' to update internal state to match running version.",
-					Priority:    priority,
-				})
-				priority++
+				add("sync", "Run 'payram-updater sync' to update internal state to match running version.")
 			}
 		}
 	}
 
-	// If container is missing
-	containerCheck, ok := result.Checks["container"]
-	if ok && containerCheck.Status == "WARNING" && strings.Contains(containerCheck.Message, "missing") {
-		result.Recommendations = append(result.Recommendations, Recommendation{
-			Action:      "recover",
-			Description: "Run 'payram-updater recover' to restart the container",
-			Priority:    priority,
-		})
-		priority++
+	// A running update stops and renames containers on purpose; only advise
+	// on the container when no update is working on it.
+	if facts.checked && !updateRunning {
+		name, previous := i.containerName, facts.previousName
+		putPreviousBack := fmt.Sprintf("docker rename %s %s && docker update --restart unless-stopped %s && docker start %s", previous, name, name, name)
+		lastUpdateFailed := stale || (job != nil && job.State == jobs.JobStateFailed)
+		afterRestart := ""
+		if stale {
+			// The restarted updater repairs the switch itself; doing it by
+			// hand at the same time would race it.
+			afterRestart = "If PayRam is still not running a minute after you restart the updater: "
+		}
+		switch {
+		case !facts.exists && facts.previousExists:
+			add("put_previous_back", fmt.Sprintf("PayRam's container '%s' is missing but '%s' (the version that ran before the update) exists: an update was interrupted while switching versions. Restart the updater (sudo systemctl restart payram-updater); it repairs an interrupted update on its own. If PayRam is still not running a minute later, put the previous version back (this does not touch your data): %s", name, previous, putPreviousBack))
+		case !facts.exists:
+			add("find_container", fmt.Sprintf("PayRam's container '%s' does not exist. List every container with: docker ps -a. If PayRam runs under another name, set TARGET_CONTAINER_NAME in /etc/payram/updater.env; otherwise contact PayRam support. Do not delete PayRam's data folders or Docker volumes.", name))
+		case facts.status != "running" && facts.previousExists && lastUpdateFailed:
+			add("put_previous_back", fmt.Sprintf("%sPayRam's container '%s' is %s and '%s' (the version that ran before the failed update) exists. Put the previous version back (this does not touch your data): docker rename %s %s-failed-manual && %s", afterRestart, name, facts.status, previous, name, name, putPreviousBack))
+		case facts.status != "running":
+			add("start_container", fmt.Sprintf("PayRam's container '%s' is %s. Start it: docker start %s", name, facts.status, name))
+		}
 	}
 
 	// If docker daemon is down
 	dockerCheck, ok := result.Checks["dockerDaemon"]
 	if ok && dockerCheck.Status == "FAILED" {
 		result.Recommendations = append(result.Recommendations, Recommendation{
-			Action:      "reinstall",
-			Description: "Docker daemon is not running. Start Docker service or reinstall.",
+			Action:      "start_docker",
+			Description: "Docker is not running, so PayRam is not running either. Start it: sudo systemctl start docker",
 			Priority:    1, // Highest priority
 		})
 	}
 
 	// If everything is OK
 	if result.OverallState == StateOK && len(result.Recommendations) == 0 {
-		result.Recommendations = append(result.Recommendations, Recommendation{
-			Action:      "none",
-			Description: "System is healthy. No action required.",
-			Priority:    priority,
-		})
+		add("none", "System is healthy. No action required.")
 	}
 }
 
-// buildPlaybookContext constructs a PlaybookContext from available inspector state.
-// Uses containerName and coreBaseURL from inspector configuration.
-func (i *Inspector) buildPlaybookContext(backupPath string) recovery.PlaybookContext {
-	ctx := recovery.PlaybookContext{
-		BackupPath:    backupPath,
+// buildPlaybookContext constructs a PlaybookContext from the inspector's
+// configuration. Callers add the job with WithJob, whose recorded container
+// and URL win over the inspector's guesses.
+func (i *Inspector) buildPlaybookContext() recovery.PlaybookContext {
+	return recovery.PlaybookContext{
 		ContainerName: i.containerName,
 		BaseURL:       i.coreBaseURL,
-		ImageRepo:     "payramapp/payram", // default, could be made configurable
 	}
-
-	// Try to extract HTTP port from coreBaseURL (e.g., "http://127.0.0.1:8080")
-	// This is a best-effort extraction
-	if len(i.coreBaseURL) > 0 {
-		// Simple parsing: look for the port after the last colon
-		for j := len(i.coreBaseURL) - 1; j >= 0; j-- {
-			if i.coreBaseURL[j] == ':' {
-				ctx.HTTPPort = i.coreBaseURL[j+1:]
-				break
-			}
-		}
-	}
-
-	return ctx
 }

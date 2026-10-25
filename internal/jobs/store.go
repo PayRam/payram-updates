@@ -5,11 +5,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 )
 
-// Store handles persistence of jobs and logs.
+// Store handles persistence of jobs and logs. Its files are readable by root
+// only: job logs name backup files and container settings.
 type Store struct {
 	stateDir string
+	// mu orders Save and Touch, so a heartbeat can never write back an older
+	// copy of the job over a newer one.
+	mu sync.Mutex
 }
 
 // NewStore creates a new Store with the given state directory.
@@ -41,6 +48,55 @@ func (s *Store) LoadLatest() (*Job, error) {
 
 // Save persists the job to disk atomically.
 func (s *Store) Save(job *Job) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.save(job)
+}
+
+// Touch moves the saved job's UpdatedAt to now without changing anything
+// else. A running update calls it as a heartbeat: an active job whose
+// UpdatedAt is minutes old belongs to an updater that died.
+func (s *Store) Touch() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, err := s.LoadLatest()
+	if err != nil || job == nil {
+		return err
+	}
+	job.UpdatedAt = time.Now().UTC()
+	return s.save(job)
+}
+
+// StartHeartbeat touches the saved job every interval until the returned
+// stop is called. Stop returns once the heartbeat has ended, so nothing is
+// written after it (a stopped update must not be touched again). onError,
+// if set, hears failed touches. Stop may be called more than once.
+func (s *Store) StartHeartbeat(every time.Duration, onError func(error)) (stop func()) {
+	done := make(chan struct{})
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := s.Touch(); err != nil && onError != nil {
+					onError(err)
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+		<-ended
+	}
+}
+
+func (s *Store) save(job *Job) error {
 	if err := s.ensureJobDir(); err != nil {
 		return err
 	}
@@ -65,7 +121,7 @@ func (s *Store) AppendLog(line string) error {
 	}
 
 	logsPath := s.logsPath()
-	f, err := os.OpenFile(logsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(logsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
@@ -75,6 +131,37 @@ func (s *Store) AppendLog(line string) error {
 		return fmt.Errorf("failed to write log: %w", err)
 	}
 
+	return nil
+}
+
+// RewriteLogs passes every line of the job log through clean and writes the
+// result back (atomically, root only) when anything changed. A missing log is
+// fine.
+func (s *Store) RewriteLogs(clean func(string) string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := os.ReadFile(s.logsPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read log file: %w", err)
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	changed := false
+	for i, line := range lines {
+		body := strings.TrimSuffix(line, "\n")
+		if cleaned := clean(body); cleaned != body {
+			lines[i] = cleaned + strings.TrimPrefix(line, body)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	if err := s.atomicWrite(s.logsPath(), []byte(strings.Join(lines, ""))); err != nil {
+		return fmt.Errorf("failed to rewrite log file: %w", err)
+	}
 	return nil
 }
 
@@ -106,9 +193,17 @@ func (s *Store) logsPath() string {
 // ensureJobDir creates the job directory if it doesn't exist.
 func (s *Store) ensureJobDir() error {
 	jobDir := filepath.Join(s.stateDir, "jobs", "latest")
-	if err := os.MkdirAll(jobDir, 0755); err != nil {
+	if err := os.MkdirAll(jobDir, 0700); err != nil {
 		return fmt.Errorf("failed to create job directory: %w", err)
 	}
+	// Directories made by older versions were world-readable. Tightening
+	// them is best effort: a filesystem that refuses chmod (root-squashed
+	// NFS, one without modes) must not stop every update from saving its
+	// progress.
+	for _, dir := range []string{filepath.Join(s.stateDir, "jobs"), jobDir} {
+		_ = os.Chmod(dir, 0700)
+	}
+	_ = os.Chmod(s.logsPath(), 0600)
 	return nil
 }
 

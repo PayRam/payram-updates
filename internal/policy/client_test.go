@@ -284,3 +284,29 @@ func TestFetch_LocalFile_InvalidJSON(t *testing.T) {
 		t.Errorf("expected ErrInvalidJSON, got: %v", err)
 	}
 }
+
+func TestFetch_RefusesPlainHTTPToAnotherHost(t *testing.T) {
+	client := NewClient(2 * time.Second)
+	_, err := client.Fetch(context.Background(), "http://raw.githubusercontent.com/PayRam/payram-scripts/main/updater-configs/upgrade-policy.json")
+	if err == nil || !strings.Contains(err.Error(), "only https://") {
+		t.Fatalf("got %v, want a refusal of plain http", err)
+	}
+}
+
+func TestFetch_RefusesARedirectToPlainHTTP(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"latest":"9.9.9"}`))
+	}))
+	defer target.Close()
+	// A loopback http server is allowed, but it redirects to a non-loopback
+	// plain-http address, which must be refused.
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://example.com/policy.json", http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	_, err := NewClient(2*time.Second).Fetch(context.Background(), redirector.URL)
+	if err == nil || !strings.Contains(err.Error(), "only https://") {
+		t.Fatalf("got %v, want the redirect to plain http refused", err)
+	}
+}

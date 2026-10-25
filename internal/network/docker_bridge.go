@@ -59,6 +59,25 @@ func GetContainerIPByName(dockerBin string, containerName string) (string, error
 	return getContainerIP(ctx, dockerBin, containerName)
 }
 
+// ContainerIPs returns every address the container has, on all its networks.
+func ContainerIPs(ctx context.Context, dockerBin string, containerName string) ([]string, error) {
+	inspector := container.NewInspector(dockerBin, logger.StdLogger())
+	runtimeState, err := inspector.ExtractRuntimeState(ctx, containerName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect container %s: %w", containerName, err)
+	}
+	var ips []string
+	for _, network := range runtimeState.Networks {
+		if ip := strings.TrimSpace(network.IPAddress); ip != "" {
+			ips = append(ips, ip)
+		}
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("container %s has no IP address in any network", containerName)
+	}
+	return ips, nil
+}
+
 // getContainerIP inspects a container and returns its IP address.
 func getContainerIP(ctx context.Context, dockerBin string, containerName string) (string, error) {
 	inspector := container.NewInspector(dockerBin, logger.StdLogger())

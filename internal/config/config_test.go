@@ -81,8 +81,8 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.Port != 2567 {
 		t.Errorf("expected default port 2567, got %d", cfg.Port)
 	}
-	if cfg.ExecutionMode != "dry-run" {
-		t.Errorf("expected default execution mode 'dry-run', got %s", cfg.ExecutionMode)
+	if cfg.ExecutionMode != "execute" {
+		t.Errorf("expected default execution mode 'execute', got %s", cfg.ExecutionMode)
 	}
 	if cfg.StateDir != "/var/lib/payram-updater" {
 		t.Errorf("expected default state dir '/var/lib/payram-updater', got %s", cfg.StateDir)
@@ -107,8 +107,8 @@ func TestLoad_BackupDefaults(t *testing.T) {
 
 	// Verify backup defaults
 	// Backups are always enabled
-	if cfg.Backup.Dir != "data/backups" {
-		t.Errorf("expected default backup dir 'data/backups', got %s", cfg.Backup.Dir)
+	if cfg.Backup.Dir != "/var/lib/payram/backups" {
+		t.Errorf("expected default backup dir '/var/lib/payram/backups', got %s", cfg.Backup.Dir)
 	}
 	if cfg.Backup.Retention != 10 {
 		t.Errorf("expected default retention 10, got %d", cfg.Backup.Retention)

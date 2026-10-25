@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -377,4 +379,81 @@ func TestContext_Integration(t *testing.T) {
 	var _ func(context.Context, string) error = runner.Remove
 	var _ func(context.Context, []string) error = runner.Run
 	var _ func(context.Context, string) (bool, error) = runner.InspectRunning
+}
+
+func TestRedactArgs_HidesEnvironmentValuesAndPasswords(t *testing.T) {
+	args := []string{
+		"run", "-d", "--name", "payram",
+		"-e", "AES_KEY=0123456789abcdef",
+		"--env", "POSTGRES_PASSWORD=hunter2",
+		"--env=SSL_CERT_PATH=/etc/letsencrypt/live/x",
+		"-e", "PASSTHROUGH",
+		"exec", "payram", "sh", "-c", "PGPASSWORD=s3cret pg_dump -U payram",
+		"payramapp/payram:3.10.0",
+	}
+	got := strings.Join(RedactArgs(args), " ")
+
+	for _, secret := range []string{"0123456789abcdef", "hunter2", "/etc/letsencrypt", "s3cret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("redacted args still contain %q: %s", secret, got)
+		}
+	}
+	for _, kept := range []string{"AES_KEY=***", "POSTGRES_PASSWORD=***", "--env=SSL_CERT_PATH=***", "-e PASSTHROUGH", "PGPASSWORD=*** pg_dump", "payramapp/payram:3.10.0"} {
+		if !strings.Contains(got, kept) {
+			t.Fatalf("redacted args lost %q: %s", kept, got)
+		}
+	}
+	if args[5] != "AES_KEY=0123456789abcdef" {
+		t.Fatal("RedactArgs must not modify its input")
+	}
+}
+
+// TestState_MissingContainerInEveryDockerWording: Docker Desktop 4.x prints
+// "error: no such object: x" for inspect; older engines print "Error: No such
+// object" or "No such container". A missing container is never an error.
+func TestState_MissingContainerInEveryDockerWording(t *testing.T) {
+	for _, wording := range []string{
+		"error: no such object: payram-next",
+		"Error: No such object: payram-next",
+		"Error response from daemon: No such container: payram-next",
+	} {
+		script := filepath.Join(t.TempDir(), "docker")
+		body := "#!/bin/sh\necho '" + wording + "' >&2\nexit 1\n"
+		if err := os.WriteFile(script, []byte(body), 0700); err != nil {
+			t.Fatal(err)
+		}
+		runner := &Runner{DockerBin: script}
+
+		state, err := runner.State(context.Background(), "payram-next")
+		if err != nil || state.Exists {
+			t.Errorf("%q: State = %+v, %v; want Exists=false and no error", wording, state, err)
+		}
+		if err := runner.Remove(context.Background(), "payram-next"); err != nil {
+			t.Errorf("%q: Remove must be idempotent: %v", wording, err)
+		}
+		if err := runner.Stop(context.Background(), "payram-next"); err != nil {
+			t.Errorf("%q: Stop must be idempotent: %v", wording, err)
+		}
+	}
+}
+
+// TestRedactLine_CleansWhatOlderUpdatersLogged: v0.2.3 logged whole docker
+// command lines, with the hot-wallet key and the database password in them.
+func TestRedactLine_CleansWhatOlderUpdatersLogged(t *testing.T) {
+	cases := map[string]string{
+		"  5. Run new container: docker run -d --name payram -e AES_KEY=6b1f0e1d2c -e POSTGRES_PASSWORD=payram123 -e SERVER=PRODUCTION payramapp/payram:3.8.1": "  5. Run new container: docker run -d --name payram -e AES_KEY=*** -e POSTGRES_PASSWORD=*** -e SERVER=*** payramapp/payram:3.8.1",
+		"Executing: docker run --env=AES_KEY=abc --env POSTGRES_PASSWORD=x img":                                                                                "Executing: docker run --env=AES_KEY=*** --env POSTGRES_PASSWORD=*** img",
+		"sh -c PGPASSWORD=secret pg_dump -h 127.0.0.1":                                                                                                         "sh -c PGPASSWORD=*** pg_dump -h 127.0.0.1",
+		"config: AES_KEY=deadbeef DB_PASSWORD=hunter2 API_TOKEN=t0k":                                                                                           "config: AES_KEY=*** DB_PASSWORD=*** API_TOKEN=***",
+		"Backup created successfully: payram-backup-20261024-to-3.10.0.dump (12.00 MB)":                                                                        "Backup created successfully: payram-backup-20261024-to-3.10.0.dump (12.00 MB)",
+		"-e AES_KEY -e POSTGRES_PASSWORD (names only)":                                                                                                         "-e AES_KEY -e POSTGRES_PASSWORD (names only)",
+	}
+	for in, want := range cases {
+		if got := RedactLine(in); got != want {
+			t.Errorf("RedactLine(%q)\n got %q\nwant %q", in, got, want)
+		}
+	}
+	if got := RedactLines("a -e AES_KEY=1\nb\n"); got != "a -e AES_KEY=***\nb\n" {
+		t.Errorf("RedactLines = %q", got)
+	}
 }

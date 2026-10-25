@@ -3,18 +3,22 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/payram/payram-updater/internal/cli"
 	"github.com/payram/payram-updater/internal/container"
+	"github.com/payram/payram-updater/internal/dockerexec"
 	"github.com/payram/payram-updater/internal/history"
 	"github.com/payram/payram-updater/internal/inspect"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/logger"
 	"github.com/payram/payram-updater/internal/manifest"
+	"github.com/payram/payram-updater/internal/network"
 	"github.com/payram/payram-updater/internal/recovery"
 )
 
@@ -35,12 +39,14 @@ type HistoryResponse struct {
 	Count  int             `json:"count"`
 }
 
-// PlanRequest represents the request body for POST /upgrade/plan.
+// PlanRequest represents the request body for POST /upgrade/plan. The running
+// version is never taken from the caller: it is looked up (see
+// lookupCurrentVersion), so the downgrade and breakpoint checks cannot be
+// moved by claiming an older one.
 type PlanRequest struct {
 	Mode            string `json:"mode"`
 	RequestedTarget string `json:"requestedTarget"`
 	Source          string `json:"source"`
-	CurrentVersion  string `json:"currentVersion"` // running version of the core container; enables breakpoint crossing detection
 }
 
 // PlanResponse represents the response for POST /upgrade/plan.
@@ -59,8 +65,7 @@ type PlanResponse struct {
 type RunRequest struct {
 	Mode            string `json:"mode"`
 	RequestedTarget string `json:"requestedTarget"`
-	Source          string `json:"source"`         // Origin of request, defaults to "UNKNOWN"
-	CurrentVersion  string `json:"currentVersion"` // running version of the core container; enables breakpoint crossing detection
+	Source          string `json:"source"` // Origin of request, defaults to "UNKNOWN"
 }
 
 func parseJobMode(value string) (jobs.JobMode, error) {
@@ -79,13 +84,75 @@ func parseJobMode(value string) (jobs.JobMode, error) {
 	}
 }
 
-func resolveMode(requestedMode, source string) (jobs.JobMode, error) {
-	if strings.EqualFold(strings.TrimSpace(source), "CLI") {
-		return parseJobMode(requestedMode)
-	}
+// errManualNeedsRoot refuses manual mode to a caller that is not root's CLI.
+var errManualNeedsRoot = errors.New("manual mode skips the release policy's checks, so only root's payram-updater command may use it: run it with sudo")
 
-	return jobs.JobModeDashboard, nil
+// resolveMode decides a request's mode. MANUAL skips the release policy's
+// gates, so only root's CLI may ask for it (fromRootCLI: a request from this
+// machine carrying the token only root can read). Any other request is
+// DASHBOARD, except that a request claiming to be the CLI and asking for
+// MANUAL without the token is refused, so the operator learns to use sudo
+// instead of silently getting the dashboard's checks.
+func resolveMode(requestedMode, source string, fromRootCLI bool) (jobs.JobMode, error) {
+	if !strings.EqualFold(strings.TrimSpace(source), "CLI") {
+		return jobs.JobModeDashboard, nil
+	}
+	mode, err := parseJobMode(requestedMode)
+	if err != nil {
+		return "", err
+	}
+	if mode == jobs.JobModeManual && !fromRootCLI {
+		return "", errManualNeedsRoot
+	}
+	return mode, nil
 }
+
+// isRootCLIRequest reports whether r comes from root's payram-updater command
+// on this machine.
+func (s *Server) isRootCLIRequest(r *http.Request) bool {
+	return network.IsLoopbackRequest(r) && cli.TokenMatches(s.cliToken, r.Header.Get(cli.TokenHeader))
+}
+
+// writeModeError answers a request whose mode was refused.
+func writeModeError(w http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	if errors.Is(err, errManualNeedsRoot) {
+		status = http.StatusForbidden
+	}
+	http.Error(w, sentence(err.Error()), status)
+}
+
+// lookupCurrentVersion asks the running PayRam which version it is (its API,
+// or its image label). "" when it cannot be told; the release checks that
+// need it are then skipped, as for an updater that never knew it.
+func (s *Server) lookupCurrentVersion(ctx context.Context) string {
+	if s.versionLookup != nil {
+		return s.versionLookup(ctx)
+	}
+	version, err := s.runningVersion(ctx, s.fetchPolicyInitVersion(ctx))
+	if err != nil {
+		logger.Warnf("Server", "lookupCurrentVersion", "Could not tell which version PayRam runs (%v); the breakpoint and downgrade checks are skipped for this request", err)
+		return ""
+	}
+	return version
+}
+
+// runningVersion is the version the PayRam container runs, from its API or
+// its image label. It has its own time budget (the policy fetch before it
+// has another).
+func (s *Server) runningVersion(ctx context.Context, initVersion string) (string, error) {
+	lookupCtx, cancel := context.WithTimeout(ctx, time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
+	defer cancel()
+	containerName, err := s.discoverContainerName(lookupCtx)
+	if err != nil {
+		return "", err
+	}
+	version, _, err := s.resolveCoreVersion(lookupCtx, containerName, initVersion)
+	return version, err
+}
+
+// maxRequestBody bounds a plan/run request body; both are a few fields.
+const maxRequestBody = 64 << 10
 
 // RunResponse represents the response for POST /upgrade/run.
 type RunResponse struct {
@@ -137,11 +204,14 @@ func (s *Server) HandleUpgradeStatus() http.HandlerFunc {
 			}
 		}
 
-		// Build response with recovery playbook if job failed
+		// Build response with recovery playbook if job failed, or if it is
+		// still marked active but its updater stopped saving progress.
 		response := UpgradeStatusResponse{Job: job}
 		if job.State == jobs.JobStateFailed && job.FailureCode != "" {
-			ctx := s.buildPlaybookContext(job.BackupPath)
-			playbook := recovery.RenderPlaybook(job.FailureCode, ctx)
+			playbook := recovery.RenderJobPlaybook(job, s.buildPlaybookContext(job))
+			response.RecoveryPlaybook = &playbook
+		} else if recovery.IsStale(job, time.Now()) {
+			playbook := recovery.RenderPlaybook(recovery.StalePlaybookCode(job.State), s.buildPlaybookContext(job).WithJob(job))
 			response.RecoveryPlaybook = &playbook
 		}
 
@@ -170,7 +240,9 @@ func (s *Server) HandleUpgradeLogs() http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(logs))
+		// The log is cleaned when the updater starts; this also covers a
+		// line that slipped past that (the dashboard shows the log).
+		w.Write([]byte(dockerexec.RedactLines(logs)))
 	}
 }
 
@@ -207,15 +279,6 @@ func (s *Server) HandleHistory() http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(HistoryResponse{Events: events, Count: len(events)})
 	}
-}
-
-// isJobActive returns true if the job is in an active state.
-func isJobActive(job *jobs.Job) bool {
-	// Active states are those that indicate ongoing work
-	return job.State == jobs.JobStatePolicyFetching ||
-		job.State == jobs.JobStateManifestFetching ||
-		job.State == jobs.JobStateExecuting ||
-		job.State == jobs.JobStateVerifying
 }
 
 // HandleUpgradeLast returns a handler for the /upgrade/last endpoint.
@@ -278,7 +341,7 @@ func (s *Server) HandleUpgradePlaybook() http.HandlerFunc {
 			return
 		}
 
-		playbook := recovery.RenderPlaybook(job.FailureCode, s.buildPlaybookContext(job.BackupPath))
+		playbook := recovery.RenderJobPlaybook(job, s.buildPlaybookContext(job))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -366,7 +429,7 @@ func (s *Server) HandleUpgradeInspect() http.HandlerFunc {
 			s.jobStore,
 			s.dockerRunner.DockerBin,
 			containerName,
-			s.coreClient.BaseURL, // Use resolved BaseURL from coreClient (handles auto-discovery)
+			s.currentCoreBaseURL(ctx, containerName),
 			s.config.PolicyURL,
 			s.config.RuntimeManifestURL,
 			s.config.DebugVersionMode,
@@ -392,14 +455,14 @@ func (s *Server) HandleUpgradePlan() http.HandlerFunc {
 
 		// Parse request body
 		var req PlanRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody)).Decode(&req); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
 
-		mode, err := resolveMode(req.Mode, req.Source)
+		mode, err := resolveMode(req.Mode, req.Source, s.isRootCLIRequest(r))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeModeError(w, err)
 			return
 		}
 
@@ -413,22 +476,7 @@ func (s *Server) HandleUpgradePlan() http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 
-		// If caller did not supply currentVersion, resolve it from the running container.
-		// This allows payram-core to omit the field entirely while still getting full
-		// gate enforcement (breakpoints and stop points).
-		currentVersion := req.CurrentVersion
-		if currentVersion == "" {
-			resolveCtx, resolveCancel := context.WithTimeout(r.Context(), time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
-			defer resolveCancel()
-			if containerName, cnErr := s.discoverContainerName(resolveCtx); cnErr == nil {
-				initVersion := s.fetchPolicyInitVersion(resolveCtx)
-				if ver, _, verErr := s.resolveCoreVersion(resolveCtx, containerName, initVersion); verErr == nil {
-					currentVersion = ver
-				}
-			}
-		}
-
-		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, currentVersion)
+		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, s.lookupCurrentVersion(r.Context()))
 
 		// Build response
 		response := PlanResponse{
@@ -487,14 +535,14 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 
 		// Parse request body
 		var req RunRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody)).Decode(&req); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
 
-		mode, err := resolveMode(req.Mode, req.Source)
+		mode, err := resolveMode(req.Mode, req.Source, s.isRootCLIRequest(r))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeModeError(w, err)
 			return
 		}
 
@@ -510,15 +558,31 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 			source = "UNKNOWN"
 		}
 
-		// Check for active job (concurrency check)
-		existingJob, err := s.jobStore.LoadLatest()
-		if err != nil {
-			logger.Error("Server", "HandleUpgradeRun", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
+		// One update at a time: the slot is claimed before anything else and
+		// held until the job ends (released below if no job is started).
+		if err := s.claimUpgradeSlot(); err != nil {
+			response := map[string]string{
+				"error":   "An active job already exists",
+				"message": fmt.Sprintf("%s; wait for it to finish or check its status", sentence(err.Error())),
+			}
+			if existingJob, loadErr := s.jobStore.LoadLatest(); loadErr == nil && existingJob != nil {
+				response["jobId"] = existingJob.JobID
+				response["state"] = string(existingJob.State)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(response)
 			return
 		}
-
-		if existingJob != nil && isJobActive(existingJob) {
+		started := false
+		defer func() {
+			if !started {
+				s.releaseUpgradeSlot()
+			}
+		}()
+		// A job still marked active on disk belongs to an updater that
+		// stopped; the startup repair finishes it. Until then, refuse.
+		if existingJob, err := s.jobStore.LoadLatest(); err == nil && existingJob != nil && existingJob.IsActive() {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]string{
@@ -534,20 +598,7 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 
-		// If caller did not supply currentVersion, resolve it from the running container.
-		currentVersion := req.CurrentVersion
-		if currentVersion == "" {
-			resolveCtx, resolveCancel := context.WithTimeout(r.Context(), time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
-			defer resolveCancel()
-			if containerName, cnErr := s.discoverContainerName(resolveCtx); cnErr == nil {
-				initVersion := s.fetchPolicyInitVersion(resolveCtx)
-				if ver, _, verErr := s.resolveCoreVersion(resolveCtx, containerName, initVersion); verErr == nil {
-					currentVersion = ver
-				}
-			}
-		}
-
-		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, currentVersion)
+		plan := s.PlanUpgrade(ctx, mode, req.RequestedTarget, s.lookupCurrentVersion(r.Context()))
 		if plan.State == jobs.JobStateFailed {
 			// Planning failed - return error without creating a job
 			w.Header().Set("Content-Type", "application/json")
@@ -566,8 +617,8 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 		jobID := fmt.Sprintf("job-%d", time.Now().UnixNano())
 		job := jobs.NewJob(jobID, mode, req.RequestedTarget)
 		job.ResolvedTarget = plan.ResolvedTarget
-		job.State = jobs.JobStateReady
-		job.Message = "Upgrade job created"
+		job.State = jobs.JobStateExecuting
+		job.Message = "Preparing the update"
 		job.UpdatedAt = time.Now().UTC()
 
 		// Save job
@@ -581,68 +632,47 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 		s.jobStore.AppendLog(fmt.Sprintf("Starting upgrade job %s: mode=%s target=%s (resolved: %s) source=%s",
 			jobID, mode, req.RequestedTarget, plan.ResolvedTarget, source))
 
-		// Launch background execution goroutine
-		s.upgradeWg.Add(1)
-		go s.executeUpgrade(job, plan.Manifest, plan.ArchSupport, plan.SteppingStone)
-		// Return response
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(RunResponse{
+		// The reply is built before the job starts: from then on the job
+		// belongs to the update goroutine.
+		response := RunResponse{
 			JobID:           job.JobID,
 			State:           string(job.State),
 			Mode:            string(job.Mode),
 			RequestedTarget: job.RequestedTarget,
 			ResolvedTarget:  job.ResolvedTarget,
 			Message:         "Upgrade job started",
-		})
+		}
+		started = true
+		s.startUpgrade(job, plan)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
 	}
 }
 
-// buildPlaybookContext constructs a PlaybookContext by discovering runtime information.
-// It attempts to discover the running Payram container and extract dynamic values.
-// Falls back to empty values if discovery fails (placeholders will remain in playbook).
-func (s *Server) buildPlaybookContext(backupPath string) recovery.PlaybookContext {
+// buildPlaybookContext fills the values a playbook's steps name. The job's
+// own record (container, address, backup) wins; only what it lacks is
+// looked up.
+func (s *Server) buildPlaybookContext(job *jobs.Job) recovery.PlaybookContext {
 	ctx := recovery.PlaybookContext{
-		BackupPath: backupPath,
-		ImageRepo:  "payramapp/payram", // default
+		ImageRepo: "payramapp/payram",
+		BackupDir: s.config.Backup.Dir,
 	}
-
-	// Determine image pattern for discovery
-	imagePattern := "payramapp/payram:"
 	if s.config.ImageRepoOverride != "" {
-		imagePattern = s.config.ImageRepoOverride + ":"
 		ctx.ImageRepo = s.config.ImageRepoOverride
 	}
-
-	// Try to discover running container. Prefer explicit name (handles non-semver tags).
-	if s.config.TargetContainerName != "" {
-		ctx.ContainerName = s.config.TargetContainerName
-	} else {
-		discoverer := container.NewDiscoverer(s.config.DockerBin, imagePattern, logger.StdLogger())
-		discovered, err := discoverer.DiscoverPayramContainer(context.Background())
-		if err != nil {
-			// Container not found or discovery failed - return partial context
-			// Placeholders will remain in the playbook
-			return ctx
-		}
-		ctx.ContainerName = discovered.Name
+	if job != nil {
+		ctx = ctx.WithJob(job)
 	}
 
-	// Try to use the core client's base URL for port extraction
-	// The coreClient was initialized with discovered port in New()
-	if s.coreClient != nil {
-		// Extract port from base URL (e.g., "http://127.0.0.1:8080")
-		baseURL := s.coreClient.BaseURL
-		ctx.BaseURL = baseURL
-
-		// Simple port extraction from URL
-		for i := len(baseURL) - 1; i >= 0; i-- {
-			if baseURL[i] == ':' {
-				ctx.HTTPPort = baseURL[i+1:]
-				break
-			}
+	if ctx.ContainerName == "" {
+		if name, err := s.discoverContainerName(context.Background()); err == nil {
+			ctx.ContainerName = name
 		}
 	}
-
+	if ctx.BaseURL == "" && ctx.ContainerName != "" {
+		ctx.BaseURL = s.currentCoreBaseURL(context.Background(), ctx.ContainerName)
+	}
 	return ctx
 }

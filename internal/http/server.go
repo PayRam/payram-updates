@@ -2,17 +2,22 @@ package http
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	goversion "github.com/hashicorp/go-version"
 	"github.com/payram/payram-updater/internal/backup"
+	"github.com/payram/payram-updater/internal/cli"
 	"github.com/payram/payram-updater/internal/config"
 	"github.com/payram/payram-updater/internal/container"
 	"github.com/payram/payram-updater/internal/coreclient"
@@ -21,49 +26,24 @@ import (
 	"github.com/payram/payram-updater/internal/history"
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/logger"
-	"github.com/payram/payram-updater/internal/manifest"
 	"github.com/payram/payram-updater/internal/network"
 	"github.com/payram/payram-updater/internal/policy"
+	"github.com/payram/payram-updater/internal/switchover"
 )
 
-// discoverCoreBaseURL discovers the Payram Core base URL by:
-// 1. Finding the running Payram container via docker ps
-// 2. Extracting runtime state (ports) via docker inspect
-// 3. Probing each exposed port for "Welcome to Payram Core"
-// This allows the updater to work without CORE_BASE_URL being explicitly configured.
-func discoverCoreBaseURL(dockerBin string, imagePattern string) (string, error) {
-	ctx := context.Background()
+// shutdownGrace is how long a stopping updater waits for an update in
+// progress to finish or switch back. The systemd unit allows 15 minutes.
+const shutdownGrace = 14 * time.Minute
 
-	// Step 1: Discover the Payram container
-	discoverer := container.NewDiscoverer(dockerBin, imagePattern, logger.StdLogger())
-	discovered, err := discoverer.DiscoverPayramContainer(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to discover Payram container: %w", err)
-	}
+// coreURLCacheFor is how long a found PayRam API address is reused by the
+// read-only endpoints before it is looked up again.
+const coreURLCacheFor = time.Minute
 
-	return discoverCoreBaseURLByName(ctx, dockerBin, discovered.Name)
-}
-
-// discoverCoreBaseURLByName discovers the Payram Core base URL for a specific container.
-func discoverCoreBaseURLByName(ctx context.Context, dockerBin string, containerName string) (string, error) {
-	// Extract runtime state to get ports
-	inspector := container.NewInspector(dockerBin, logger.StdLogger())
-	runtimeState, err := inspector.ExtractRuntimeState(ctx, containerName)
-	if err != nil {
-		return "", fmt.Errorf("failed to extract runtime state: %w", err)
-	}
-
-	// Identify which port serves Payram Core
-	identifier := container.NewPortIdentifier(logger.StdLogger())
-	identifiedPort, err := identifier.IdentifyPayramCorePort(ctx, runtimeState)
-	if err != nil {
-		return "", fmt.Errorf("failed to identify Payram Core port: %w", err)
-	}
-
-	// Build the base URL from the identified port using the discovered scheme
-	baseURL := fmt.Sprintf("%s://127.0.0.1:%s", identifiedPort.Scheme, identifiedPort.HostPort)
-	return baseURL, nil
-}
+var (
+	errUpgradeBusy  = errors.New("an update is already running")
+	errRepairing    = errors.New("the updater is finishing an update that was interrupted")
+	errShuttingDown = errors.New("the updater is shutting down")
+)
 
 // Server represents the HTTP server.
 type Server struct {
@@ -72,80 +52,56 @@ type Server struct {
 	config              *config.Config
 	jobStore            *jobs.Store
 	dockerRunner        *dockerexec.Runner
-	coreClient          *coreclient.Client
 	backupManager       *backup.Manager
 	containerBackupExec *backup.ContainerBackupExecutor
 	historyStore        *history.Store
-	upgradeWg           sync.WaitGroup
+	allowList           *network.AllowList
+
+	// upgradeRunning is held from the moment an update (or the repair of an
+	// interrupted one) is accepted until it ends, so a second one is refused
+	// instead of racing it on the same container. upgradeWg lets shutdown
+	// wait for it.
+	upgradeRunning atomic.Bool
+	repairing      atomic.Bool
+	shuttingDown   atomic.Bool
+	upgradeWg      sync.WaitGroup
+
+	// switchTiming is how patient the container switch is (zero = defaults).
+	switchTiming switchover.Timing
+	// heartbeatEvery is how often a running job's UpdatedAt is refreshed.
+	heartbeatEvery time.Duration
+	// currentPolicyInit is the policy's updater_api_init_version for the job
+	// in the update slot (versions below it are probed the legacy way).
+	currentPolicyInit string
+
+	coreURLMu sync.Mutex
+	coreURL   string
+	coreURLAt time.Time
+
+	// cliToken is the secret root's payram-updater command sends to be
+	// granted manual mode (see cli.EnsureToken). Empty: manual mode is off.
+	cliToken string
+
+	// versionLookup replaces lookupCurrentVersion in tests.
+	versionLookup func(ctx context.Context) string
 }
 
-// New creates a new HTTP server instance.
+// New creates a new HTTP server instance. It does not look for PayRam yet:
+// every job finds the container and its API itself, because PayRam may not
+// be running when the updater starts (after a reboot) and an update may move
+// it to a new address.
 func New(cfg *config.Config, jobStore *jobs.Store) *Server {
-	// Create docker runner
 	dockerRunner := &dockerexec.Runner{
 		DockerBin: cfg.DockerBin,
 		Logger:    logger.StdLogger(),
+		// Docker's default 10s kills the bundled Postgres mid-shutdown.
+		StopTimeoutSeconds: 60,
 	}
 
-	// Always discover CoreBaseURL dynamically via docker inspect
-	logger.Infof("Server", "New", "Discovering Payram Core port via docker inspect...")
-	// Use imagePattern for discovery (default to payramapp/payram if not overridden)
 	imagePattern := "payramapp/payram:"
 	if cfg.ImageRepoOverride != "" {
 		imagePattern = cfg.ImageRepoOverride + ":"
 	}
-
-	var coreBaseURL string
-	var err error
-	if cfg.TargetContainerName != "" {
-		// Use explicit container name if set
-		coreBaseURL, err = discoverCoreBaseURLByName(context.Background(), cfg.DockerBin, cfg.TargetContainerName)
-		if err != nil {
-			logger.Error("Server", "New", err)
-			logger.Warnf("Server", "New", "Falling back to http://127.0.0.1:8080 (this may not work if Payram Core is on a different port)")
-			coreBaseURL = "http://127.0.0.1:8080"
-		} else {
-			logger.Infof("Server", "New", "Discovered Payram Core at: %s (from TARGET_CONTAINER_NAME=%s)", coreBaseURL, cfg.TargetContainerName)
-		}
-	} else {
-		// Fall back to semver-based discovery
-		coreBaseURL, err = discoverCoreBaseURL(cfg.DockerBin, imagePattern)
-		if err != nil {
-			logger.Error("Server", "New", err)
-			logger.Warnf("Server", "New", "Falling back to http://127.0.0.1:8080 (this may not work if Payram Core is on a different port)")
-			coreBaseURL = "http://127.0.0.1:8080"
-		} else {
-			logger.Infof("Server", "New", "Discovered Payram Core at: %s", coreBaseURL)
-		}
-	}
-
-	// Discover Payram container IP for access control
-	logger.Infof("Server", "New", "Discovering Payram container IP for access control...")
-	var payramContainerIP string
-	if cfg.TargetContainerName != "" {
-		// Use explicit container name if set
-		payramContainerIP, err = network.GetContainerIPByName(cfg.DockerBin, cfg.TargetContainerName)
-		if err != nil {
-			logger.Error("Server", "New", err)
-			logger.Warnf("Server", "New", "API access will be restricted to localhost only")
-			payramContainerIP = ""
-		} else {
-			logger.Infof("Server", "New", "Payram container IP: %s (from TARGET_CONTAINER_NAME=%s)", payramContainerIP, cfg.TargetContainerName)
-		}
-	} else {
-		// Fall back to semver-based discovery
-		payramContainerIP, err = network.GetPayramContainerIP(cfg.DockerBin, imagePattern)
-		if err != nil {
-			logger.Error("Server", "New", err)
-			logger.Warnf("Server", "New", "API access will be restricted to localhost only")
-			payramContainerIP = ""
-		} else {
-			logger.Infof("Server", "New", "Payram container IP: %s (API access restricted to localhost and this container)", payramContainerIP)
-		}
-	}
-
-	// Create core API client
-	coreClient := coreclient.NewClient(coreBaseURL)
 
 	// Create backup manager (legacy, for backward compatibility with existing backups)
 	// Backups are always enabled
@@ -159,6 +115,10 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 		PGPassword:          cfg.Backup.PGPassword,
 		ImagePattern:        imagePattern,
 		TargetContainerName: cfg.TargetContainerName,
+		// Pruning never deletes the backup of the latest failed update.
+		StateDir:          cfg.StateDir,
+		DockerBin:         cfg.DockerBin,
+		SupervisorExclude: cfg.SupervisorExclude,
 	}
 	backupMgr := backup.NewManager(backupCfg, &backup.RealExecutor{}, logger.StdLogger())
 
@@ -176,10 +136,14 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 		config:              cfg,
 		jobStore:            jobStore,
 		dockerRunner:        dockerRunner,
-		coreClient:          coreClient,
 		backupManager:       backupMgr,
 		containerBackupExec: containerBackupExec,
 		historyStore:        history.NewStore(cfg.StateDir),
+		switchTiming:        switchover.Timing{HealthTimeout: time.Duration(cfg.HealthCheckTimeoutSeconds) * time.Second},
+		heartbeatEvery:      20 * time.Second,
+	}
+	if cfg.CoreBaseURL != "" {
+		logger.Infof("Server", "New", "PayRam API address set by CORE_BASE_URL: %s", cfg.CoreBaseURL)
 	}
 
 	mux := http.NewServeMux()
@@ -194,95 +158,92 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 	mux.HandleFunc("/history", s.HandleHistory())
 	mux.HandleFunc("/upgrade/history", s.HandleHistory())
 
-	// Apply IP restriction middleware to allow only localhost and Payram container
-	allowedIPs := []string{
-		"127.0.0.1", // localhost IPv4
-		"::1",       // localhost IPv6
-	}
-	if payramContainerIP != "" {
-		allowedIPs = append(allowedIPs, payramContainerIP)
-	}
-	handler := network.AllowedIPsMiddleware(allowedIPs, logger.StdLogger())(mux)
-	logger.Infof("Server", "New", "API access restricted to: %v", allowedIPs)
+	// Only this machine and the PayRam container may call the API. The
+	// container's address is looked up when it first calls, and again when
+	// an update gave it a new one.
+	s.allowList = network.NewAllowList(s.lookupContainerIPs, 5*time.Second, logger.StdLogger())
+	logger.Infof("Server", "New", "API access restricted to this machine and the PayRam container")
 
 	// Bind only to localhost and docker bridge (local machine only)
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 	s.httpServer = &http.Server{
-		Addr:    addr,
-		Handler: handler,
+		Addr:              addr,
+		Handler:           s.allowList.Middleware(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
 	}
 
 	return s
 }
 
 // Start starts the HTTP server and blocks until shutdown.
-// It handles graceful shutdown on SIGINT and SIGTERM.
+// On SIGINT/SIGTERM it lets an update in progress finish (or switch back)
+// before exiting, so PayRam is never left half-updated.
 func (s *Server) Start() error {
-	autoUpdateCtx, autoUpdateCancel := context.WithCancel(context.Background())
-	defer autoUpdateCancel()
+	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
+	defer cancelBackground()
 
-	// Create a channel to listen for shutdown signals
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
-	// Create a channel to capture server errors
-	serverErrors := make(chan error, 1)
+	serverErrors := make(chan error, 2)
 
-	// Start the server in a goroutine
+	s.secureStoredFiles()
+	if token, err := cli.EnsureToken(s.config.StateDir); err != nil {
+		logger.Warnf("Server", "Start", "Manual mode is unavailable: %v (dashboard updates are not affected)", err)
+	} else {
+		s.cliToken = token
+	}
+
+	listener, err := net.Listen("tcp", s.httpServer.Addr)
+	if err != nil {
+		return fmt.Errorf("failed to create listener: %w", err)
+	}
+	logger.Infof("Server", "Start", "Localhost: http://%s", s.httpServer.Addr)
 	go func() {
-		// Get Docker bridge IP for logging and optional listener
-		dockerIP, err := network.GetDockerBridgeIP()
-		if err != nil {
-			logger.Error("Server", "Start", err)
-			logger.Warnf("Server", "Start", "Starting HTTP server on localhost only: http://127.0.0.1:%d", s.port)
-		} else {
-			logger.Infof("Server", "Start", "Starting HTTP server on local interfaces")
-			logger.Infof("Server", "Start", "Localhost: http://127.0.0.1:%d", s.port)
-			logger.Infof("Server", "Start", "Docker bridge: http://%s:%d", dockerIP, s.port)
-		}
-
-		// Always listen on localhost
-		listener, err := net.Listen("tcp", s.httpServer.Addr)
-		if err != nil {
-			serverErrors <- fmt.Errorf("failed to create listener: %w", err)
-			return
-		}
-
-		// If docker bridge IP is available, start a second listener on it
-		if dockerIP != "" {
-			bridgeAddr := fmt.Sprintf("%s:%d", dockerIP, s.port)
-			bridgeListener, bridgeErr := net.Listen("tcp", bridgeAddr)
-			if bridgeErr != nil {
-				logger.Error("Server", "Start", bridgeErr)
-				logger.Warnf("Server", "Start", "Failed to bind docker bridge listener (%s)", bridgeAddr)
-			} else {
-				go func() {
-					if err := s.httpServer.Serve(bridgeListener); err != nil && err != http.ErrServerClosed {
-						serverErrors <- fmt.Errorf("HTTP server error (docker bridge): %w", err)
-					}
-				}()
-			}
-		}
-
 		if err := s.httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			serverErrors <- fmt.Errorf("HTTP server error: %w", err)
 		}
 	}()
+	go s.serveOnDockerBridge(backgroundCtx, serverErrors)
 
-	if s.config.AutoUpdateEnabled {
-		go s.startAutoUpdateLoop(autoUpdateCtx)
-	}
+	// An updater that stopped mid-update left its job behind: finish or
+	// reverse it before taking new work. Auto-update starts only after the
+	// repair, so it can never start an update on top of the interrupted one.
+	go func() {
+		s.repairInterruptedUpgrade(backgroundCtx)
+		if s.config.AutoUpdateEnabled {
+			s.startAutoUpdateLoop(backgroundCtx)
+		}
+	}()
 
-	// Wait for either a signal or server error
 	select {
 	case err := <-serverErrors:
-		autoUpdateCancel()
+		cancelBackground()
 		return err
 	case sig := <-stop:
 		logger.Warnf("Server", "Start", "Received signal %v, initiating graceful shutdown", sig)
 	}
 
-	// Graceful shutdown with timeout
+	s.shuttingDown.Store(true)
+	cancelBackground()
+	if s.upgradeRunning.Load() {
+		logger.Warnf("Server", "Start", "Waiting up to %s for the update in progress to finish, so PayRam is not left half-updated", shutdownGrace)
+		finished := make(chan struct{})
+		go func() {
+			s.upgradeWg.Wait()
+			close(finished)
+		}()
+		select {
+		case <-finished:
+			logger.Infof("Server", "Start", "Update finished; stopping")
+		case <-time.After(shutdownGrace):
+			logger.Warnf("Server", "Start", "The update did not finish in time; the next start will put PayRam right")
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -292,6 +253,79 @@ func (s *Server) Start() error {
 
 	logger.Infof("Server", "Start", "Server stopped gracefully")
 	return nil
+}
+
+// secureStoredFiles makes what the updater keeps on disk root-only before it
+// serves anything. Updaters up to v0.2.3 logged docker command lines with
+// AES_KEY in them (the dashboard shows that log), and left backups, which
+// hold the whole payments database, readable by every user on the server
+// until the next backup was taken. (The state directory's own files are
+// root-only already, and the directory itself may be shared, so it is left
+// as it is; the installer restricts its default one.)
+func (s *Server) secureStoredFiles() {
+	if err := s.jobStore.RewriteLogs(dockerexec.RedactLine); err != nil {
+		logger.Warnf("Server", "secureStoredFiles", "Could not clean the update log of secret values: %v", err)
+	}
+	if s.config.Backup.Dir != "" {
+		if err := backup.SecureBackupDir(s.config.Backup.Dir, logger.StdLogger()); err != nil {
+			logger.Warnf("Server", "secureStoredFiles", "Could not restrict the backup folder to root: %v", err)
+		}
+	}
+}
+
+// serveOnDockerBridge listens on the docker0 address the PayRam container
+// calls. docker0 only exists once Docker is up, which after a reboot can be
+// later than the updater, so it keeps trying instead of giving up once.
+func (s *Server) serveOnDockerBridge(ctx context.Context, serverErrors chan<- error) {
+	warned := false
+	for {
+		dockerIP, err := network.GetDockerBridgeIP()
+		if err == nil {
+			bridgeAddr := fmt.Sprintf("%s:%d", dockerIP, s.port)
+			bridgeListener, listenErr := net.Listen("tcp", bridgeAddr)
+			if listenErr == nil {
+				logger.Infof("Server", "Start", "Docker bridge: http://%s", bridgeAddr)
+				if err := s.httpServer.Serve(bridgeListener); err != nil && err != http.ErrServerClosed {
+					serverErrors <- fmt.Errorf("HTTP server error (docker bridge): %w", err)
+				}
+				return
+			}
+			err = listenErr
+		}
+		if !warned {
+			logger.Warnf("Server", "Start", "The PayRam dashboard cannot reach the updater yet (%v); retrying every 10s", err)
+			warned = true
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
+	}
+}
+
+// claimUpgradeSlot reserves the single update slot.
+func (s *Server) claimUpgradeSlot() error {
+	if s.shuttingDown.Load() {
+		return errShuttingDown
+	}
+	if !s.upgradeRunning.CompareAndSwap(false, true) {
+		if s.repairing.Load() {
+			return errRepairing
+		}
+		return errUpgradeBusy
+	}
+	return nil
+}
+
+func (s *Server) releaseUpgradeSlot() {
+	s.upgradeRunning.Store(false)
+}
+
+// startUpgrade runs a job whose slot was claimed with claimUpgradeSlot.
+func (s *Server) startUpgrade(job *jobs.Job, plan *UpgradePlan) {
+	s.upgradeWg.Add(1)
+	go s.executeUpgrade(job, plan)
 }
 
 func (s *Server) startAutoUpdateLoop(ctx context.Context) {
@@ -336,22 +370,29 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	if err := s.claimUpgradeSlot(); err != nil {
+		logger.Infof("Server", "runAutoUpdateOnce", "Auto update: skipping (%v)", err)
+		return
+	}
+	started := false
+	defer func() {
+		if !started {
+			s.releaseUpgradeSlot()
+		}
+	}()
 
-	// Skip if an active job exists
 	existingJob, err := s.jobStore.LoadLatest()
 	if err != nil {
 		logger.Error("Server", "runAutoUpdateOnce", err)
 		return
 	}
-	if existingJob != nil {
-		if isJobActive(existingJob) {
-			logger.Infof("Server", "runAutoUpdateOnce", "Auto update: active job %s in state %s, skipping", existingJob.JobID, existingJob.State)
-			return
-		}
-		if existingJob.State == jobs.JobStateFailed {
-			logger.Warnf("Server", "runAutoUpdateOnce", "Auto update: last job failed (%s), skipping", existingJob.FailureCode)
-			return
-		}
+	if existingJob != nil && existingJob.IsActive() {
+		logger.Warnf("Server", "runAutoUpdateOnce", "Auto update: update %s is still marked %s, skipping", existingJob.JobID, existingJob.State)
+		return
+	}
+	if existingJob != nil && existingJob.State == jobs.JobStateFailed {
+		logger.Warnf("Server", "runAutoUpdateOnce", "Auto update: last job failed (%s), skipping", existingJob.FailureCode)
+		return
 	}
 
 	// Fetch policy to get latest version
@@ -370,16 +411,9 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	}
 	initVersion := strings.TrimSpace(policyData.UpdaterAPIInitVersion)
 
-	containerName, err := s.discoverContainerName(ctx)
-	if err != nil {
-		logger.Error("Server", "runAutoUpdateOnce", err)
-		return
-	}
-
-	// Fetch current version (API or label fallback)
-	versionCtx, cancel := context.WithTimeout(ctx, time.Duration(s.config.FetchTimeoutSeconds)*time.Second)
-	defer cancel()
-	currentVersion, _, err := s.resolveCoreVersion(versionCtx, containerName, initVersion)
+	// Unlike a dashboard request, auto-update does not go ahead without
+	// knowing what runs.
+	currentVersion, err := s.runningVersion(ctx, initVersion)
 	if err != nil {
 		logger.Error("Server", "runAutoUpdateOnce", err)
 		return
@@ -399,18 +433,11 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 		return
 	}
 
-	// Re-check for active job to avoid race
-	existingJob, err = s.jobStore.LoadLatest()
-	if err == nil && existingJob != nil && isJobActive(existingJob) {
-		logger.Infof("Server", "runAutoUpdateOnce", "Auto update: active job %s in state %s, skipping", existingJob.JobID, existingJob.State)
-		return
-	}
-
 	jobID := fmt.Sprintf("job-%d", time.Now().UnixNano())
 	job := jobs.NewJob(jobID, jobs.JobModeDashboard, plan.RequestedTarget)
 	job.ResolvedTarget = plan.ResolvedTarget
-	job.State = jobs.JobStateReady
-	job.Message = "Auto update job created"
+	job.State = jobs.JobStateExecuting
+	job.Message = "Preparing the update"
 	job.UpdatedAt = time.Now().UTC()
 
 	if err := s.jobStore.Save(job); err != nil {
@@ -419,38 +446,31 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	}
 
 	s.jobStore.AppendLog(fmt.Sprintf("Starting auto update job %s: mode=%s target=%s source=AUTO", jobID, "DASHBOARD", plan.RequestedTarget))
-	go s.executeUpgrade(job, plan.Manifest, plan.ArchSupport, plan.SteppingStone)
+	started = true
+	s.startUpgrade(job, plan)
 }
 
-// executeUpgrade runs the upgrade execution in the background.
-// It updates job state and logs progress as it executes.
-// All configuration comes from the manifest - no environment overrides.
-//
-// FAIL-FAST GUARANTEES (Phase G):
-// ================================
-// This function enforces strict fail-fast behavior. If ANY step cannot be
-// completed safely, the upgrade FAILS IMMEDIATELY with:
-//  1. Explicit failure code (for playbook lookup)
-//  2. Human-readable error message
-//  3. Container left in safe state (running or recoverable)
-//  4. No guessing, no fallback logic, no silent failures
-//
-// SAFETY ZONES:
-// - Before backup: Container untouched, fully running (SAFE)
-// - After backup, before stop: Container still running, backup exists (SAFE)
-// - After stop: Container stopped but recoverable via backup + restart (RECOVERABLE)
-// - After health check fails: NEW container running but unhealthy, backup exists (RECOVERABLE)
-//
-// ALL FAILURE CODES HAVE RECOVERY PLAYBOOKS:
-// See internal/recovery/playbook.go for complete recovery instructions.
-// Every failure includes next steps for manual recovery.
-func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest, archSupport map[string]string, steppingStone string) {
+// executeUpgrade runs an update job in the background. Whatever happens, it
+// ends with PayRam running: the new version once it has proven itself, or
+// the previous one, switched back automatically (see runUpgrade).
+func (s *Server) executeUpgrade(job *jobs.Job, plan *UpgradePlan) {
 	defer s.upgradeWg.Done()
+	defer s.releaseUpgradeSlot()
 	ctx := context.Background()
+
+	// A CLI restore and a daemon update must never change the container at
+	// the same time.
+	release, err := jobs.AcquireContainerLock(s.config.StateDir)
+	if err != nil {
+		s.failBeforeChange(job, "CONCURRENCY_BLOCKED", fmt.Sprintf("%v", err))
+		return
+	}
+	defer release()
+
+	stopHeartbeat := s.startHeartbeat()
+	defer stopHeartbeat()
+
 	isDryRun := s.config.ExecutionMode == "dry-run"
-	imageTag := job.ResolvedTarget
-	imageRepo := manifestData.Image.Repo
-	policyInitVersion := s.fetchPolicyInitVersion(ctx)
 
 	// Record upgrade start
 	upgradeData := map[string]string{
@@ -486,6 +506,9 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest, 
 			if job.FailureCode != "" {
 				data["failureCode"] = job.FailureCode
 			}
+			if job.CauseCode != "" {
+				data["causeCode"] = job.CauseCode
+			}
 		} else if job.State == jobs.JobStateReady {
 			if isDryRun {
 				status = "validated"
@@ -504,153 +527,29 @@ func (s *Server) executeUpgrade(job *jobs.Job, manifestData *manifest.Manifest, 
 		})
 	}()
 
-	// Phase 1: Resolve target container name
-	containerName, ok := s.resolveTargetContainer(ctx, job, manifestData)
-	if !ok {
-		return
+	// A bug must not leave PayRam half-switched.
+	defer func() {
+		if r := recover(); r != nil {
+			logger.ErrorMsg("Server", "executeUpgrade", fmt.Sprintf("panic during update: %v\n%s", r, debug.Stack()))
+			s.jobStore.AppendLog(fmt.Sprintf("Internal error: %v", r))
+			s.putPayramBack(ctx, s.newSwitch(), job, "INTERNAL_ERROR",
+				fmt.Sprintf("the updater hit an internal error (%v)", r), stageReachedCutover(job.SwitchStage))
+		}
+	}()
+
+	s.runUpgrade(ctx, job, plan, isDryRun)
+}
+
+// startHeartbeat refreshes the saved job's UpdatedAt while a job runs, so an
+// active job that stops being refreshed is known to belong to a dead updater.
+func (s *Server) startHeartbeat() func() {
+	every := s.heartbeatEvery
+	if every <= 0 {
+		every = 20 * time.Second
 	}
-
-	// Phase 2: Prepare upgrade arguments (extract runtime state & build docker args).
-	// Also applies arch suffix from current container tag (e.g. 1.9.3 → 1.9.3-arm64).
-	dockerArgs, imageTag, ok := s.prepareUpgradeArgs(ctx, job, containerName, manifestData, imageTag, archSupport)
-	if !ok {
-		return
-	}
-
-	// Phase 3: Execute dry-run if configured
-	if isDryRun {
-		s.executeDryRun(job, imageRepo, imageTag, containerName, dockerArgs)
-		return
-	}
-
-	// EXECUTE mode: perform actual upgrade
-
-	// Phase 4: Pre-flight checks
-	if !s.preflightChecks(ctx, job, containerName) {
-		return
-	}
-
-	if steppingStone != "" {
-		// TWO-HOP UPGRADE: breakpoint chaining.
-		// Hop 1: upgrade silently through the stepping stone version.
-		// Hop 2: upgrade to the resolved target (breakpoint version).
-		// Both hops use the same pre-hop backup for rollback safety.
-
-		// Phase 5a: Pull stepping stone image
-		steppingArgs, steppingTag, ok := s.prepareUpgradeArgs(ctx, job, containerName, manifestData, steppingStone, archSupport)
-		if !ok {
-			return
-		}
-		s.jobStore.AppendLog(fmt.Sprintf("Breakpoint upgrade: passing through stepping stone %s first, then continuing to %s", steppingTag, imageTag))
-		if !s.pullUpgradeImage(ctx, job, imageRepo, steppingTag) {
-			return
-		}
-
-		// Phase 6a: Quiesce + Backup (once, covers both hops)
-		stoppedPrograms, usedSupervisor, ok := s.quiesceSupervisorPrograms(ctx, job, containerName)
-		if !ok {
-			return
-		}
-		if usedSupervisor {
-			if _, ok := s.createPreUpgradeBackupAfterQuiesce(ctx, job, containerName, steppingTag, policyInitVersion, 3, stoppedPrograms); !ok {
-				return
-			}
-		} else {
-			if _, ok := s.createPreUpgradeBackupBeforeStop(ctx, job, containerName, steppingTag, policyInitVersion); !ok {
-				return
-			}
-		}
-
-		// Phase 7a: Stop → replace → verify stepping stone
-		if !s.stopContainerForUpgrade(ctx, job, containerName) {
-			return
-		}
-		if !s.replaceContainer(ctx, job, containerName, steppingArgs) {
-			return
-		}
-		job.Message = fmt.Sprintf("Passing through %s, upgrading to %s...", steppingTag, imageTag)
-		job.UpdatedAt = time.Now().UTC()
-		s.jobStore.Save(job)
-		if !s.verifyUpgrade(ctx, job, containerName, steppingTag, policyInitVersion) {
-			return
-		}
-		s.jobStore.AppendLog(fmt.Sprintf("Stepping stone %s healthy, continuing to %s", steppingTag, imageTag))
-
-		// Phase 5b: Pull final image (stepping stone is now running — re-read runtime state)
-		dockerArgs, imageTag, ok = s.prepareUpgradeArgs(ctx, job, containerName, manifestData, imageTag, archSupport)
-		if !ok {
-			return
-		}
-		if !s.pullUpgradeImage(ctx, job, imageRepo, imageTag) {
-			return
-		}
-
-		// Phase 7b: Stop stepping stone → replace → verify final target
-		if !s.stopContainerForUpgrade(ctx, job, containerName) {
-			return
-		}
-		if !s.replaceContainer(ctx, job, containerName, dockerArgs) {
-			return
-		}
-		if !s.verifyUpgrade(ctx, job, containerName, imageTag, policyInitVersion) {
-			// Hop 2 failed. System is on stepping stone (now stopped). Report clearly.
-			job.FailureCode = "HEALTHCHECK_FAILED"
-			job.Message = fmt.Sprintf(
-				"Upgrade to %s failed after passing through stepping stone %s. "+
-					"System was on %s (healthy). Backup available at: %s. "+
-					"Retry the upgrade to attempt %s again.",
-				imageTag, steppingTag, steppingTag, job.BackupPath, imageTag,
-			)
-			job.UpdatedAt = time.Now().UTC()
-			s.jobStore.Save(job)
-			return
-		}
-
-		s.finalizeUpgrade(ctx, job, imageRepo, imageTag)
-		return
-	}
-
-	// SINGLE-HOP UPGRADE (no stepping stone)
-
-	// Phase 5: Pull image before stopping container
-	if !s.pullUpgradeImage(ctx, job, imageRepo, imageTag) {
-		return
-	}
-
-	// Phase 6: Quiesce supervisor programs (if available)
-	stoppedPrograms, usedSupervisor, ok := s.quiesceSupervisorPrograms(ctx, job, containerName)
-	if !ok {
-		return
-	}
-
-	// Phase 7: Create backup (supervisor quiesce or fallback)
-	if usedSupervisor {
-		if _, ok := s.createPreUpgradeBackupAfterQuiesce(ctx, job, containerName, imageTag, policyInitVersion, 3, stoppedPrograms); !ok {
-			return
-		}
-	} else {
-		if _, ok := s.createPreUpgradeBackupBeforeStop(ctx, job, containerName, imageTag, policyInitVersion); !ok {
-			return
-		}
-	}
-
-	// Phase 8: Stop container before replacement
-	if !s.stopContainerForUpgrade(ctx, job, containerName) {
-		return
-	}
-
-	// Phase 9: Replace container with new version
-	if !s.replaceContainer(ctx, job, containerName, dockerArgs) {
-		return
-	}
-
-	// Phase 10: Verify upgrade (health and version checks)
-	if !s.verifyUpgrade(ctx, job, containerName, imageTag, policyInitVersion) {
-		return
-	}
-
-	// Phase 11: Finalize upgrade (mark complete and prune old images)
-	s.finalizeUpgrade(ctx, job, imageRepo, imageTag)
+	return s.jobStore.StartHeartbeat(every, func(err error) {
+		logger.Error("Server", "startHeartbeat", err)
+	})
 }
 
 func (s *Server) fetchPolicyInitVersion(ctx context.Context) string {
@@ -665,15 +564,25 @@ func (s *Server) fetchPolicyInitVersion(ctx context.Context) string {
 	return strings.TrimSpace(policyData.UpdaterAPIInitVersion)
 }
 
+// resolveCoreVersion returns the version PayRam in containerName runs: from
+// its API when it answers, else from the container's labels.
 func (s *Server) resolveCoreVersion(ctx context.Context, containerName, initVersion string) (string, bool, error) {
-	versionResp, err := s.coreClient.Version(ctx)
-	if err == nil && versionResp != nil && versionResp.Version != "" {
-		legacy, legacyErr := corecompat.IsBeforeInit(versionResp.Version, initVersion)
-		if legacyErr != nil {
-			logger.Error("Server", "resolveCoreVersion", legacyErr)
-			return versionResp.Version, false, nil
+	return s.resolveCoreVersionAt(ctx, s.currentCoreBaseURL(ctx, containerName), containerName, initVersion)
+}
+
+func (s *Server) resolveCoreVersionAt(ctx context.Context, baseURL, containerName, initVersion string) (string, bool, error) {
+	if baseURL != "" {
+		versionResp, err := coreclient.NewClient(baseURL).Version(ctx)
+		// Some builds report a branch name ("main") instead of a version;
+		// the image label is right for those.
+		if err == nil && versionResp != nil && isReleaseVersion(versionResp.Version) {
+			legacy, legacyErr := corecompat.IsBeforeInit(versionResp.Version, initVersion)
+			if legacyErr != nil {
+				logger.Error("Server", "resolveCoreVersion", legacyErr)
+				return versionResp.Version, false, nil
+			}
+			return versionResp.Version, legacy, nil
 		}
-		return versionResp.Version, legacy, nil
 	}
 
 	labelVersion, err := corecompat.VersionFromLabels(ctx, s.config.DockerBin, containerName)
@@ -688,6 +597,43 @@ func (s *Server) resolveCoreVersion(ctx context.Context, containerName, initVers
 	}
 
 	return labelVersion, legacy, nil
+}
+
+// currentCoreBaseURL returns the PayRam API address for read-only use,
+// looked up at most once a minute. Updates look it up themselves.
+func (s *Server) currentCoreBaseURL(ctx context.Context, containerName string) string {
+	s.coreURLMu.Lock()
+	defer s.coreURLMu.Unlock()
+	if s.coreURL != "" && time.Since(s.coreURLAt) < coreURLCacheFor {
+		return s.coreURL
+	}
+	if containerName == "" {
+		name, err := s.discoverContainerName(ctx)
+		if err != nil {
+			return s.config.CoreBaseURL
+		}
+		containerName = name
+	}
+	url, _, err := container.FindCoreBaseURL(ctx, s.config.DockerBin, containerName, s.config.CoreBaseURL, logger.StdLogger())
+	if err != nil {
+		logger.Warnf("Server", "currentCoreBaseURL", "Could not find the PayRam API: %v", err)
+		return ""
+	}
+	s.coreURL, s.coreURLAt = url, time.Now()
+	return url
+}
+
+func (s *Server) rememberCoreBaseURL(url string) {
+	s.coreURLMu.Lock()
+	defer s.coreURLMu.Unlock()
+	s.coreURL, s.coreURLAt = url, time.Now()
+}
+
+// isReleaseVersion reports whether v looks like a release version (3.10.0,
+// v3.10.0, 3.10.0-arm64) rather than a branch name.
+func isReleaseVersion(v string) bool {
+	_, err := goversion.NewVersion(baseVersionTag(strings.TrimPrefix(strings.TrimSpace(v), "v")))
+	return err == nil
 }
 
 func (s *Server) shouldUseLegacyForTarget(initVersion, targetVersion string) bool {
@@ -716,5 +662,14 @@ func (s *Server) discoverContainerName(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	return discovered.Name, nil
+	return container.ContainerName(discovered.Name), nil
+}
+
+// lookupContainerIPs feeds the API allow list.
+func (s *Server) lookupContainerIPs(ctx context.Context) ([]string, error) {
+	name, err := s.discoverContainerName(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return network.ContainerIPs(ctx, s.config.DockerBin, name)
 }

@@ -53,7 +53,9 @@ func DiscoverDBContext(ctx context.Context, executor CommandExecutor, opts Disco
 				Database: getEnvOrDefault("POSTGRES_DATABASE", getEnvOrDefault("POSTGRES_DB", "")),
 				Username: getEnvOrDefault("POSTGRES_USERNAME", getEnvOrDefault("POSTGRES_USER", "")),
 				Password: os.Getenv("POSTGRES_PASSWORD"),
-				SSLMode:  getEnvOrDefault("POSTGRES_SSLMODE", "disable"),
+				// Unset stays unset: libpq then uses its default ("prefer"),
+				// which is what these tools always used from the host.
+				SSLMode: os.Getenv("POSTGRES_SSLMODE"),
 			},
 		}
 		if err := dbCtx.Creds.Validate(); err != nil {
@@ -116,6 +118,7 @@ func DiscoverDBContext(ctx context.Context, executor CommandExecutor, opts Disco
 			Mode:          mode,
 			CredSource:    CredFromRunningContainer,
 			ContainerName: containerName,
+			AppContainer:  discoveredName,
 			Creds: DBCreds{
 				Host:     dbConfig.Host,
 				Port:     dbConfig.Port,

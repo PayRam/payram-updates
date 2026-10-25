@@ -267,13 +267,16 @@ func TestReconcileMounts_KeepsExistingWhenManifestRequiresSamePath(t *testing.T)
 	}
 }
 
-// TestReconcileMounts_BindMountVsVolume tests bind mount detection.
-func TestReconcileMounts_BindMountVsVolume(t *testing.T) {
+// TestReconcileMounts_ManifestHostFolderIsIgnored: the manifest may add a
+// Docker volume, never a host folder (a remote file must not be able to mount
+// e.g. "/" into the container).
+func TestReconcileMounts_ManifestHostFolderIsIgnored(t *testing.T) {
 	inspected := []Mount{}
 
 	manifestMounts := []manifest.Volume{
 		{Destination: "/data", Source: "", ReadOnly: false},           // Volume (no host path)
-		{Destination: "/config", Source: "/host/cfg", ReadOnly: true}, // Bind mount (has host path)
+		{Destination: "/config", Source: "/host/cfg", ReadOnly: true}, // Host folder: refused
+		{Destination: "/host", Source: "/", ReadOnly: false},          // Host root: refused
 	}
 
 	logger := &mockLogger{}
@@ -284,41 +287,11 @@ func TestReconcileMounts_BindMountVsVolume(t *testing.T) {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
 
-	if len(result) != 2 {
-		t.Fatalf("Expected 2 mounts, got %d", len(result))
+	if len(result) != 1 {
+		t.Fatalf("Expected only the volume mount, got %d mounts: %+v", len(result), result)
 	}
-
-	// Check volume
-	volumeFound := false
-	for _, mount := range result {
-		if mount.Destination == "/data" {
-			volumeFound = true
-			if mount.Type != "volume" {
-				t.Errorf("Expected type 'volume', got '%s'", mount.Type)
-			}
-			break
-		}
-	}
-	if !volumeFound {
-		t.Error("Expected volume mount /data")
-	}
-
-	// Check bind mount
-	bindFound := false
-	for _, mount := range result {
-		if mount.Destination == "/config" {
-			bindFound = true
-			if mount.Type != "bind" {
-				t.Errorf("Expected type 'bind', got '%s'", mount.Type)
-			}
-			if mount.Source != "/host/cfg" {
-				t.Errorf("Expected source '/host/cfg', got '%s'", mount.Source)
-			}
-			break
-		}
-	}
-	if !bindFound {
-		t.Error("Expected bind mount /config")
+	if result[0].Destination != "/data" || result[0].Type != "volume" {
+		t.Errorf("Expected volume mount /data, got %+v", result[0])
 	}
 }
 

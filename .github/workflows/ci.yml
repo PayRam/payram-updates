@@ -1,0 +1,84 @@
+name: ci
+
+# Every pull request and every push to main runs the full check, and the
+# release workflow calls this same workflow before it builds anything, so no
+# binary reaches a merchant without passing it.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: format, vet, test, vulnerabilities, installer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash # -eo pipefail
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted="$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-formatted (run: gofmt -w <file>):"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (race detector)
+        run: go test -race ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      - name: Tests leave the tree clean
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::The checks above changed or created files in the repository. Tests must write to t.TempDir(), not the source tree."
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+
+      - name: Installer syntax
+        run: bash -n setup_payram_updater.sh
+
+      - name: Installer lint (shellcheck)
+        run: shellcheck --severity=warning setup_payram_updater.sh
+
+      # The installer writes the unit and the env file itself (it is piped
+      # from curl and cannot read other files), so the copies for packagers
+      # and developers must not drift from it.
+      - name: Packaging files match the installer
+        env:
+          PAYRAM_UPDATER_SETUP_LIBRARY_ONLY: "true"
+        run: |
+          bash -c 'source ./setup_payram_updater.sh && systemd_unit_content' |
+            diff -u - packaging/systemd/payram-updater.service
+          for example in packaging/examples/updater.env.example .env.example; do
+            while IFS= read -r line; do
+              if ! grep -qxF -- "$line" "$example"; then
+                echo "::error file=$example::missing the installer default: $line"
+                exit 1
+              fi
+            done < <(bash -c 'source ./setup_payram_updater.sh && env_template')
+          done
+
+      - name: Release build
+        run: make build-release check-release VERSION="ci-${GITHUB_SHA::12}"

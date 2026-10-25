@@ -2,12 +2,17 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/payram/payram-updater/internal/dbexec"
+	"github.com/payram/payram-updater/internal/jobs"
 )
 
 // mockLogger implements Logger for testing.
@@ -76,164 +81,10 @@ func newTestManager(t *testing.T, executor *mockExecutor) (*Manager, string) {
 		PGUser:     "testuser",
 		PGPassword: "testpass",
 		PGDumpBin:  "pg_dump",
+		StateDir:   filepath.Join(tmpDir, "state"),
 	}
 
 	return NewManager(cfg, executor, &mockLogger{}), tmpDir
-}
-
-// newTestManagerWithMockContainer creates a test manager and sets up a mock container
-// with DB environment variables for testing restore operations.
-func newTestManagerWithMockContainer(t *testing.T, executor *mockExecutor) (*Manager, string, string) {
-	t.Helper()
-	mgr, tmpDir := newTestManager(t, executor)
-
-	// Mock container name - tests should use this to skip discovery
-	containerName := "test-payram-container"
-
-	// For tests that actually call docker inspect, they need to provide
-	// a mock executor that handles the inspect commands
-	return mgr, tmpDir, containerName
-}
-
-func TestCreateBackup_Success(t *testing.T) {
-	// Set external DB environment to avoid container discovery
-	os.Setenv("POSTGRES_HOST", "external-db.example.com")
-	os.Setenv("POSTGRES_PORT", "5432")
-	os.Setenv("POSTGRES_DATABASE", "testdb")
-	os.Setenv("POSTGRES_USER", "testuser")
-	os.Setenv("POSTGRES_PASSWORD", "testpass")
-	defer func() {
-		os.Unsetenv("POSTGRES_HOST")
-		os.Unsetenv("POSTGRES_PORT")
-		os.Unsetenv("POSTGRES_DATABASE")
-		os.Unsetenv("POSTGRES_USER")
-		os.Unsetenv("POSTGRES_PASSWORD")
-	}()
-
-	executor := &mockExecutor{
-		executeFunc: func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
-			// Simulate pg_dump creating the file
-			for i, arg := range args {
-				if arg == "-f" && i+1 < len(args) {
-					if err := os.WriteFile(args[i+1], []byte("fake backup data"), 0644); err != nil {
-						return nil, err
-					}
-					break
-				}
-			}
-			return []byte("pg_dump success"), nil
-		},
-	}
-
-	mgr, _ := newTestManager(t, executor)
-
-	meta := BackupMeta{
-		FromVersion:   "1.7.8",
-		TargetVersion: "1.7.9",
-		JobID:         "job-123",
-	}
-
-	info, err := mgr.CreateBackup(context.Background(), meta)
-	if err != nil {
-		t.Fatalf("CreateBackup failed: %v", err)
-	}
-
-	if info == nil {
-		t.Fatal("expected backup info, got nil")
-	}
-
-	// Verify backup info fields
-	if info.FromVersion != "1.7.8" {
-		t.Errorf("expected FromVersion '1.7.8', got %s", info.FromVersion)
-	}
-	if info.TargetVersion != "1.7.9" {
-		t.Errorf("expected TargetVersion '1.7.9', got %s", info.TargetVersion)
-	}
-	if info.JobID != "job-123" {
-		t.Errorf("expected JobID 'job-123', got %s", info.JobID)
-	}
-	if info.Database != "testdb" {
-		t.Errorf("expected Database 'testdb', got %s", info.Database)
-	}
-	if info.Size == 0 {
-		t.Error("expected non-zero size")
-	}
-	if info.Path == "" {
-		t.Error("expected non-empty path")
-	}
-
-	// Verify pg_dump was called with correct args
-	if len(executor.calls) != 1 {
-		t.Fatalf("expected 1 executor call, got %d", len(executor.calls))
-	}
-
-	call := executor.calls[0]
-	if call.Name != "pg_dump" {
-		t.Errorf("expected pg_dump, got %s", call.Name)
-	}
-
-	// Check for required args
-	if !containsArg(call.Args, "-Fc") {
-		t.Error("expected -Fc flag for custom format")
-	}
-	if !containsArg(call.Args, "-h") || !containsArg(call.Args, "external-db.example.com") {
-		t.Error("expected -h external-db.example.com")
-	}
-	if !containsArg(call.Args, "-U") || !containsArg(call.Args, "testuser") {
-		t.Error("expected -U testuser")
-	}
-	if !containsArg(call.Args, "-d") || !containsArg(call.Args, "testdb") {
-		t.Error("expected -d testdb")
-	}
-
-	// Check env has password
-	hasPassword := false
-	for _, e := range call.Env {
-		if e == "PGPASSWORD=testpass" {
-			hasPassword = true
-			break
-		}
-	}
-	if !hasPassword {
-		t.Error("expected PGPASSWORD in env")
-	}
-}
-
-func TestCreateBackup_PgDumpFails(t *testing.T) {
-	// Set external DB environment to avoid container discovery
-	os.Setenv("POSTGRES_HOST", "external-db.example.com")
-	os.Setenv("POSTGRES_PORT", "5432")
-	os.Setenv("POSTGRES_DATABASE", "testdb")
-	os.Setenv("POSTGRES_USER", "testuser")
-	os.Setenv("POSTGRES_PASSWORD", "testpass")
-	defer func() {
-		os.Unsetenv("POSTGRES_HOST")
-		os.Unsetenv("POSTGRES_PORT")
-		os.Unsetenv("POSTGRES_DATABASE")
-		os.Unsetenv("POSTGRES_USER")
-		os.Unsetenv("POSTGRES_PASSWORD")
-	}()
-
-	executor := &mockExecutor{
-		executeFunc: func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
-			return []byte("connection refused"), &mockError{msg: "exit status 1"}
-		},
-	}
-
-	mgr, _ := newTestManager(t, executor)
-
-	_, err := mgr.CreateBackup(context.Background(), BackupMeta{
-		FromVersion:   "1.0.0",
-		TargetVersion: "1.1.0",
-	})
-
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-
-	if !strings.Contains(err.Error(), "pg_dump (host) failed") {
-		t.Errorf("expected pg_dump (host) failed error, got: %v", err)
-	}
 }
 
 func TestListBackups_Empty(t *testing.T) {
@@ -450,209 +301,6 @@ func TestGetBackupByPath(t *testing.T) {
 	}
 }
 
-func TestBackupFilename(t *testing.T) {
-	// Set external DB environment to avoid container discovery
-	os.Setenv("POSTGRES_HOST", "external-db.example.com")
-	os.Setenv("POSTGRES_PORT", "5432")
-	os.Setenv("POSTGRES_DATABASE", "testdb")
-	os.Setenv("POSTGRES_USER", "testuser")
-	os.Setenv("POSTGRES_PASSWORD", "testpass")
-	defer func() {
-		os.Unsetenv("POSTGRES_HOST")
-		os.Unsetenv("POSTGRES_PORT")
-		os.Unsetenv("POSTGRES_DATABASE")
-		os.Unsetenv("POSTGRES_USER")
-		os.Unsetenv("POSTGRES_PASSWORD")
-	}()
-
-	executor := &mockExecutor{
-		executeFunc: func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
-			// Find and create the output file
-			for i, arg := range args {
-				if arg == "-f" && i+1 < len(args) {
-					os.WriteFile(args[i+1], []byte("data"), 0644)
-					break
-				}
-			}
-			return nil, nil
-		},
-	}
-
-	mgr, _ := newTestManager(t, executor)
-
-	meta := BackupMeta{
-		FromVersion:   "1.7.8",
-		TargetVersion: "1.7.9",
-	}
-
-	info, err := mgr.CreateBackup(context.Background(), meta)
-	if err != nil {
-		t.Fatalf("CreateBackup failed: %v", err)
-	}
-
-	// Filename should match pattern
-	if !strings.Contains(info.Filename, "payram-backup-") {
-		t.Errorf("filename should start with payram-backup-, got %s", info.Filename)
-	}
-	if !strings.Contains(info.Filename, "-1.7.8-to-1.7.9.dump") {
-		t.Errorf("filename should contain version info, got %s", info.Filename)
-	}
-}
-
-// ========== Restore Tests ==========
-
-func TestRestoreBackup_RequiresConfirmation(t *testing.T) {
-	executor := &mockExecutor{}
-	mgr, tmpDir := newTestManager(t, executor)
-
-	// Create a backup file
-	backupPath := filepath.Join(tmpDir, "backups", "test.dump")
-	os.WriteFile(backupPath, []byte("backup data"), 0644)
-
-	// Try to restore without confirmation (provide container to skip discovery)
-	_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{
-		Confirmed:     false,
-		ContainerName: "test-container",
-	})
-	if err == nil {
-		t.Fatal("expected error without confirmation")
-	}
-	if !strings.Contains(err.Error(), "requires explicit confirmation") {
-		t.Errorf("expected confirmation error, got: %v", err)
-	}
-
-	// Executor should not have been called
-	if len(executor.calls) != 0 {
-		t.Error("executor should not have been called without confirmation")
-	}
-}
-
-func TestRestoreBackup_Success(t *testing.T) {
-	executor := mockDockerInspectExecutor(func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
-		return []byte("restore complete"), nil
-	})
-
-	mgr, tmpDir := newTestManager(t, executor)
-
-	// Create persisted credentials for restore
-	stateDir := filepath.Join(tmpDir, "state")
-	os.MkdirAll(stateDir, 0755)
-	dbEnvContent := `POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DATABASE=testdb
-POSTGRES_USERNAME=testuser
-POSTGRES_PASSWORD=testpass
-`
-	os.WriteFile(filepath.Join(stateDir, "db.env"), []byte(dbEnvContent), 0600)
-
-	// Create a backup file
-	backupPath := filepath.Join(tmpDir, "backups", "test.dump")
-	os.WriteFile(backupPath, []byte("backup data"), 0644)
-
-	// Restore with confirmation
-	_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true, ContainerName: "test-payram-mock"})
-	if err != nil {
-		t.Fatalf("RestoreBackup failed: %v", err)
-	}
-
-	// Verify pg_restore was called (now it's the first call since we load credentials from file)
-	if len(executor.calls) < 1 {
-		t.Fatalf("expected at least 1 executor call (restore), got %d", len(executor.calls))
-	}
-
-	// Debug: print all calls
-	for i, call := range executor.calls {
-		t.Logf("Call %d: %s %v", i, call.Name, call.Args)
-	}
-
-	// Find the pg_restore call (should be "docker exec" or "sh -c" wrapping pg_restore)
-	var restoreCall *mockCall
-	for i := range executor.calls {
-		if executor.calls[i].Name == "docker" || executor.calls[i].Name == "sh" {
-			restoreCall = &executor.calls[i]
-			break
-		}
-	}
-	if restoreCall == nil {
-		t.Fatal("expected docker exec or shell command for restore")
-	}
-
-	// For local DB, the command should be docker exec (since we have a containerName)
-	// The args will be like: exec -i test-payram-mock pg_restore --clean --if-exists ...
-	// We just verify that docker exec was called
-	if restoreCall.Name != "docker" && restoreCall.Name != "sh" {
-		t.Errorf("expected docker or sh command, got %s", restoreCall.Name)
-	}
-}
-
-func TestRestoreBackup_FileNotFound(t *testing.T) {
-	executor := &mockExecutor{}
-	mgr, _ := newTestManager(t, executor)
-
-	_, err := mgr.RestoreBackup(context.Background(), "/nonexistent/backup.dump", RestoreOptions{Confirmed: true, ContainerName: "test-payram-mock"})
-	if err == nil {
-		t.Fatal("expected error for nonexistent file")
-	}
-	if !strings.Contains(err.Error(), "does not exist") {
-		t.Errorf("expected 'does not exist' error, got: %v", err)
-	}
-}
-
-func TestRestoreBackup_EmptyFile(t *testing.T) {
-	executor := &mockExecutor{}
-	mgr, tmpDir := newTestManager(t, executor)
-
-	// Create empty file
-	backupPath := filepath.Join(tmpDir, "backups", "empty.dump")
-	os.WriteFile(backupPath, []byte{}, 0644)
-
-	_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true, ContainerName: "test-payram-mock"})
-	if err == nil {
-		t.Fatal("expected error for empty file")
-	}
-	if !strings.Contains(err.Error(), "empty") {
-		t.Errorf("expected 'empty' error, got: %v", err)
-	}
-}
-
-func TestRestoreBackup_PgRestoreFails(t *testing.T) {
-	// Set external DB environment to avoid container discovery
-	os.Setenv("POSTGRES_HOST", "external-db.example.com")
-	os.Setenv("POSTGRES_PORT", "5432")
-	os.Setenv("POSTGRES_DATABASE", "testdb")
-	os.Setenv("POSTGRES_USER", "testuser")
-	os.Setenv("POSTGRES_PASSWORD", "testpass")
-	defer func() {
-		os.Unsetenv("POSTGRES_HOST")
-		os.Unsetenv("POSTGRES_PORT")
-		os.Unsetenv("POSTGRES_DATABASE")
-		os.Unsetenv("POSTGRES_USER")
-		os.Unsetenv("POSTGRES_PASSWORD")
-	}()
-
-	executor := &mockExecutor{
-		executeFunc: func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
-			// Return error for pg_restore
-			return []byte("connection refused"), &mockError{msg: "exit status 1"}
-		},
-	}
-
-	mgr, tmpDir := newTestManager(t, executor)
-
-	// Create a backup file
-	backupPath := filepath.Join(tmpDir, "backups", "test.dump")
-	os.WriteFile(backupPath, []byte("backup data"), 0644)
-
-	_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true})
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	// After refactor, error message is now "RESTORE_FAILED: restore" instead of "pg_restore failed"
-	if !strings.Contains(err.Error(), "RESTORE_FAILED") && !strings.Contains(err.Error(), "restore") {
-		t.Errorf("expected restore failed error, got: %v", err)
-	}
-}
-
 func TestVerifyBackupFile_Valid(t *testing.T) {
 	mgr, tmpDir := newTestManager(t, &mockExecutor{})
 
@@ -862,173 +510,6 @@ func TestDetectBackupFormat(t *testing.T) {
 	}
 }
 
-// Test RestoreBackup tool selection
-func TestRestoreBackup_ToolSelection(t *testing.T) {
-	tests := []struct {
-		name        string
-		filename    string
-		expectTool  string
-		expectError bool
-	}{
-		{
-			name:       "sql uses psql",
-			filename:   "backup.sql",
-			expectTool: "psql",
-		},
-		{
-			name:       "dump uses pg_restore",
-			filename:   "backup.dump",
-			expectTool: "pg_restore",
-		},
-		{
-			name:        "unknown format fails",
-			filename:    "backup.txt",
-			expectError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var capturedTool string
-			executor := mockDockerInspectExecutor(func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
-				capturedTool = name
-				return []byte("success"), nil
-			})
-			mgr, tmpDir := newTestManager(t, executor)
-
-			// Create persisted credentials for restore
-			stateDir := filepath.Join(tmpDir, "state")
-			os.MkdirAll(stateDir, 0755)
-			dbEnvContent := `POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DATABASE=testdb
-POSTGRES_USERNAME=testuser
-POSTGRES_PASSWORD=testpass
-`
-			os.WriteFile(filepath.Join(stateDir, "db.env"), []byte(dbEnvContent), 0600)
-
-			// Create test backup file
-			backupPath := filepath.Join(tmpDir, "backups", tt.filename)
-			if err := os.WriteFile(backupPath, []byte("test backup"), 0644); err != nil {
-				t.Fatalf("failed to create test file: %v", err)
-			}
-
-			_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true, ContainerName: "test-payram-mock"})
-
-			if tt.expectError {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				if !strings.Contains(err.Error(), "INVALID_BACKUP_FORMAT") {
-					t.Errorf("expected INVALID_BACKUP_FORMAT error, got: %v", err)
-				}
-			} else {
-				if err != nil {
-					t.Fatalf("RestoreBackup failed: %v", err)
-				}
-				// For local DB, the tool is now "sh" (docker exec wrapper), not psql/pg_restore directly
-				if capturedTool != "sh" {
-					t.Errorf("expected tool %q (docker exec wrapper), got %q", "sh", capturedTool)
-				}
-			}
-		})
-	}
-}
-
-// Test RestoreBackup with psql args
-func TestRestoreBackup_PsqlArgs(t *testing.T) {
-	executor := mockDockerInspectExecutor(func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
-		return []byte("success"), nil
-	})
-	mgr, tmpDir := newTestManager(t, executor)
-
-	// Create persisted credentials for restore
-	stateDir := filepath.Join(tmpDir, "state")
-	os.MkdirAll(stateDir, 0755)
-	dbEnvContent := `POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DATABASE=testdb
-POSTGRES_USERNAME=testuser
-POSTGRES_PASSWORD=testpass
-`
-	os.WriteFile(filepath.Join(stateDir, "db.env"), []byte(dbEnvContent), 0600)
-
-	// Create test SQL backup
-	backupPath := filepath.Join(tmpDir, "backups", "backup.sql")
-	if err := os.WriteFile(backupPath, []byte("SELECT 1;"), 0644); err != nil {
-		t.Fatalf("failed to create test file: %v", err)
-	}
-
-	_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true, ContainerName: "test-payram-mock"})
-	if err != nil {
-		t.Fatalf("RestoreBackup failed: %v", err)
-	}
-
-	// Now credentials come from file, so no docker inspect call
-	if len(executor.calls) < 1 {
-		t.Fatalf("expected at least 1 executor call (restore), got %d", len(executor.calls))
-	}
-
-	// Find the restore call (docker exec or sh -c)
-	var restoreCall *mockCall
-	for i := range executor.calls {
-		if executor.calls[i].Name == "docker" || executor.calls[i].Name == "sh" {
-			restoreCall = &executor.calls[i]
-			break
-		}
-	}
-	if restoreCall == nil {
-		t.Fatal("expected docker exec or shell command for psql restore")
-	}
-}
-
-// Test RestoreBackup with pg_restore args
-func TestRestoreBackup_PgRestoreArgs(t *testing.T) {
-	executor := mockDockerInspectExecutor(func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
-		return []byte("success"), nil
-	})
-	mgr, tmpDir := newTestManager(t, executor)
-
-	// Create persisted credentials for restore
-	stateDir := filepath.Join(tmpDir, "state")
-	os.MkdirAll(stateDir, 0755)
-	dbEnvContent := `POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DATABASE=testdb
-POSTGRES_USERNAME=testuser
-POSTGRES_PASSWORD=testpass
-`
-	os.WriteFile(filepath.Join(stateDir, "db.env"), []byte(dbEnvContent), 0600)
-
-	// Create test dump backup
-	backupPath := filepath.Join(tmpDir, "backups", "backup.dump")
-	if err := os.WriteFile(backupPath, []byte("binary dump"), 0644); err != nil {
-		t.Fatalf("failed to create test file: %v", err)
-	}
-
-	_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true, ContainerName: "test-payram-mock"})
-	if err != nil {
-		t.Fatalf("RestoreBackup failed: %v", err)
-	}
-
-	// Now credentials come from file, so no docker inspect call
-	if len(executor.calls) < 1 {
-		t.Fatalf("expected at least 1 executor call (restore), got %d", len(executor.calls))
-	}
-
-	// Find the restore call (docker exec or sh -c)
-	var restoreCall *mockCall
-	for i := range executor.calls {
-		if executor.calls[i].Name == "docker" || executor.calls[i].Name == "sh" {
-			restoreCall = &executor.calls[i]
-			break
-		}
-	}
-	if restoreCall == nil {
-		t.Fatal("expected docker exec or shell command for pg_restore restore")
-	}
-}
-
 // Test ListBackups sorting
 func TestListBackups_Sorting(t *testing.T) {
 	executor := &mockExecutor{}
@@ -1066,5 +547,494 @@ func TestListBackups_Sorting(t *testing.T) {
 	}
 	if backups[2].Filename != "payram-backup-20260130-100000-1.0.0-to-1.1.0.sql" {
 		t.Errorf("expected 20260130 backup third, got %s", backups[2].Filename)
+	}
+}
+
+// ========== Create, list and prune ==========
+
+func setExternalDBEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("POSTGRES_HOST", "external-db.example.com")
+	t.Setenv("POSTGRES_PORT", "5432")
+	t.Setenv("POSTGRES_DATABASE", "testdb")
+	t.Setenv("POSTGRES_USER", "testuser")
+	t.Setenv("POSTGRES_PASSWORD", "testpass")
+}
+
+func TestCreateBackup_ExternalDBWritesVerifiedPrivateDump(t *testing.T) {
+	setExternalDBEnv(t)
+	mgr, _ := newTestManager(t, &mockExecutor{})
+	runner := &fakeRunner{handle: postgresTools(nil)}
+	mgr.Runner = runner
+
+	info, err := mgr.CreateBackup(context.Background(), BackupMeta{FromVersion: "1.7.8", TargetVersion: "1.7.9", JobID: "job-123"})
+	if err != nil {
+		t.Fatalf("CreateBackup failed: %v", err)
+	}
+	if info.FromVersion != "1.7.8" || info.TargetVersion != "1.7.9" || info.JobID != "job-123" || info.Database != "testdb" {
+		t.Errorf("unexpected info: %+v", info)
+	}
+	if !strings.HasPrefix(info.Filename, "payram-backup-") || !strings.HasSuffix(info.Filename, "-1.7.8-to-1.7.9.dump") {
+		t.Errorf("filename = %s", info.Filename)
+	}
+	if info.Size == 0 {
+		t.Error("expected non-zero size")
+	}
+
+	dumps := runner.callsOf("pg_dump")
+	if len(dumps) != 1 {
+		t.Fatalf("expected 1 pg_dump, got steps %v", runner.steps())
+	}
+	dump := dumps[0].Cmd
+	if dump.Name != "pg_dump" {
+		t.Errorf("expected host pg_dump, got %s", dump.Name)
+	}
+	for _, arg := range []string{"-Fc", "-h", "external-db.example.com", "-U", "testuser", "-d", "testdb"} {
+		if !cmdHasArg(dump, arg) {
+			t.Errorf("pg_dump missing %s: %v", arg, dump.Args)
+		}
+	}
+	if !cmdHasEnv(dump, "PGPASSWORD=testpass") {
+		t.Error("expected PGPASSWORD in env")
+	}
+	if len(runner.callsOf("pg_restore --list")) != 1 {
+		t.Errorf("the new backup must be read back with pg_restore --list: %v", runner.steps())
+	}
+	runner.assertNoSecretInArgs(t, "testpass")
+
+	st, err := os.Stat(info.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0600 {
+		t.Errorf("backup mode = %o, want 0600", st.Mode().Perm())
+	}
+	dirInfo, _ := os.Stat(mgr.Config.Dir)
+	if dirInfo.Mode().Perm() != 0700 {
+		t.Errorf("backup dir mode = %o, want 0700", dirInfo.Mode().Perm())
+	}
+}
+
+func TestCreateBackup_PgDumpFails(t *testing.T) {
+	setExternalDBEnv(t)
+	mgr, _ := newTestManager(t, &mockExecutor{})
+	mgr.Runner = &fakeRunner{handle: func(cmd dbexec.Command, stdin []byte, stdout io.Writer) ([]byte, error) {
+		return []byte("pg_dump: error: connection refused"), &mockError{msg: "exit status 1"}
+	}}
+
+	_, err := mgr.CreateBackup(context.Background(), BackupMeta{FromVersion: "1.0.0", TargetVersion: "1.1.0"})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "pg_dump on this host failed") || !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	backups, _ := mgr.ListBackups()
+	if len(backups) != 0 {
+		t.Errorf("a failed backup must leave no file, found %d", len(backups))
+	}
+}
+
+func TestSecureBackupDir_TightensDirectoryAndFiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "backups")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(dir, "payram-backup-20260101-000000-1.0.0-to-1.1.0.sql")
+	other := filepath.Join(dir, "notes.txt")
+	os.WriteFile(old, []byte("data"), 0644)
+	os.WriteFile(other, []byte("data"), 0644)
+
+	if err := SecureBackupDir(dir, &mockLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ := os.Stat(dir); info.Mode().Perm() != 0700 {
+		t.Errorf("dir mode = %o, want 0700", info.Mode().Perm())
+	}
+	if info, _ := os.Stat(old); info.Mode().Perm() != 0600 {
+		t.Errorf("legacy backup mode = %o, want 0600", info.Mode().Perm())
+	}
+	if info, _ := os.Stat(other); info.Mode().Perm() != 0644 {
+		t.Errorf("unrelated file must be left alone, mode = %o", info.Mode().Perm())
+	}
+}
+
+func TestListBackups_SkipsEmptyAndPartialFiles(t *testing.T) {
+	mgr, tmpDir := newTestManager(t, &mockExecutor{})
+	dir := filepath.Join(tmpDir, "backups")
+	os.WriteFile(filepath.Join(dir, "payram-backup-20260101-000000-1.0.0-to-1.1.0.dump"), []byte("data"), 0600)
+	os.WriteFile(filepath.Join(dir, "payram-backup-20260102-000000-1.1.0-to-1.2.0.dump"), nil, 0600)
+	os.WriteFile(filepath.Join(dir, "payram-backup-20260103-000000-1.2.0-to-1.3.0.dump.partial"), []byte("half"), 0600)
+
+	backups, err := mgr.ListBackups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backups) != 1 || backups[0].Filename != "payram-backup-20260101-000000-1.0.0-to-1.1.0.dump" {
+		t.Fatalf("expected only the complete backup, got %+v", backups)
+	}
+}
+
+func writeFailedJob(t *testing.T, stateDir, backupPath string) {
+	t.Helper()
+	store := jobs.NewStore(stateDir)
+	job := jobs.NewJob("job-1", jobs.JobModeManual, "1.2.0")
+	job.State = jobs.JobStateFailed
+	job.FailureCode = jobs.FailureUpgradeRolledBack
+	job.BackupPath = backupPath
+	if err := store.Save(job); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPruneBackups_NeverDeletesTheFailedUpdatesBackup(t *testing.T) {
+	mgr, tmpDir := newTestManager(t, &mockExecutor{})
+	dir := filepath.Join(tmpDir, "backups")
+	var paths []string
+	for i := 1; i <= 4; i++ {
+		ext := ".dump"
+		if i%2 == 0 {
+			ext = ".sql"
+		}
+		p := filepath.Join(dir, fmt.Sprintf("payram-backup-2026010%d-100000-1.0.%d-to-1.0.%d%s", i, i, i+1, ext))
+		os.WriteFile(p, []byte("data"), 0600)
+		paths = append(paths, p)
+	}
+	writeFailedJob(t, mgr.Config.StateDir, paths[0]) // the oldest
+
+	pruned, err := mgr.PruneBackups(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 2 {
+		t.Fatalf("expected 2 pruned (.sql and .dump counted alike), got %d", len(pruned))
+	}
+	if _, err := os.Stat(paths[0]); err != nil {
+		t.Fatalf("the failed update's backup was deleted: %v", err)
+	}
+	if _, err := os.Stat(paths[3]); err != nil {
+		t.Fatalf("the newest backup was deleted: %v", err)
+	}
+}
+
+func TestPruneBackups_KeepsProtectedPaths(t *testing.T) {
+	mgr, tmpDir := newTestManager(t, &mockExecutor{})
+	dir := filepath.Join(tmpDir, "backups")
+	oldest := filepath.Join(dir, "payram-backup-20260101-100000-1.0.0-to-1.1.0.dump")
+	os.WriteFile(oldest, []byte("data"), 0600)
+	os.WriteFile(filepath.Join(dir, "payram-backup-20260102-100000-1.1.0-to-1.2.0.dump"), []byte("data"), 0600)
+
+	if _, err := mgr.PruneBackups(1, oldest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldest); err != nil {
+		t.Fatalf("protected backup deleted: %v", err)
+	}
+}
+
+func TestPruneBackups_RemovesStaleLeftoversWithoutCountingThem(t *testing.T) {
+	mgr, tmpDir := newTestManager(t, &mockExecutor{})
+	dir := filepath.Join(tmpDir, "backups")
+	complete := filepath.Join(dir, "payram-backup-20260101-100000-1.0.0-to-1.1.0.dump")
+	staleEmpty := filepath.Join(dir, "payram-backup-20260102-100000-1.1.0-to-1.2.0.dump")
+	stalePartial := filepath.Join(dir, "payram-backup-20260103-100000-1.2.0-to-1.3.0.dump.partial")
+	freshPartial := filepath.Join(dir, "payram-backup-20260104-100000-1.3.0-to-1.4.0.dump.partial")
+	os.WriteFile(complete, []byte("data"), 0600)
+	os.WriteFile(staleEmpty, nil, 0600)
+	os.WriteFile(stalePartial, []byte("half"), 0600)
+	os.WriteFile(freshPartial, []byte("being written"), 0600)
+	old := time.Now().Add(-2 * time.Hour)
+	os.Chtimes(staleEmpty, old, old)
+	os.Chtimes(stalePartial, old, old)
+
+	pruned, err := mgr.PruneBackups(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 0 {
+		t.Fatalf("the only complete backup must be kept, pruned %+v", pruned)
+	}
+	for _, gone := range []string{staleEmpty, stalePartial} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Errorf("%s should have been removed", filepath.Base(gone))
+		}
+	}
+	for _, kept := range []string{complete, freshPartial} {
+		if _, err := os.Stat(kept); err != nil {
+			t.Errorf("%s should have been kept: %v", filepath.Base(kept), err)
+		}
+	}
+}
+
+func TestBackupListItem_HasUpgradeVersions(t *testing.T) {
+	cases := map[string]bool{
+		"payram-backup-20260101-100000-1.7.0-to-1.7.9.dump":        true,
+		"payram-backup-20260101-100000-manual-to-manual.dump":      false,
+		"payram-backup-20260101-100000-unknown-to-1.7.9.sql":       false,
+		"payram-backup-20260101-100000-pre-restore-safety.dump":    false,
+		"payram-backup-20260101-100000-1.7.0-rc1-to-1.7.9-rc.dump": true,
+	}
+	for name, want := range cases {
+		meta := parseBackupFilename(name)
+		item := BackupListItem{FromVersion: meta.FromVersion, ToVersion: meta.ToVersion}
+		if got := item.HasUpgradeVersions(); got != want {
+			t.Errorf("%s: HasUpgradeVersions = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// ========== Restore ==========
+
+const restoreContainer = "payram-test"
+
+// newRestoreManager is a manager whose PayRam container runs the bundled
+// database (credentials from docker inspect) with a fake runner for every
+// docker exec.
+func newRestoreManager(t *testing.T, override func(step string, cmd dbexec.Command, stdin []byte, stdout io.Writer) (bool, []byte, error)) (*Manager, *fakeRunner, string) {
+	t.Helper()
+	mgr, tmpDir := newTestManager(t, mockDockerInspectExecutor(nil))
+	mgr.Config.TargetContainerName = restoreContainer
+	runner := &fakeRunner{handle: postgresTools(override)}
+	mgr.Runner = runner
+	backupPath := filepath.Join(tmpDir, "backups", "payram-backup-20260101-100000-1.7.0-to-1.8.0.dump")
+	if err := os.WriteFile(backupPath, []byte("PGDMP-backup"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return mgr, runner, backupPath
+}
+
+func indexOf(steps []string, step string) int {
+	for i, s := range steps {
+		if s == step {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestRestoreBackup_RequiresConfirmation(t *testing.T) {
+	mgr, runner, backupPath := newRestoreManager(t, nil)
+	_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: false})
+	if err == nil || !strings.Contains(err.Error(), "requires explicit confirmation") {
+		t.Fatalf("expected confirmation error, got: %v", err)
+	}
+	if len(runner.steps()) != 0 {
+		t.Error("nothing may run without confirmation")
+	}
+}
+
+func TestRestoreBackup_StopsWritersTakesSafetyBackupRestoresAndStartsWriters(t *testing.T) {
+	mgr, runner, backupPath := newRestoreManager(t, nil)
+
+	result, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true})
+	if err != nil {
+		t.Fatalf("RestoreBackup: %v", err)
+	}
+	if !result.DBRestored || !result.NeedsRecovery || result.FromVersion != "1.7.0" || result.ToVersion != "1.8.0" {
+		t.Errorf("unexpected result: %+v", result)
+	}
+	if result.Database.Tables != 7 || !result.Database.HasMigrations || result.Database.MigrationRows != 12 {
+		t.Errorf("unexpected counts: %+v", result.Database)
+	}
+
+	steps := runner.steps()
+	stop, dump, restore, start := indexOf(steps, "supervisorctl stop"), indexOf(steps, "pg_dump"), indexOf(steps, "psql restore"), indexOf(steps, "supervisorctl start")
+	if stop < 0 || dump < 0 || restore < 0 || start < 0 || !(stop < dump && dump < restore && restore < start) {
+		t.Fatalf("expected stop < safety dump < restore < start, got %v", steps)
+	}
+	if steps[len(steps)-1] != "supervisorctl start" {
+		t.Errorf("programs must be started again last, got %v", steps)
+	}
+
+	stopped := runner.callsOf("supervisorctl stop")[0].Cmd.Args
+	started := runner.callsOf("supervisorctl start")[0].Cmd.Args
+	wantPrograms := "payram-core payram-eth-listener"
+	if !strings.HasSuffix(strings.Join(stopped, " "), "stop "+wantPrograms) {
+		t.Errorf("must stop only running non-postgres programs, got %v", stopped)
+	}
+	if !strings.HasSuffix(strings.Join(started, " "), "start "+wantPrograms) {
+		t.Errorf("must start exactly the stopped programs, got %v", started)
+	}
+
+	if !strings.HasSuffix(result.SafetyBackupPath, "-pre-restore-safety.dump") {
+		t.Errorf("safety backup name = %s", result.SafetyBackupPath)
+	}
+	if info, err := os.Stat(result.SafetyBackupPath); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("safety backup missing or not 0600: %v", err)
+	}
+
+	psql := runner.callsOf("psql restore")[0]
+	if !cmdHasArg(psql.Cmd, restoreContainer) || !cmdHasArg(psql.Cmd, "ON_ERROR_STOP=1") {
+		t.Errorf("psql restore args: %v", psql.Cmd.Args)
+	}
+	stream := string(psql.Stdin)
+	if !strings.HasPrefix(stream, "BEGIN;") || !strings.Contains(stream, "DROP SCHEMA IF EXISTS public CASCADE;") ||
+		!strings.HasSuffix(strings.TrimSpace(stream), "COMMIT;") {
+		t.Errorf("restore stream:\n%s", stream)
+	}
+	runner.assertNoSecretInArgs(t, "testpass")
+}
+
+func TestRestoreBackup_FailedRestoreStartsWritersAgainAndNamesSafetyBackup(t *testing.T) {
+	mgr, runner, backupPath := newRestoreManager(t, func(step string, cmd dbexec.Command, stdin []byte, stdout io.Writer) (bool, []byte, error) {
+		if step == "psql restore" {
+			return true, []byte("psql:<stdin>:40: ERROR:  syntax error at or near \"garbage\"\n"), &mockError{msg: "exit status 3"}
+		}
+		return false, nil, nil
+	})
+
+	_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, want := range []string{"Restore failed and was rolled back: the database was not changed.", "syntax error", "pre-restore-safety.dump"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q: %v", want, err)
+		}
+	}
+	var restoreErr *dbexec.RestoreError
+	if !errors.As(err, &restoreErr) || !restoreErr.Unchanged {
+		t.Errorf("error must stay a dbexec.RestoreError: %v", err)
+	}
+	if len(runner.callsOf("supervisorctl start")) != 1 {
+		t.Fatalf("programs must be started again after a failed restore: %v", runner.steps())
+	}
+}
+
+func TestRestoreBackup_SafetyBackupFailureAbortsBeforeRestoring(t *testing.T) {
+	mgr, runner, backupPath := newRestoreManager(t, func(step string, cmd dbexec.Command, stdin []byte, stdout io.Writer) (bool, []byte, error) {
+		if step == "pg_dump" {
+			return true, []byte("pg_dump: error: could not write: No space left on device"), &mockError{msg: "exit status 1"}
+		}
+		return false, nil, nil
+	})
+
+	_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true})
+	if err == nil || !strings.Contains(err.Error(), "safety backup") || !strings.Contains(err.Error(), "nothing was restored") {
+		t.Fatalf("expected safety-backup failure, got %v", err)
+	}
+	if len(runner.callsOf("psql restore")) != 0 {
+		t.Fatal("the database must not be touched when the safety backup fails")
+	}
+	if len(runner.callsOf("supervisorctl start")) != 1 {
+		t.Fatal("programs must be started again")
+	}
+}
+
+func TestRestoreBackup_SkipSafetyBackup(t *testing.T) {
+	mgr, runner, backupPath := newRestoreManager(t, nil)
+	result, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true, SkipSafetyBackup: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SafetyBackupPath != "" || len(runner.callsOf("pg_dump")) != 0 {
+		t.Fatalf("no safety backup expected, steps %v", runner.steps())
+	}
+}
+
+func TestRestoreBackup_RefusedWhileAnUpdateHoldsTheLock(t *testing.T) {
+	mgr, runner, backupPath := newRestoreManager(t, nil)
+	release, err := jobs.AcquireContainerLock(mgr.Config.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	_, err = mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true})
+	if !errors.Is(err, ErrRestoreLocked) {
+		t.Fatalf("expected ErrRestoreLocked, got %v", err)
+	}
+	if len(runner.steps()) != 0 {
+		t.Fatalf("nothing may run while locked: %v", runner.steps())
+	}
+}
+
+func TestRestoreBackup_DamagedBackupRefusedBeforeStoppingAnything(t *testing.T) {
+	mgr, runner, backupPath := newRestoreManager(t, func(step string, cmd dbexec.Command, stdin []byte, stdout io.Writer) (bool, []byte, error) {
+		if step == "pg_restore --list" {
+			return true, []byte("pg_restore: error: input file is too short (read 12, expected 5)"), &mockError{msg: "exit status 1"}
+		}
+		return false, nil, nil
+	})
+
+	_, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true})
+	if err == nil || !strings.Contains(err.Error(), "damaged or incomplete, so nothing was changed") {
+		t.Fatalf("expected damaged-backup error, got %v", err)
+	}
+	for _, step := range runner.steps() {
+		if step != "pg_restore --list" {
+			t.Fatalf("only the file check may run, got %v", runner.steps())
+		}
+	}
+}
+
+func TestRestoreBackup_WithoutSupervisorctlWarnsAndContinues(t *testing.T) {
+	mgr, runner, backupPath := newRestoreManager(t, func(step string, cmd dbexec.Command, stdin []byte, stdout io.Writer) (bool, []byte, error) {
+		if strings.HasPrefix(step, "supervisorctl") {
+			return true, []byte(`OCI runtime exec failed: exec: "supervisorctl": executable file not found in $PATH`), &mockError{msg: "exit status 126"}
+		}
+		return false, nil, nil
+	})
+
+	if _, err := mgr.RestoreBackup(context.Background(), backupPath, RestoreOptions{Confirmed: true}); err != nil {
+		t.Fatalf("restore must go on without supervisorctl: %v", err)
+	}
+	if len(runner.callsOf("supervisorctl stop")) != 0 || len(runner.callsOf("supervisorctl start")) != 0 {
+		t.Fatalf("nothing to stop or start without supervisorctl: %v", runner.steps())
+	}
+}
+
+func TestRestoreBackup_ManualBackupNeedsNoContainerRollback(t *testing.T) {
+	mgr, _, _ := newRestoreManager(t, nil)
+	manual := filepath.Join(mgr.Config.Dir, "payram-backup-20260101-100000-manual-to-manual.dump")
+	os.WriteFile(manual, []byte("PGDMP"), 0600)
+	result, err := mgr.RestoreBackup(context.Background(), manual, RestoreOptions{Confirmed: true, SkipSafetyBackup: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.NeedsRecovery {
+		t.Error("a manual backup records no versions to roll back to")
+	}
+}
+
+func TestRestoreBackup_UnknownFormat(t *testing.T) {
+	mgr, runner, _ := newRestoreManager(t, nil)
+	path := filepath.Join(mgr.Config.Dir, "backup.txt")
+	os.WriteFile(path, []byte("x"), 0600)
+	_, err := mgr.RestoreBackup(context.Background(), path, RestoreOptions{Confirmed: true})
+	if err == nil || !strings.Contains(err.Error(), "INVALID_BACKUP_FORMAT") {
+		t.Fatalf("expected INVALID_BACKUP_FORMAT, got %v", err)
+	}
+	if len(runner.steps()) != 0 {
+		t.Fatal("nothing may run for an unknown format")
+	}
+}
+
+func TestRestoreBackup_FileNotFound(t *testing.T) {
+	mgr, _, _ := newRestoreManager(t, nil)
+	_, err := mgr.RestoreBackup(context.Background(), "/nonexistent/backup.dump", RestoreOptions{Confirmed: true})
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("expected 'does not exist' error, got: %v", err)
+	}
+}
+
+func TestRestoreBackup_EmptyFile(t *testing.T) {
+	mgr, _, _ := newRestoreManager(t, nil)
+	path := filepath.Join(mgr.Config.Dir, "payram-backup-20260101-100000-1.0.0-to-1.1.0.dump")
+	os.WriteFile(path, nil, 0600)
+	_, err := mgr.RestoreBackup(context.Background(), path, RestoreOptions{Confirmed: true})
+	if err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("expected 'empty' error, got: %v", err)
+	}
+}
+
+func TestWaitForDatabase_PollsPgIsReadyInsideContainer(t *testing.T) {
+	mgr, runner, _ := newRestoreManager(t, nil)
+	if err := mgr.WaitForDatabase(context.Background(), restoreContainer, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	calls := runner.callsOf("pg_isready")
+	if len(calls) != 1 || calls[0].Cmd.Name != "docker" || !cmdHasArg(calls[0].Cmd, restoreContainer) {
+		t.Fatalf("expected docker exec pg_isready, got %v", runner.steps())
 	}
 }

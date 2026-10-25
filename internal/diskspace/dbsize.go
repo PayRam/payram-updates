@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/payram/payram-updater/internal/dbexec"
 )
 
 // DBConfig holds database connection information.
@@ -83,35 +85,36 @@ func (c *DBSizeChecker) GetDatabaseSize(ctx context.Context, containerName strin
 		}
 	}
 
-	return 0, fmt.Errorf("could not parse database size from output: %s", outputStr)
+	return 0, fmt.Errorf("could not parse database size from output: %s", dbexec.TruncateOutput([]byte(outputStr)))
 }
 
-// executeQueryInContainer runs psql inside the container.
+// executeQueryInContainer runs psql inside the container. The password goes
+// to docker by name only (-e PGPASSWORD) with the value in docker's own
+// environment, so it never shows in the process list.
 func (c *DBSizeChecker) executeQueryInContainer(ctx context.Context, containerName string, dbConfig *DBConfig, query string) ([]byte, error) {
-	// Build psql command
-	psqlCmd := fmt.Sprintf(
-		"psql -h %s -p %s -U %s -d %s -t -A -c %q",
-		dbConfig.Host, dbConfig.Port, dbConfig.Username, dbConfig.Database, query,
+	args := []string{"exec"}
+	if dbConfig.Password != "" {
+		args = append(args, "-e", "PGPASSWORD")
+	}
+	args = append(args, containerName, "psql", "-X",
+		"-h", dbConfig.Host,
+		"-p", dbConfig.Port,
+		"-U", dbConfig.Username,
+		"-d", dbConfig.Database,
+		"-t", // tuples only (no headers)
+		"-A", // unaligned output
+		"-c", query,
 	)
 
-	// Build docker exec command
-	args := []string{"exec"}
-
-	// Set password via environment if provided
-	if dbConfig.Password != "" {
-		args = append(args, "-e", fmt.Sprintf("PGPASSWORD=%s", dbConfig.Password))
-	}
-
-	args = append(args, containerName, "sh", "-c", psqlCmd)
-
 	cmd := exec.CommandContext(ctx, c.DockerBin, args...)
-	return cmd.CombinedOutput()
+	cmd.Env = dbexec.ClientEnv(dbConfig.Password, "")
+	return runQuery(cmd)
 }
 
 // executeQueryFromHost runs psql on the host machine.
 func (c *DBSizeChecker) executeQueryFromHost(ctx context.Context, dbConfig *DBConfig, query string) ([]byte, error) {
-	// Build psql command
 	args := []string{
+		"-X",
 		"-h", dbConfig.Host,
 		"-p", dbConfig.Port,
 		"-U", dbConfig.Username,
@@ -122,11 +125,16 @@ func (c *DBSizeChecker) executeQueryFromHost(ctx context.Context, dbConfig *DBCo
 	}
 
 	cmd := exec.CommandContext(ctx, "psql", args...)
+	cmd.Env = dbexec.ClientEnv(dbConfig.Password, "")
+	return runQuery(cmd)
+}
 
-	// Set password via environment if provided
-	if dbConfig.Password != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("PGPASSWORD=%s", dbConfig.Password))
+// runQuery runs a psql command and returns its output; on failure the error
+// carries at most ~2 KB of what psql said.
+func runQuery(cmd *exec.Cmd) ([]byte, error) {
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return output, fmt.Errorf("%w: %s", err, dbexec.TruncateOutput(output))
 	}
-
-	return cmd.CombinedOutput()
+	return output, nil
 }

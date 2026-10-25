@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewStore(t *testing.T) {
@@ -213,4 +214,111 @@ func TestStore_JSONFormatting(t *testing.T) {
 	if !strings.Contains(string(data), "  ") {
 		t.Error("expected formatted JSON with indentation")
 	}
+}
+
+func TestStore_TouchMovesUpdatedAtOnly(t *testing.T) {
+	store := NewStore(t.TempDir())
+	job := NewJob("job-1", JobModeDashboard, "3.10.0")
+	job.State = JobStateBackingUp
+	job.Message = "Creating database backup"
+	job.UpdatedAt = job.UpdatedAt.Add(-10 * time.Minute)
+	if err := store.Save(job); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Touch(); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	loaded, err := store.LoadLatest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(loaded.UpdatedAt) > time.Minute {
+		t.Fatalf("UpdatedAt not moved: %s", loaded.UpdatedAt)
+	}
+	if loaded.State != JobStateBackingUp || loaded.Message != job.Message {
+		t.Fatalf("Touch changed the job: %+v", loaded)
+	}
+}
+
+func TestStore_FilesAreRootOnly(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := store.Save(NewJob("job-1", JobModeDashboard, "3.10.0")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendLog("line"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(dir, "jobs", "latest", "status.json"),
+		filepath.Join(dir, "jobs", "latest", "logs.txt"),
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm != 0600 {
+			t.Errorf("%s mode = %o, want 600", path, perm)
+		}
+	}
+	info, _ := os.Stat(filepath.Join(dir, "jobs", "latest"))
+	if perm := info.Mode().Perm(); perm != 0700 {
+		t.Errorf("job dir mode = %o, want 700", perm)
+	}
+}
+
+func TestStore_RewriteLogs_CleansLinesAndKeepsTheRest(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	store.AppendLog("first line")
+	store.AppendLog("docker run -e AES_KEY=secret img")
+	store.AppendLog("last line")
+
+	err := store.RewriteLogs(func(line string) string { return strings.ReplaceAll(line, "secret", "***") })
+	if err != nil {
+		t.Fatalf("RewriteLogs: %v", err)
+	}
+	logs, _ := store.ReadLogs()
+	if logs != "first line\ndocker run -e AES_KEY=*** img\nlast line\n" {
+		t.Fatalf("logs = %q", logs)
+	}
+	info, err := os.Stat(filepath.Join(dir, "jobs", "latest", "logs.txt"))
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("rewritten log mode = %v, %v; want 0600", info.Mode().Perm(), err)
+	}
+	// Nothing to change, nothing written; no log at all is fine too.
+	if err := store.RewriteLogs(func(line string) string { return line }); err != nil {
+		t.Fatalf("RewriteLogs without changes: %v", err)
+	}
+	if err := NewStore(t.TempDir()).RewriteLogs(func(line string) string { return "x" }); err != nil {
+		t.Fatalf("RewriteLogs without a log: %v", err)
+	}
+}
+
+// TestStore_StartHeartbeat_NothingIsWrittenAfterStop: stop returns only once
+// the heartbeat has ended, so a finished update is never touched again.
+func TestStore_StartHeartbeat_NothingIsWrittenAfterStop(t *testing.T) {
+	store := NewStore(t.TempDir())
+	job := NewJob("j", JobModeDashboard, "3.10.0")
+	job.State = JobStateVerifying
+	job.UpdatedAt = time.Now().Add(-time.Hour).UTC()
+	if err := store.Save(job); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := store.StartHeartbeat(time.Millisecond, nil)
+	time.Sleep(20 * time.Millisecond)
+	stop()
+	refreshed, _ := store.LoadLatest()
+	if time.Since(refreshed.UpdatedAt) > time.Second {
+		t.Fatalf("UpdatedAt = %s, want refreshed", refreshed.UpdatedAt)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	after, _ := store.LoadLatest()
+	if !after.UpdatedAt.Equal(refreshed.UpdatedAt) {
+		t.Fatal("the heartbeat wrote after stop returned")
+	}
+	stop() // a second stop is harmless
 }

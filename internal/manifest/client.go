@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -74,9 +75,31 @@ func NewClient(timeout time.Duration) *Client {
 	return &Client{
 		httpClient: &http.Client{
 			Timeout: timeout,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 5 {
+					return errors.New("too many redirects")
+				}
+				return checkFetchURL(req.URL)
+			},
 		},
 		timeout: timeout,
 	}
+}
+
+// checkFetchURL allows https, and plain http only to this machine (local test
+// servers). The manifest decides which image and version every merchant's next
+// update runs, so it must not be readable or replaceable on the way.
+func checkFetchURL(u *url.URL) error {
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" {
+		switch u.Hostname() {
+		case "127.0.0.1", "localhost", "::1":
+			return nil
+		}
+	}
+	return fmt.Errorf("refusing to fetch the manifest from %s: only https:// addresses are allowed", u.Redacted())
 }
 
 // Fetch retrieves and parses the manifest from the given URL or local file path.
@@ -114,6 +137,9 @@ func (c *Client) fetchHTTP(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	if err := checkFetchURL(req.URL); err != nil {
+		return nil, err
 	}
 
 	resp, err := c.httpClient.Do(req)
