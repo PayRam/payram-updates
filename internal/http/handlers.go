@@ -66,6 +66,17 @@ type RunRequest struct {
 	Mode            string `json:"mode"`
 	RequestedTarget string `json:"requestedTarget"`
 	Source          string `json:"source"` // Origin of request, defaults to "UNKNOWN"
+	// Attended says a person at root's command line follows the update and
+	// answers its question before a backup is restored. Honoured only for
+	// root's CLI (the token); any other caller's update is unattended.
+	Attended bool `json:"attended"`
+}
+
+// AnswerRequest is the body of POST /upgrade/answer.
+type AnswerRequest struct {
+	QuestionID string `json:"questionId"`
+	// Restore is the answer: true restores the backup and switches back.
+	Restore bool `json:"restore"`
 }
 
 func parseJobMode(value string) (jobs.JobMode, error) {
@@ -620,6 +631,7 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 		job.State = jobs.JobStateExecuting
 		job.Message = "Preparing the update"
 		job.UpdatedAt = time.Now().UTC()
+		job.Attended = req.Attended && s.isRootCLIRequest(r)
 
 		// Save job
 		if err := s.jobStore.Save(job); err != nil {
@@ -648,6 +660,36 @@ func (s *Server) HandleUpgradeRun() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(response)
+	}
+}
+
+// HandleUpgradeAnswer returns the handler for POST /upgrade/answer: root's
+// payram-updater command answers the question an attended update waits on
+// (whether to restore the backup and switch back). Only root's CLI may
+// answer; an answer to a question that no longer waits (answered, or past
+// its deadline, when the default was taken) is refused with 409.
+func (s *Server) HandleUpgradeAnswer() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.isRootCLIRequest(r) {
+			http.Error(w, "Only root's payram-updater command can answer an update's question: run it with sudo", http.StatusForbidden)
+			return
+		}
+		var req AnswerRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody)).Decode(&req); err != nil || req.QuestionID == "" {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if !s.answers.deliver(req.QuestionID, req.Restore) {
+			http.Error(w, "That question is no longer waiting for an answer (it was answered, or its time ran out and the default was taken)", http.StatusConflict)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]bool{"accepted": true})
 	}
 }
 

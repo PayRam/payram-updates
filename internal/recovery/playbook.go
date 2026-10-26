@@ -227,7 +227,7 @@ var playbooks = map[string]Playbook{
 		Code:        jobs.FailureUpgradeRolledBack,
 		Severity:    SeverityInfo,
 		Title:       "Update Rolled Back",
-		UserMessage: "PayRam is running on the version it had before the update; your data is safe. The new version failed its checks, so the updater switched back to the previous version on its own. Nothing needs to be restored: the database was kept as it is, including every payment recorded during the update. Send the updater logs to PayRam support before retrying.",
+		UserMessage: "PayRam is running on the version it had before the update; your data is safe. The new version failed its checks, so the updater switched back to the previous version on its own, after checking that the new version had not changed the database's structure (or had never started). Nothing needs to be restored: the database was kept as it is, including every payment recorded during the update. Send the updater logs to PayRam support before retrying.",
 		SSHSteps: numbered(
 			stepCheckHealth,
 			stepListContainers+". <container_name> is PayRam; <container_name>-failed is the new version that failed, kept stopped so support can see why.",
@@ -239,6 +239,98 @@ var playbooks = map[string]Playbook{
 		DocsURL:     "https://docs.payram.com/recovery",
 		DataRisk:    DataRiskNone,
 		PayRamState: PayRamRestored,
+	},
+
+	jobs.FailureUpgradeRolledBackRestored: {
+		Code:        jobs.FailureUpgradeRolledBackRestored,
+		Severity:    SeverityInfo,
+		Title:       "Update Rolled Back, Backup Restored",
+		UserMessage: "PayRam is running on the version it had before the update. The new version failed its checks after it had already changed the database, which the previous version cannot run on, so the updater restored the backup taken just before the update and then switched back. Payments recorded before the update have not been deleted. What PayRam recorded while the failed version ran (a few minutes, while PayRam was down) is no longer in the database; PayRam reads the blockchain again from where it stood at the backup, so deposits made since then are found again and their webhooks are sent again. The new version had sent no payout or sweep and handed out no payment address after the backup, so nothing can be paid twice or missed. Send the updater logs to PayRam support before retrying.",
+		SSHSteps: numbered(
+			stepCheckHealth,
+			stepListContainers+". <container_name> is PayRam; <container_name>-failed is the new version that failed, kept stopped so support can see why.",
+			"See why the new version failed (read-only): docker logs --tail 300 <container_name>-failed",
+			"Over the next minutes, check in the dashboard that recent deposits show up again: PayRam re-reads the blockchain from the backup's point.",
+			stepContactSupport,
+			"Retry the update later, once PayRam support has confirmed the cause is fixed.",
+			"Do not restore a backup: the updater already did, and PayRam is running. The database as the failed version left it was saved first (the update's message names the file), in case PayRam support needs it.",
+		),
+		DocsURL:     "https://docs.payram.com/recovery",
+		DataRisk:    DataRiskPossible,
+		PayRamState: PayRamRestored,
+	},
+
+	jobs.FailureUpgradeMoneyMoved: {
+		Code:        jobs.FailureUpgradeMoneyMoved,
+		Severity:    SeverityManual,
+		Title:       "Update Failed After Money Moved",
+		UserMessage: "PayRam was left on the new version, which failed its checks, so it may not work fully. Your payments have not been deleted. Before it failed, the new version had changed the database and moved money: it requested, signed or sent a payout, started a sweep, sent gas, deployed a deposit wallet, or gave a customer a payment address. Restoring the backup would make PayRam forget that (a payout could be sent twice, or a customer's payment go unseen), and the previous version cannot run on the changed database, so the updater did neither. Do not restore the backup and do not start the previous version. Contact PayRam support now.",
+		SSHSteps: numbered(
+			stepCheckHealth,
+			stepListContainers+". <container_name> is the new version; <previous_container> is the version that ran before, stopped.",
+			"See why the new version failed (read-only): docker logs --tail 300 <container_name>",
+			stepContactSupport,
+			"Do not restore a backup and do not start <previous_container>: either could make PayRam send a payout twice or miss a customer's payment.",
+			stepKeepData,
+		),
+		DocsURL:     "https://docs.payram.com/recovery",
+		DataRisk:    DataRiskPossible,
+		PayRamState: PayRamUncertain,
+	},
+
+	jobs.FailureUpgradeDatabaseUnchecked: {
+		Code:        jobs.FailureUpgradeDatabaseUnchecked,
+		Severity:    SeverityManual,
+		Title:       "Update Failed, Database Not Checked",
+		UserMessage: "PayRam was left on the new version, which failed its checks, so it may be down. Your payments have not been deleted. The updater could not read the database to check whether the new version had changed it or moved money, so it neither restored the backup nor switched back: either could be unsafe. Contact PayRam support; do not restore the backup or start the previous version on your own.",
+		SSHSteps: numbered(
+			stepCheckHealth,
+			stepListContainers+". <container_name> is the new version; <previous_container> is the version that ran before, stopped.",
+			"See why the new version failed (read-only): docker logs --tail 300 <container_name>",
+			stepReadReason,
+			stepContactSupport,
+			"Do not start <previous_container> or restore a backup unless PayRam support asks you to: the previous version may not run on a database the new version changed, and a restore could undo a payout that was sent.",
+			stepKeepData,
+		),
+		DocsURL:     "https://docs.payram.com/recovery",
+		DataRisk:    DataRiskPossible,
+		PayRamState: PayRamUncertain,
+	},
+
+	jobs.FailureUpgradeRestoreFailed: {
+		Code:        jobs.FailureUpgradeRestoreFailed,
+		Severity:    SeverityManual,
+		Title:       "Update Failed, Restore Failed",
+		UserMessage: "PayRam may be down, or running the new version that failed its checks. Your payments have not been deleted. The new version had changed the database, so the backup had to be restored before switching back, but the restore failed. The update's message says whether the database is as the new version left it (PayRam was then left on the new version) or whether that is not certain (both versions were then stopped). Contact PayRam support; do not restore a backup or start a container on your own.",
+		SSHSteps: numbered(
+			stepCheckHealth,
+			stepListContainers,
+			stepReadReason,
+			stepContactSupport,
+			"Do not restore a backup or start <previous_container> until PayRam support has checked the database.",
+			stepKeepData,
+		),
+		DocsURL:     "https://docs.payram.com/recovery",
+		DataRisk:    DataRiskPossible,
+		PayRamState: PayRamUncertain,
+	},
+
+	jobs.FailureUpgradeRestoreDeclined: {
+		Code:        jobs.FailureUpgradeRestoreDeclined,
+		Severity:    SeverityManual,
+		Title:       "Update Stopped, Restore Declined",
+		UserMessage: "PayRam is stopped, as you chose. Your payments have not been deleted. The new version failed its checks after it had changed the database, and you declined to restore the backup, so the new version and the previous one were both left stopped and the database is as the new version left it. Contact PayRam support before starting either.",
+		SSHSteps: numbered(
+			stepListContainers+". <container_name> (the new version) and <previous_container> (the version before) should both be listed as Exited.",
+			"See why the new version failed (read-only): docker logs --tail 300 <container_name>",
+			stepContactSupport,
+			"To bring the new version back as it is (only if PayRam support says it works on your data; nothing is removed): docker update --restart unless-stopped <container_name> && docker start <container_name>",
+			"Do not start <previous_container> on this database: it may not run on what the new version changed. Going back to it needs the database put back to the backup first, which PayRam support does with you.",
+			stepKeepData,
+		),
+		DocsURL:     "https://docs.payram.com/recovery",
+		DataRisk:    DataRiskPossible,
+		PayRamState: PayRamUncertain,
 	},
 
 	jobs.FailureRollbackFailed: {
@@ -530,6 +622,25 @@ var playbooks = map[string]Playbook{
 		PayRamState: PayRamUnchanged,
 	},
 
+	"DATABASE_READ_FAILED": {
+		Code:        "DATABASE_READ_FAILED",
+		Severity:    SeverityRetryable,
+		Title:       "Database Could Not Be Read",
+		UserMessage: msgUnchanged + "Before switching versions the updater records which migrations the database has (so that a failed new version can be switched back safely), and it could not read them, so it stopped and started PayRam's background programs again.",
+		SSHSteps: numbered(
+			stepCheckHealth,
+			stepReadReason,
+			stepPrograms,
+			stepStartPrograms,
+			stepDBReady,
+			stepRetry,
+			stepSendLogs,
+		),
+		DocsURL:     "https://docs.payram.com/troubleshooting/backup",
+		DataRisk:    DataRiskNone,
+		PayRamState: PayRamUnchanged,
+	},
+
 	"BACKUP_TIMEOUT": {
 		Code:        "BACKUP_TIMEOUT",
 		Severity:    SeverityRetryable,
@@ -713,7 +824,7 @@ var playbooks = map[string]Playbook{
 		Code:        "INTERNAL_ERROR",
 		Severity:    SeverityManual,
 		Title:       "Updater Error",
-		UserMessage: "PayRam was put back on the version it had before, unless the message above says otherwise; the updater hit an internal error and stopped the update. Your data is safe: the updater never deletes payment data.",
+		UserMessage: "PayRam was put back on the version it had before, unless the message above says otherwise; the updater hit an internal error and stopped the update. Your payments have not been deleted: the updater restores a backup on its own only after checking that no money moved since it was taken, and the message says so when it did.",
 		SSHSteps: numbered(
 			stepCheckHealth,
 			stepListContainers,
@@ -942,7 +1053,7 @@ var unknownPlaybook = Playbook{
 	Code:        "UNKNOWN",
 	Severity:    SeverityManual,
 	Title:       "Unknown Failure",
-	UserMessage: "PayRam may or may not be running: something unexpected stopped the update. The updater never deletes payment data on its own. Check whether PayRam is running before doing anything else; do not restore a backup or remove containers.",
+	UserMessage: "PayRam may or may not be running: something unexpected stopped the update. Unless the update's message says the backup was restored, nothing has been deleted (the updater restores a backup on its own only after checking that no money moved since it was taken). Check whether PayRam is running before doing anything else; do not restore a backup or remove containers.",
 	SSHSteps: numbered(
 		stepCheckHealth,
 		stepListContainers,
@@ -1032,18 +1143,44 @@ func RenderPlaybook(code string, ctx PlaybookContext) Playbook {
 }
 
 // renderTemplate replaces placeholders in a string with context values.
-// It expects a context that went through withDefaults.
+// It expects a context that went through withDefaults. Every value lands in
+// a command the merchant pastes into a root shell, and the container name
+// can come from the runtime manifest, so each is shell-quoted: a name such
+// as "payram; curl ... | sh" stays one harmless argument.
 func renderTemplate(text string, ctx PlaybookContext) string {
 	return strings.NewReplacer(
 		"<health_check>", healthCheckCommand(ctx.BaseURL),
-		"<container_name>", ctx.ContainerName,
-		"<previous_container>", ctx.PreviousContainer,
-		"<next_container>", ctx.NextContainer,
-		"<image_repo>", ctx.ImageRepo,
-		"<backup_dir>", ctx.BackupDir,
-		"<backup_path>", valueOr(ctx.BackupPath, "BACKUP_FILE"),
-		"<target_version>", valueOr(ctx.TargetVersion, "VERSION"),
+		"<container_name>", ShellQuote(ctx.ContainerName),
+		"<previous_container>", ShellQuote(ctx.PreviousContainer),
+		"<next_container>", ShellQuote(ctx.NextContainer),
+		"<image_repo>", ShellQuote(ctx.ImageRepo),
+		"<backup_dir>", ShellQuote(ctx.BackupDir),
+		"<backup_path>", ShellQuote(valueOr(ctx.BackupPath, "BACKUP_FILE")),
+		"<target_version>", ShellQuote(valueOr(ctx.TargetVersion, "VERSION")),
 	).Replace(text)
+}
+
+// ShellQuote returns value as one shell word: unchanged when it holds only
+// characters no shell treats specially (every normal container name, path
+// and version), otherwise in single quotes. Use it for every value put into
+// a command shown to the merchant.
+func ShellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	safe := true
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case strings.ContainsRune("_-./:@%+=,", r):
+		default:
+			safe = false
+		}
+	}
+	if safe {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
 func valueOr(value, fallback string) string {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,6 +21,9 @@ const (
 	SourceEnv      ResolutionSource = "env"
 	SourceManifest ResolutionSource = "manifest"
 )
+
+// validContainerName is Docker's rule for container names.
+var validContainerName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
 
 // ResolvedContainer contains the resolved container name and its source.
 type ResolvedContainer struct {
@@ -63,8 +67,18 @@ func (r *Resolver) Resolve(manifestData *manifest.Manifest) (*ResolvedContainer,
 		}, nil
 	}
 
-	// Priority 2: Manifest
+	// Priority 2: Manifest. The manifest is fetched from the network, and the
+	// name ends up in commands shown to the merchant, so only a name Docker
+	// itself would accept is used; anything else is ignored and the
+	// container is found by its image instead.
 	if manifestData != nil && manifestData.Defaults.ContainerName != "" {
+		if !validContainerName.MatchString(manifestData.Defaults.ContainerName) {
+			r.logger.Printf("Ignoring the manifest's container name %q: not a valid Docker container name", manifestData.Defaults.ContainerName)
+			return nil, &ResolutionError{
+				FailureCode: "CONTAINER_NAME_UNRESOLVED",
+				Message:     "The runtime manifest's container name is not a valid Docker container name",
+			}
+		}
 		r.logger.Printf("Using target container from manifest: %s", manifestData.Defaults.ContainerName)
 		return &ResolvedContainer{
 			Name:   manifestData.Defaults.ContainerName,

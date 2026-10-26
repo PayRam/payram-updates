@@ -15,6 +15,7 @@ package switchover
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -75,15 +76,34 @@ var DefaultTiming = Timing{
 	MaxRestarts:   3,
 }
 
+// Programs runs PayRam's own programs (everything supervisord runs except
+// PostgreSQL) inside a running container.
+type Programs interface {
+	// Running lists the PayRam programs that are running or starting. It
+	// returns ErrNoSupervisor when the container has no supervisorctl.
+	Running(ctx context.Context, container string) ([]string, error)
+	Stop(ctx context.Context, container string, programs []string) error
+	// Start starts programs; one that already runs is fine.
+	Start(ctx context.Context, container string, programs []string) error
+}
+
+// ErrNoSupervisor means the container has no supervisorctl, so its programs
+// cannot be stopped one by one.
+var ErrNoSupervisor = errors.New("supervisorctl is not available in the container")
+
 // Switch performs one container switchover.
 type Switch struct {
 	Docker Docker
 	Record Recorder
 	Timing Timing
-	// StartPrograms starts supervisor programs inside a running container.
-	// Restore uses it when the update stopped PayRam's programs for the
-	// backup but never stopped the container.
-	StartPrograms func(ctx context.Context, container string, programs []string) error
+	// Programs starts and stops PayRam's programs inside a container.
+	// Restore starts the ones the backup stopped when the container itself
+	// was never stopped; CheckDatabase stops the new version's while it
+	// reads the database. Nil: programs are never stopped or started.
+	Programs Programs
+	// Database reaches PayRam's database for CheckDatabase and
+	// RestoreDatabase. Nil: the database cannot be checked.
+	Database Database
 }
 
 // StepError is a failed switch step. Code is the step's failure code
@@ -438,13 +458,10 @@ func (w *Switch) Restore(ctx context.Context, job *jobs.Job) error {
 	startedFresh := false
 	if prevState.Exists {
 		if current.Exists {
-			w.logf("Stopping the new version's container and keeping it as %s for support", failed)
-			if err := w.Docker.Stop(ctx, name); err != nil {
-				return fmt.Errorf("could not stop the new version's container %s: %w", name, err)
+			if err := w.StopFailedVersion(ctx, name); err != nil {
+				return err
 			}
-			if err := w.Docker.UpdateRestartPolicy(ctx, name, "no"); err != nil {
-				return fmt.Errorf("could not stop the new container from restarting: %w", err)
-			}
+			w.logf("Keeping the new version's container as %s for support", failed)
 			w.removeQuietly(ctx, failed)
 			if err := w.Docker.Rename(ctx, name, failed); err != nil {
 				return fmt.Errorf("could not move the new container aside: %w", err)
@@ -480,9 +497,9 @@ func (w *Switch) Restore(ctx context.Context, job *jobs.Job) error {
 		if err := w.Docker.Start(ctx, name); err != nil {
 			return fmt.Errorf("could not start %s: %w", name, err)
 		}
-	} else if len(job.QuiescedPrograms) > 0 && w.StartPrograms != nil {
+	} else if len(job.QuiescedPrograms) > 0 && w.Programs != nil {
 		w.logf("Starting PayRam's programs again: %s", strings.Join(job.QuiescedPrograms, ", "))
-		if err := w.StartPrograms(ctx, name, job.QuiescedPrograms); err != nil {
+		if err := w.Programs.Start(ctx, name, job.QuiescedPrograms); err != nil {
 			w.logf("Programs did not start (%s); restarting the container instead", shortError(err))
 			if err := w.Docker.Stop(ctx, name); err != nil {
 				return fmt.Errorf("could not restart %s: %w", name, err)
@@ -493,6 +510,23 @@ func (w *Switch) Restore(ctx context.Context, job *jobs.Job) error {
 		}
 	}
 	w.removeQuietly(ctx, NextName(name))
+	return nil
+}
+
+// StopFailedVersion stops the new version's container (named name, after a
+// cutover) so that it cannot start again by itself: its restart policy goes
+// off before the stop, as Cutover does for the old container. In the other
+// order, a Docker restart between the two would start it again next to the
+// old one, and two PayRam containers on one data folder run two Postgres
+// servers on the same files.
+func (w *Switch) StopFailedVersion(ctx context.Context, name string) error {
+	if err := w.Docker.UpdateRestartPolicy(ctx, name, "no"); err != nil {
+		return fmt.Errorf("could not stop the new version's container %s from restarting: %w", name, err)
+	}
+	w.logf("Stopping the new version's container %s", name)
+	if err := w.Docker.Stop(ctx, name); err != nil {
+		return fmt.Errorf("could not stop the new version's container %s: %w", name, err)
+	}
 	return nil
 }
 

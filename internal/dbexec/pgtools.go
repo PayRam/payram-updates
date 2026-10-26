@@ -131,10 +131,16 @@ func (OSRunner) Run(ctx context.Context, c Command, stdin io.Reader, stdout io.W
 type cappedBuffer struct {
 	buf   bytes.Buffer
 	limit int
+	// dropped reports whether anything was dropped.
+	dropped bool
 }
 
 func (b *cappedBuffer) Write(p []byte) (int, error) {
-	if room := b.limit - b.buf.Len(); room > 0 {
+	room := b.limit - b.buf.Len()
+	if room < len(p) {
+		b.dropped = true
+	}
+	if room > 0 {
 		if len(p) > room {
 			b.buf.Write(p[:room])
 		} else {
@@ -631,14 +637,19 @@ func explainPSQLFailure(db DBContext, firstError string, err error, stderr []byt
 	return "psql stopped at the first error: " + firstError
 }
 
+// maxQueryOutput caps what a query may return. A result cut short would be
+// read as a different answer, so a longer one is an error instead.
+const maxQueryOutput = 1024 * 1024
+
 // runQuery runs SQL statements with psql and returns the unaligned,
 // tuples-only output.
 func runQuery(ctx context.Context, tc toolCommander, db DBContext, queries ...string) (string, error) {
-	args := append([]string{"-X", "-A", "-t", "-v", "ON_ERROR_STOP=1"}, connArgs(db)...)
+	// -q keeps command tags (BEGIN, COMMIT) out of the output.
+	args := append([]string{"-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1"}, connArgs(db)...)
 	for _, q := range queries {
 		args = append(args, "-c", q)
 	}
-	out := &cappedBuffer{limit: 64 * 1024}
+	out := &cappedBuffer{limit: maxQueryOutput}
 	stderr, err := tc.runner().Run(ctx, tc.toolCommand(db, "psql", false, args...), nil, out)
 	if err != nil {
 		return "", &DBError{
@@ -647,7 +658,23 @@ func runQuery(ctx context.Context, tc toolCommander, db DBContext, queries ...st
 			Err:     err,
 		}
 	}
+	if out.dropped {
+		return "", &DBError{Code: ErrCodeDatabaseUnreachable, Message: fmt.Sprintf("the answer from database %s was longer than %d bytes", db.Creds.Database, maxQueryOutput)}
+	}
 	return out.String(), nil
+}
+
+// readOnlyQuery runs SELECT statements in one read-only transaction (it can
+// never change the database) and returns the unaligned, tuples-only output,
+// one row per line with columns separated by "|".
+func readOnlyQuery(ctx context.Context, tc toolCommander, db DBContext, queries ...string) (string, error) {
+	if err := tc.checkTarget(db); err != nil {
+		return "", err
+	}
+	// Every -c shares one session, so the statements run in this one
+	// read-only transaction and see one snapshot of the database.
+	statements := append([]string{"BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"}, queries...)
+	return runQuery(ctx, tc, db, append(statements, "COMMIT")...)
 }
 
 // describeDatabase counts tables in public and rows in public.migrations.

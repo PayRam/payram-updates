@@ -84,6 +84,15 @@ type Server struct {
 
 	// versionLookup replaces lookupCurrentVersion in tests.
 	versionLookup func(ctx context.Context) string
+
+	// answers carries the answer of the person following an attended update
+	// to the question it waits on (POST /upgrade/answer).
+	answers answerBox
+	// questionWait is how long that question waits (zero: restoreQuestionWait).
+	questionWait time.Duration
+	// switchWiring replaces newSwitch's Docker, programs and database in
+	// tests.
+	switchWiring func(*switchover.Switch)
 }
 
 // New creates a new HTTP server instance. It does not look for PayRam yet:
@@ -155,6 +164,7 @@ func New(cfg *config.Config, jobStore *jobs.Store) *Server {
 	mux.HandleFunc("/upgrade/inspect", s.HandleUpgradeInspect())
 	mux.HandleFunc("/upgrade/plan", s.HandleUpgradePlan())
 	mux.HandleFunc("/upgrade/run", s.HandleUpgradeRun())
+	mux.HandleFunc("/upgrade/answer", s.HandleUpgradeAnswer())
 	mux.HandleFunc("/history", s.HandleHistory())
 	mux.HandleFunc("/upgrade/history", s.HandleHistory())
 
@@ -450,9 +460,12 @@ func (s *Server) runAutoUpdateOnce(ctx context.Context) {
 	s.startUpgrade(job, plan)
 }
 
-// executeUpgrade runs an update job in the background. Whatever happens, it
-// ends with PayRam running: the new version once it has proven itself, or
-// the previous one, switched back automatically (see runUpgrade).
+// executeUpgrade runs an update job in the background. It ends with the new
+// version once it has proven itself, or the previous one, switched back
+// automatically (with the backup restored when the new version migrated the
+// database), or, when switching back could send a payout twice or the
+// database cannot be checked, with PayRam left on the new version and the
+// job saying so (see runUpgrade).
 func (s *Server) executeUpgrade(job *jobs.Job, plan *UpgradePlan) {
 	defer s.upgradeWg.Done()
 	defer s.releaseUpgradeSlot()

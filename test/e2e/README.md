@@ -27,10 +27,10 @@ update flow (`internal/switchover`, `internal/http/upgrade_*.go`) changes.
 
 | Scenario | Starts on | Does | Expects |
 |---|---|---|---|
-| `rollback_after_migrations` | fresh `E2E_OLD` | update to a build that migrates the database, then never answers | switched back (`UPGRADE_ROLLED_BACK` / `HEALTHCHECK_FAILED`); the old version runs on the migrated database |
-| `container_exits` | old | update to a build that exits at once | switched back well before the health timeout |
+| `rollback_after_migrations` | fresh `E2E_OLD` | update to a build that migrates the database, then never answers | backup restored, then switched back (`UPGRADE_ROLLED_BACK_RESTORED` / `HEALTHCHECK_FAILED`); the old version runs on its own migrations again; the migrated database was saved first |
+| `container_exits` | old | update to a build that exits at once | well before the health timeout: `UPGRADE_DATABASE_UNCHECKED` (the bundled database cannot be read in a stopped container, so neither restored nor switched back); both versions stopped |
 | `pull_fails` | old | update to a version that cannot be downloaded | `DOCKER_PULL_FAILED`; the container was not touched |
-| `concurrent_click` | old | two Update requests at once | the second is refused (409) |
+| `concurrent_click` | old | two Update requests at once | the second is refused (409); the first ends restored and switched back |
 | `manual_mode_token` | old | ask for manual mode without, then with, root's CLI token | refused (403), then allowed; token file mode 600 |
 | `backup_fails` | old | the database dump fails (3 attempts) after PayRam's programs were stopped | `BACKUP_FAILED_AFTER_QUIESCE`, nothing changed; every stopped program runs again |
 | `happy_upgrade` | old | update to `E2E_NEW` | `READY`; ports (loopback binding kept, database port dropped), named volumes, previous image kept, backups mode 600 |
@@ -42,6 +42,7 @@ update flow (`internal/switchover`, `internal/http/upgrade_*.go`) changes.
 | `interrupted_old_updater_job` | fresh old | a job left active by a v0.2.3 updater that stopped PayRam's programs and died; then update | the new updater starts the programs again and ends the job (`UPGRADE_INTERRUPTED`); the next update succeeds |
 | `setup_script_install` | fresh old, as `setup_payram.sh` runs it with a certificate | update to `E2E_NEW` | `READY`; host folders kept (the certificate one read-only), AES key and every setting carried over, an empty one included; ports 80 and 443 kept, database port dropped |
 | `https_only_install` | fresh old, HTTPS (443) only | update to `E2E_NEW` | the updater finds PayRam on HTTPS and checks it over TLS; `READY` |
+| `money_moved_not_restored` | fresh old | update to a build that migrates, then never answers; a sweep is started meanwhile | `UPGRADE_MONEY_MOVED_NOT_RESTORED`: not restored, not switched back; the new version runs as it was, the old one stays stopped |
 | `auto_remove_refused` | fresh old, started with `--rm` (as the DigitalOcean unit does) | update to `E2E_NEW` | `CONTAINER_NOT_REPLACEABLE`; the container is not touched and keeps running |
 
 ## How it stays out of the way

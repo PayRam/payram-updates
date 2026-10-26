@@ -32,6 +32,10 @@ type ContainerState struct {
 	RestartCount int
 	Image        string // image reference the container was created from
 	ExitCode     int
+	// HasStarted reports whether Docker ever started the container. A
+	// container that was created but never started has run none of its
+	// programs (so it cannot have changed PayRam's database).
+	HasStarted bool
 }
 
 // Pull pulls a Docker image.
@@ -207,7 +211,7 @@ func (r *Runner) ConnectNetwork(ctx context.Context, network, container string) 
 // State reports whether a container exists and how it is doing. A missing
 // container is not an error: State returns Exists=false.
 func (r *Runner) State(ctx context.Context, container string) (ContainerState, error) {
-	args := []string{"inspect", "-f", "{{.State.Running}}|{{.State.Status}}|{{.RestartCount}}|{{.Config.Image}}|{{.State.ExitCode}}", container}
+	args := []string{"inspect", "-f", "{{.State.Running}}|{{.State.Status}}|{{.RestartCount}}|{{.Config.Image}}|{{.State.ExitCode}}|{{.State.StartedAt}}", container}
 	cmd := exec.CommandContext(ctx, r.DockerBin, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -222,7 +226,7 @@ func (r *Runner) State(ctx context.Context, container string) (ContainerState, e
 
 func parseContainerState(line string) (ContainerState, error) {
 	fields := strings.Split(line, "|")
-	if len(fields) != 5 {
+	if len(fields) != 6 {
 		return ContainerState{}, fmt.Errorf("unexpected docker inspect output: %q", line)
 	}
 	state := ContainerState{
@@ -230,6 +234,8 @@ func parseContainerState(line string) (ContainerState, error) {
 		Running: fields[0] == "true",
 		Status:  fields[1],
 		Image:   fields[3],
+		// Docker reports the zero time for a container it never started.
+		HasStarted: fields[5] != "" && !strings.HasPrefix(fields[5], "0001-01-01"),
 	}
 	fmt.Sscanf(fields[2], "%d", &state.RestartCount)
 	fmt.Sscanf(fields[4], "%d", &state.ExitCode)

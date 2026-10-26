@@ -231,27 +231,40 @@ expect_container() { # name exists?
   if $REAL_DOCKER inspect "$1" >/dev/null 2>&1; then [ "$2" = yes ] && pass "$1 exists" || fail "$1 exists"; else [ "$2" = no ] && pass "$1 absent" || fail "$1 absent"; fi
 }
 
+# The failed new version migrated the database and moved no money: the
+# updater restores the pre-update backup, then switches back, so $OLD runs on
+# the database it knows (audit H1: it used to run on the migrated one).
 scenario_rollback_after_migrations() {
   fresh_payram ${OLD}${ARCH} || return
-  local before; before=$(sql "select count(*) from migrations" )
+  local before; before=$(sql "select string_agg(id, ',' order by id) from migrations")
   HC=180 start_updater
   run_update 99.0.1
   wait_job_done 1500
-  expect_job FAILED UPGRADE_ROLLED_BACK HEALTHCHECK_FAILED
+  expect_job FAILED UPGRADE_ROLLED_BACK_RESTORED HEALTHCHECK_FAILED
   expect_payram ${OLD}${ARCH}
   expect_container $NAME-failed yes
   expect_container $NAME-previous no
-  echo "  migrations before=$before after=$(sql 'select count(*) from migrations') (the failed new version may have migrated; $OLD must still run)"
+  [ "$(sql "select string_agg(id, ',' order by id) from migrations")" = "$before" ] \
+    && pass "the database has $OLD's migrations again (the backup was restored)" || fail "migrations differ from before the update"
+  ls "$E"/backups/*pre-restore-safety* >/dev/null 2>&1 && pass "the migrated database was saved before the restore" || fail "no safety backup of the migrated database"
+  grep -q "restored the backup taken at" "$E/last-status.json" && pass "message says the backup was restored" || fail "message: $(field message < "$E/last-status.json")"
 }
 
+# A build that exits at once leaves its database unreadable (the bundled
+# database lives in that container), so whether it migrated cannot be told:
+# the updater neither restores nor switches back, and says so.
 scenario_container_exits() {
   HC=600 start_updater
   local start=$SECONDS
   run_update 99.0.2
   wait_job_done 900
-  expect_job FAILED UPGRADE_ROLLED_BACK DOCKER_ERROR
+  expect_job FAILED UPGRADE_DATABASE_UNCHECKED DOCKER_ERROR
   [ $((SECONDS - start)) -lt 420 ] && pass "an exiting container fails fast ($((SECONDS - start))s, not the 600s timeout)" || fail "took $((SECONDS - start))s"
-  expect_payram ${OLD}${ARCH}
+  for c in $NAME $NAME-previous; do
+    [ "$($REAL_DOCKER inspect -f '{{.State.Running}}' $c 2>/dev/null)" = false ] && pass "$c is stopped" || fail "$c: $($REAL_DOCKER inspect -f '{{.State.Status}}' $c 2>&1)"
+  done
+  [ "$($REAL_DOCKER inspect -f '{{.HostConfig.RestartPolicy.Name}}' $NAME-previous)" = no ] && pass "the previous version cannot start by itself" || fail "$NAME-previous may restart"
+  fresh_payram ${OLD}${ARCH}   # the next scenarios start from a running $OLD
 }
 
 scenario_pull_fails() {
@@ -266,9 +279,9 @@ scenario_pull_fails() {
 }
 
 scenario_concurrent_click() {
-  HC=600 start_updater
-  run_update 99.0.2 >/dev/null
-  local second; second=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$UPORT/upgrade/run" -d '{"requestedTarget":"99.0.2"}')
+  HC=60 start_updater
+  run_update 99.0.1 >/dev/null
+  local second; second=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$UPORT/upgrade/run" -d '{"requestedTarget":"99.0.1"}')
   [ "$second" = 409 ] && pass "second Update click refused (409)" || fail "second click got $second"
   wait_job_done 900
   expect_payram ${OLD}${ARCH}
@@ -432,6 +445,31 @@ scenario_auto_remove_refused() {
   $REAL_DOCKER rm -f $NAME >/dev/null 2>&1
 }
 
+# The failed new version migrated the database AND started a sweep (a lock
+# row PayRam writes before it broadcasts one) while it ran: restoring would
+# forget it, so the updater neither restores nor switches back. PayRam stays
+# on the new version; the old one stays aside, stopped.
+scenario_money_moved_not_restored() {
+  fresh_payram ${OLD}${ARCH} || return
+  HC=120 start_updater
+  run_update 99.0.1
+  if wait_job_state VERIFYING 900; then sleep 20; else fail "never reached VERIFYING"; return; fi
+  sql "insert into generic_data_stores (created_at, updated_at, type, valid_till, data, status) values (now(), now(), 'sweep_initiated', now() + interval '9 hours', '{\"address\":\"0xe2e\",\"txHash\":\"0xe2e\"}', 'active')" >/dev/null \
+    && pass "a sweep was started by the new version (simulated)" || fail "could not insert the sweep lock: $(sql 'select 1')"
+  wait_job_done 1500
+  expect_job FAILED UPGRADE_MONEY_MOVED_NOT_RESTORED HEALTHCHECK_FAILED
+  [ "$($REAL_DOCKER inspect -f '{{.Config.Image}}|{{.State.Running}}' $NAME)" = "payram-e2e/payram:99.0.1${ARCH}|true" ] \
+    && pass "$NAME was left on the new version, running" || fail "$NAME: $($REAL_DOCKER inspect -f '{{.Config.Image}}|{{.State.Status}}' $NAME)"
+  [ "$($REAL_DOCKER inspect -f '{{.State.Running}}|{{.HostConfig.RestartPolicy.Name}}' $NAME-previous)" = "false|no" ] \
+    && pass "$NAME-previous kept stopped with restart=no" || fail "$NAME-previous: $($REAL_DOCKER inspect -f '{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}' $NAME-previous)"
+  [ "$(sql "select count(*) from generic_data_stores where data like '%0xe2e%'")" = 1 ] && pass "the sweep record was not restored away" || fail "sweep record gone"
+  [ "$(sql 'select id from e2e_marker limit 1')" = "42" ] && pass "database marker row intact" || fail "marker row"
+  local stopped; stopped=$($REAL_DOCKER exec $NAME supervisorctl status 2>/dev/null | grep -v -E 'postgres|redis' | grep -c -E 'STOPPED')
+  [ "$stopped" = 0 ] && pass "the new version's programs run again (left as it was)" || fail "$stopped programs still stopped"
+  grep -q "Do not restore the backup" "$E/last-status.json" && pass "message warns against restoring" || fail "message: $(field message < "$E/last-status.json")"
+  $REAL_DOCKER rm -f $NAME $NAME-previous >/dev/null 2>&1
+}
+
 # Over the whole run, no docker command the updater ran carried the AES key or
 # the database password: anyone on the server can read a command line.
 check_no_secrets_on_command_lines() {
@@ -487,7 +525,8 @@ write_config
 ensure_test_images
 [ $# -eq 0 ] && set -- rollback_after_migrations container_exits pull_fails concurrent_click manual_mode_token backup_fails \
   happy_upgrade db_only_restore killed_mid_update sigterm_mid_update start_fails full_recovery \
-  interrupted_old_updater_job setup_script_install https_only_install auto_remove_refused
+  interrupted_old_updater_job setup_script_install https_only_install auto_remove_refused \
+  money_moved_not_restored
 for s in "$@"; do
   ensure_test_images
   log "=== $s ==="

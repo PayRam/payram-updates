@@ -139,6 +139,11 @@ func (e *HostPGExecutor) CheckTools(ctx context.Context, db DBContext) error {
 	return checkTools(ctx, e, db)
 }
 
+// Query implements PGExecutor.
+func (e *HostPGExecutor) Query(ctx context.Context, db DBContext, queries ...string) (string, error) {
+	return readOnlyQuery(ctx, e, db, queries...)
+}
+
 // Ping implements PGExecutor.
 func (e *HostPGExecutor) Ping(ctx context.Context, db DBContext) error {
 	return ping(ctx, e, db)

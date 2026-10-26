@@ -106,13 +106,13 @@ func promptInt(reader *bufio.Reader, prompt string, defaultValue int) int {
 // (manual mode needs it). It exits with a readable message when the daemon
 // cannot be reached or refuses the request outright (an answer that is not
 // JSON, such as "run it with sudo").
-func postToDaemon(path string, payload map[string]string) (int, []byte) {
+func postToDaemon(path string, payload any) (int, []byte) {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create request: %v\n", err)
 		os.Exit(1)
 	}
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d%s", getPort(), path), bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, daemonURL()+path, bytes.NewReader(data))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create request: %v\n", err)
 		os.Exit(1)
@@ -165,6 +165,11 @@ func cliStateDir() string {
 		return dir
 	}
 	return autoupdate.DefaultStateDir
+}
+
+// daemonURL is the local daemon's address.
+func daemonURL() string {
+	return fmt.Sprintf("http://127.0.0.1:%d", getPort())
 }
 
 func getPort() int {

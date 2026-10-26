@@ -94,7 +94,9 @@ RESTART:
 RUN FLAGS:
   --mode string    Upgrade mode: 'dashboard' or 'manual' (default: manual)
   --to string      Target version (required)
-  --yes            Skip confirmation prompt (default: false)
+  --yes            Skip confirmation prompts and return once the update has
+                   started (default: false). Without it, on a terminal, run
+                   follows the update and asks before restoring a backup.
 
 LOGS FLAGS:
 	-f, --follow     Follow logs (like tail -f)
