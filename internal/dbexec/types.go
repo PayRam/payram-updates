@@ -118,6 +118,11 @@ type PGExecutor interface {
 	// CheckTools confirms pg_dump, pg_restore and psql exist where they run.
 	CheckTools(ctx context.Context, db DBContext) error
 
+	// Query runs SELECT statements in one read-only transaction and returns
+	// the rows as unaligned, tuples-only text: one row per line, columns
+	// separated by "|". It can never change the database.
+	Query(ctx context.Context, db DBContext, queries ...string) (string, error)
+
 	// Ping runs SELECT 1 as the configured user.
 	Ping(ctx context.Context, db DBContext) error
 

@@ -701,3 +701,47 @@ func TestSQLHasTransactionControl_LongLinesAndData(t *testing.T) {
 		t.Fatal("a COMMIT; line after a long line was missed")
 	}
 }
+
+// TestQuery_RunsInOneReadOnlyTransaction: the switch back's database check
+// must never be able to change the database, and its statements must see
+// one snapshot.
+func TestQuery_RunsInOneReadOnlyTransaction(t *testing.T) {
+	runner := &fakeRunner{handle: func(cmd Command, stdin []byte, stdout io.Writer) ([]byte, error) {
+		io.WriteString(stdout, "a=1\nb=2\n")
+		return nil, nil
+	}}
+	out, err := NewDockerPGExecutor(runner, nil).Query(context.Background(), containerDB(), "SELECT 'a=1'", "SELECT 'b=2'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "a=1\nb=2\n" {
+		t.Fatalf("out = %q", out)
+	}
+	call := runner.find(t, "psql", "-q")
+	var statements []string
+	for i, arg := range call.Cmd.Args {
+		if arg == "-c" && i+1 < len(call.Cmd.Args) {
+			statements = append(statements, call.Cmd.Args[i+1])
+		}
+	}
+	want := []string{"BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY", "SELECT 'a=1'", "SELECT 'b=2'", "COMMIT"}
+	if strings.Join(statements, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("statements = %q, want %q", statements, want)
+	}
+}
+
+func TestQuery_RefusesAnAnswerThatWasCutShort(t *testing.T) {
+	runner := &fakeRunner{handle: func(cmd Command, stdin []byte, stdout io.Writer) ([]byte, error) {
+		io.WriteString(stdout, strings.Repeat("x", maxQueryOutput+10))
+		return nil, nil
+	}}
+	if _, err := NewHostPGExecutor(runner, nil).Query(context.Background(), externalDB(), "SELECT 1"); err == nil || !strings.Contains(err.Error(), "longer than") {
+		t.Fatalf("got %v, want an error: a cut answer reads as a different one", err)
+	}
+}
+
+func TestQuery_RefusesTheWrongDatabaseKind(t *testing.T) {
+	if _, err := NewDockerPGExecutor(nil, nil).Query(context.Background(), externalDB(), "SELECT 1"); err == nil {
+		t.Fatal("docker executor must refuse an external database")
+	}
+}

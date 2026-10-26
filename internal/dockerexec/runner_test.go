@@ -457,3 +457,23 @@ func TestRedactLine_CleansWhatOlderUpdatersLogged(t *testing.T) {
 		t.Errorf("RedactLines = %q", got)
 	}
 }
+
+func TestParseContainerState_SaysWhetherTheContainerEverStarted(t *testing.T) {
+	never, err := parseContainerState("false|created|0|payramapp/payram:3.10.0|0|0001-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !never.Exists || never.HasStarted || never.Status != "created" {
+		t.Fatalf("created container = %+v, want never started", never)
+	}
+	exited, err := parseContainerState("false|exited|2|payramapp/payram:3.10.0|3|2026-10-26T10:15:00.123456789Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exited.HasStarted || exited.ExitCode != 3 || exited.RestartCount != 2 {
+		t.Fatalf("exited container = %+v, want started once, exit 3, 2 restarts", exited)
+	}
+	if _, err := parseContainerState("true|running|0|img|0"); err == nil {
+		t.Fatal("an answer without the start time must be refused")
+	}
+}
