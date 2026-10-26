@@ -21,6 +21,7 @@ import (
 	"github.com/payram/payram-updater/internal/jobs"
 	"github.com/payram/payram-updater/internal/logger"
 	"github.com/payram/payram-updater/internal/manifest"
+	"github.com/payram/payram-updater/internal/recovery"
 	"github.com/payram/payram-updater/internal/switchover"
 )
 
@@ -29,12 +30,16 @@ import (
 const pullTimeout = 30 * time.Minute
 
 // runUpgrade is the update, in order. Nothing about the running PayRam
-// changes before the cutover (step 5), and every failure from there on
-// switches back to the previous container:
+// changes before the cutover (step 5). Every failure from there on goes
+// through putPayramBack: it switches back to the previous container, first
+// restoring the backup when the new version migrated the database, and
+// leaves PayRam on the new version when that version moved money since the
+// backup (see makeDatabaseFitForSwitchBack):
 //  1. find the container and how to reach its API
 //  2. build the new container's settings from the running one
 //  3. pull the image and create the new container next to the running one
-//  4. stop PayRam's programs and back up the database
+//  4. stop PayRam's programs, record the database's migrations and money
+//     records, and back the database up
 //  5. stop the old container, keep it aside, start the new one
 //  6. wait until the new version is healthy, runs the right version, stays up
 //  7. remove the old container
@@ -177,9 +182,19 @@ func (s *Server) runHop(ctx context.Context, sw *switchover.Switch, job *jobs.Jo
 			s.failStep(ctx, sw, job, err)
 			return false
 		}
+	} else {
+		// The container a failed switch goes back to now runs this hop's
+		// starting version, on the database as it is now.
+		state, err := s.containerBackupExec.ReadDatabaseState(ctx, name)
+		if err != nil {
+			s.failStep(ctx, sw, job, &switchover.StepError{Code: "DATABASE_READ_FAILED", Message: fmt.Sprintf("The database could not be read before the switch (%v), so the update stopped before switching", err)})
+			return false
+		}
+		job.DatabaseBeforeSwitch = state
 	}
 
 	s.setProgress(job, jobs.JobStateExecuting, fmt.Sprintf("Switching to %s", baseVersionTag(tag)))
+	job.PreviousPublishesDatabase = container.PublishesDatabasePort(current)
 	if err := sw.Cutover(ctx, job, current.Image, container.FormatRestartPolicy(current.RestartPolicy)); err != nil {
 		s.failStep(ctx, sw, job, err)
 		return false
@@ -225,20 +240,37 @@ func stageReachedCutover(stage jobs.SwitchStage) bool {
 // putPayramBack undoes whatever the switch did, checks that PayRam answers
 // again, and ends the job with a message saying where PayRam is:
 //   - nothing had changed: the step's code, "PayRam was not changed";
-//   - the old container had been stopped: UPGRADE_ROLLED_BACK, with the
-//     step's code as CauseCode, "switched back to <version>";
+//   - the old container had been stopped: first makeDatabaseFitForSwitchBack
+//     decides about the database. When the new version left it fit for the
+//     previous one: UPGRADE_ROLLED_BACK, "switched back to <version>"; when
+//     the backup had to be restored first: UPGRADE_ROLLED_BACK_RESTORED.
+//     Otherwise PayRam stays on the new version (or stopped) and the job
+//     ends with that decision's code (UPGRADE_MONEY_MOVED_NOT_RESTORED, ...);
 //   - switching back failed or PayRam does not answer: ROLLBACK_FAILED.
+//
+// The step's code is the CauseCode of every code that says where PayRam is.
 func (s *Server) putPayramBack(ctx context.Context, sw *switchover.Switch, job *jobs.Job, causeCode, reason string, changed bool) {
-	from := job.FromVersion
-	if from == "" {
-		from = "the previous version"
-	}
-	target := baseVersionTag(job.ResolvedTarget)
+	from, target := versionNames(job)
 	s.jobStore.AppendLog(fmt.Sprintf("Step failed (%s): %s", causeCode, reason))
 
+	neverStarted := false
 	if job.SwitchStage != jobs.SwitchStageNone {
+		if changed {
+			proceed, notStarted := s.makeDatabaseFitForSwitchBack(ctx, sw, job, causeCode, reason)
+			if !proceed {
+				return
+			}
+			neverStarted = notStarted
+		}
+		restored := job.DatabaseCheck == jobs.DatabaseCheckRestored
 		s.setProgress(job, jobs.JobStateVerifying, fmt.Sprintf("Putting PayRam %s back", from))
 		if err := sw.Restore(ctx, job); err != nil {
+			if restored {
+				s.finishFailed(job, jobs.FailureRollbackFailed, causeCode, fmt.Sprintf(
+					"The update to %s failed (%s). The backup taken at %s was restored, so the database matches %s again, but PayRam could not be switched back to %s automatically: %v. PayRam may be down. Start %s (not the new version) by following the recovery steps, or contact PayRam support with the updater log.",
+					target, reason, formatBackupTime(job.BackupTakenAt), from, from, err, from))
+				return
+			}
 			s.finishFailed(job, jobs.FailureRollbackFailed, causeCode, fmt.Sprintf(
 				"The update to %s failed (%s), and PayRam could not be switched back to %s automatically: %v. PayRam may be down. Follow the recovery steps, or contact PayRam support with the updater log.",
 				target, reason, from, err))
@@ -246,26 +278,51 @@ func (s *Server) putPayramBack(ctx context.Context, sw *switchover.Switch, job *
 		}
 		probe := s.newProbe(job.CoreBaseURL, job.ContainerName, s.shouldUseLegacyForTarget(s.currentPolicyInit, job.FromVersion))
 		if _, err := sw.WaitHealthy(ctx, job.ContainerName, probe, ""); err != nil {
-			if changed {
+			name := recovery.ShellQuote(job.ContainerName)
+			switch {
+			case restored:
+				s.finishFailed(job, jobs.FailureRollbackFailed, causeCode, fmt.Sprintf(
+					"The update to %s failed (%s). The backup taken at %s was restored and PayRam was switched back to %s, but it is not answering yet (%v). Check `docker logs %s`, or contact PayRam support with the updater log.",
+					target, reason, formatBackupTime(job.BackupTakenAt), from, err, name))
+			case changed:
 				s.finishFailed(job, jobs.FailureRollbackFailed, causeCode, fmt.Sprintf(
 					"The update to %s failed (%s). PayRam was switched back to %s, but it is not answering yet (%v). Check `docker logs %s`, or contact PayRam support with the updater log.",
-					target, reason, from, err, job.ContainerName))
-			} else {
+					target, reason, from, err, name))
+			default:
 				s.finishFailed(job, causeCode, "", fmt.Sprintf(
 					"%s. PayRam was not changed, but it is not answering its health check right now (%v). Check `docker logs %s`.",
-					sentence(reason), err, job.ContainerName))
+					sentence(reason), err, name))
 			}
 			return
 		}
 	}
 
-	if changed {
-		s.finishFailed(job, jobs.FailureUpgradeRolledBack, causeCode, fmt.Sprintf(
-			"The update to %s did not complete (%s), so PayRam was switched back to %s and is running. Nothing was removed from the database. The new version's container is kept as %s for PayRam support.",
-			target, reason, from, switchover.FailedName(job.ContainerName)))
-		return
+	failedName := recovery.ShellQuote(switchover.FailedName(job.ContainerName))
+	databasePort := ""
+	if job.PreviousPublishesDatabase {
+		// Audit L4: only the new container's settings drop the port.
+		databasePort = fmt.Sprintf(" Note: %s's container still publishes PayRam's database port (5432) on this server, as it did before the update; the new version would not have. A successful update closes it; until then make sure your firewall blocks port 5432.", from)
 	}
-	s.finishFailed(job, causeCode, "", fmt.Sprintf("%s. PayRam was not changed and keeps running %s.", sentence(reason), from))
+	switch {
+	case changed && job.DatabaseCheck == jobs.DatabaseCheckRestored:
+		safety := ""
+		if job.SafetyBackupPath != "" {
+			safety = fmt.Sprintf(" The database as the new version left it is saved in %s.", job.SafetyBackupPath)
+		}
+		s.finishFailed(job, jobs.FailureUpgradeRolledBackRestored, causeCode, fmt.Sprintf(
+			"The update to %s did not complete (%s). The new version had already changed the database, so the updater restored the backup taken at %s and switched PayRam back to %s, which is running. %s It had sent no payout or sweep and handed out no payment address since the backup, so nothing can be paid twice or missed.%s The new version's container is kept as %s for PayRam support.",
+			target, reason, formatBackupTime(job.BackupTakenAt), from, dataRemovedByRestore, safety, failedName)+databasePort)
+	case changed:
+		why := "The new version did not change the database's structure"
+		if neverStarted {
+			why = "The new version never started"
+		}
+		s.finishFailed(job, jobs.FailureUpgradeRolledBack, causeCode, fmt.Sprintf(
+			"The update to %s did not complete (%s), so PayRam was switched back to %s and is running. %s, so nothing had to be restored and every payment recorded during the update is kept. The new version's container is kept as %s for PayRam support.",
+			target, reason, from, why, failedName)+databasePort)
+	default:
+		s.finishFailed(job, causeCode, "", fmt.Sprintf("%s. PayRam was not changed and keeps running %s.", sentence(reason), from))
+	}
 }
 
 // failBeforeChange ends a job that failed before anything was touched.
@@ -304,14 +361,20 @@ func sentence(reason string) string {
 	return strings.ToUpper(reason[:1]) + reason[1:]
 }
 
-// newSwitch returns the container switch wired to Docker and the job store.
+// newSwitch returns the container switch wired to Docker, supervisorctl,
+// PayRam's database and the job store.
 func (s *Server) newSwitch() *switchover.Switch {
-	return &switchover.Switch{
-		Docker:        s.dockerRunner,
-		Record:        jobRecorder{store: s.jobStore},
-		Timing:        s.switchTiming,
-		StartPrograms: s.supervisorctlStart,
+	sw := &switchover.Switch{
+		Docker:   s.dockerRunner,
+		Record:   jobRecorder{store: s.jobStore},
+		Timing:   s.switchTiming,
+		Programs: supervisorPrograms{s: s},
+		Database: switchDatabase{containers: s.containerBackupExec, restorer: s.backupManager},
 	}
+	if s.switchWiring != nil {
+		s.switchWiring(sw)
+	}
+	return sw
 }
 
 // jobRecorder saves switch progress into the job store.
@@ -466,7 +529,7 @@ func (s *Server) executeDryRun(job *jobs.Job, imageRepo, imageTag, containerName
 	s.jobStore.AppendLog(fmt.Sprintf("  2. Create the new container next to the running one: docker %s", strings.Join(dockerexec.RedactArgs(createArgs), " ")))
 	s.jobStore.AppendLog("  3. Stop PayRam's programs (not the database) and back up the database")
 	s.jobStore.AppendLog(fmt.Sprintf("  4. Stop %s, keep it as %s, start the new container as %s", containerName, switchover.PreviousName(containerName), containerName))
-	s.jobStore.AppendLog("  5. Verify /api/v1/health, /api/v1/version and that PayRam stays up; switch back on any failure")
+	s.jobStore.AppendLog("  5. Verify /api/v1/health, /api/v1/version and that PayRam stays up; on any failure switch back (restoring the backup first if the new version migrated the database and moved no money)")
 	s.jobStore.AppendLog(fmt.Sprintf("  6. Remove %s", switchover.PreviousName(containerName)))
 
 	job.State = jobs.JobStateReady
@@ -635,7 +698,7 @@ func allStarted(output string) bool {
 // stopped, and they are saved in the job first, so a failure (or a restarted
 // updater) starts exactly those again. It reports whether supervisor was used.
 func (s *Server) quiesceForBackup(ctx context.Context, job *jobs.Job, containerName string) (bool, error) {
-	statusOutput, err := s.supervisorctlStatus(ctx, containerName)
+	running, err := s.listAppPrograms(ctx, containerName, s.config.SupervisorInclude, "RUNNING", "STARTING")
 	if err != nil {
 		if errors.Is(err, errSupervisorUnavailable) {
 			s.jobStore.AppendLog("Supervisor not available; backing up while PayRam keeps running")
@@ -643,9 +706,6 @@ func (s *Server) quiesceForBackup(ctx context.Context, job *jobs.Job, containerN
 		}
 		return false, &switchover.StepError{Code: "SUPERVISORCTL_FAILED", Message: fmt.Sprintf("Could not read PayRam's program list: %v", err)}
 	}
-
-	programs, _ := backup.ParseSupervisorStatus(statusOutput)
-	running := backup.AppPrograms(programs, s.config.SupervisorInclude, s.config.SupervisorExclude, "RUNNING", "STARTING")
 	if len(running) == 0 {
 		s.jobStore.AppendLog("No running PayRam programs need stopping for the backup")
 		return true, nil
@@ -664,6 +724,19 @@ func (s *Server) quiesceForBackup(ctx context.Context, job *jobs.Job, containerN
 	return true, nil
 }
 
+// listAppPrograms lists PayRam's programs in containerName (the database and
+// SUPERVISOR_EXCLUDE left out; only include, when given) that are in one of
+// states. It returns errSupervisorUnavailable when the container has no
+// supervisorctl.
+func (s *Server) listAppPrograms(ctx context.Context, containerName string, include []string, states ...string) ([]string, error) {
+	statusOutput, err := s.supervisorctlStatus(ctx, containerName)
+	if err != nil {
+		return nil, err
+	}
+	programs, _ := backup.ParseSupervisorStatus(statusOutput)
+	return backup.AppPrograms(programs, include, s.config.SupervisorExclude, states...), nil
+}
+
 // backUpBeforeSwitch takes the pre-update backup with PayRam's programs
 // stopped. On failure the caller's restore starts the programs again.
 func (s *Server) backUpBeforeSwitch(ctx context.Context, job *jobs.Job, containerName, imageTag string) error {
@@ -678,6 +751,16 @@ func (s *Server) backUpBeforeSwitch(ctx context.Context, job *jobs.Job, containe
 	if err != nil {
 		return err
 	}
+	// What the backup holds, for a failed switch to compare the database
+	// with. It is read before the dump: a payout PayRam might still send in
+	// between (when its programs could not be stopped) then shows as a
+	// difference, which keeps the backup from being restored over it.
+	state, err := s.containerBackupExec.ReadDatabaseState(ctx, containerName)
+	if err != nil {
+		return &switchover.StepError{Code: "DATABASE_READ_FAILED", Message: fmt.Sprintf("The database could not be read before the backup (%v), so the update stopped before switching: a failed switch would have no way to tell whether the previous version still fits the database", err)}
+	}
+	job.DatabaseAtBackup = state
+	job.DatabaseBeforeSwitch = state
 	attempts := 1
 	if usedSupervisor {
 		attempts = 3
@@ -719,6 +802,7 @@ func (s *Server) takePreUpgradeBackup(ctx context.Context, job *jobs.Job, contai
 			},
 		})
 
+		startedAt := time.Now().UTC()
 		backupResult := s.containerBackupExec.ExecuteBackup(ctx, containerName, backup.BackupMeta{
 			FromVersion:   currentVersion,
 			TargetVersion: imageTag,
@@ -727,6 +811,7 @@ func (s *Server) takePreUpgradeBackup(ctx context.Context, job *jobs.Job, contai
 		lastResult = backupResult
 
 		if backupResult.Success {
+			job.BackupTakenAt = startedAt
 			s.jobStore.AppendLog(fmt.Sprintf("Backup created successfully: %s (%.2f MB)", backupResult.Filename, float64(backupResult.Size)/(1024*1024)))
 			if backupResult.DBConfig != nil {
 				dbType := "external"

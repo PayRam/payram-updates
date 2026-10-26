@@ -267,6 +267,12 @@ func TestPlaybookClassification(t *testing.T) {
 		risk     DataRisk
 	}{
 		{jobs.FailureUpgradeRolledBack, PayRamRestored, SeverityInfo, DataRiskNone},
+		{jobs.FailureUpgradeRolledBackRestored, PayRamRestored, SeverityInfo, DataRiskPossible},
+		{jobs.FailureUpgradeMoneyMoved, PayRamUncertain, SeverityManual, DataRiskPossible},
+		{jobs.FailureUpgradeDatabaseUnchecked, PayRamUncertain, SeverityManual, DataRiskPossible},
+		{jobs.FailureUpgradeRestoreFailed, PayRamUncertain, SeverityManual, DataRiskPossible},
+		{jobs.FailureUpgradeRestoreDeclined, PayRamUncertain, SeverityManual, DataRiskPossible},
+		{"DATABASE_READ_FAILED", PayRamUnchanged, SeverityRetryable, DataRiskNone},
 		{jobs.FailureUpgradeInterrupted, PayRamRestored, SeverityInfo, DataRiskNone},
 		{jobs.FailureRollbackFailed, PayRamUncertain, SeverityManual, DataRiskPossible},
 		{jobs.FailureDockerCreateFailed, PayRamUnchanged, SeverityManual, DataRiskNone},
@@ -488,6 +494,34 @@ func TestRetryabilityHelpers(t *testing.T) {
 		if IsRetryable(code) || !RequiresManualIntervention(code) || !HasDataRisk(code) {
 			t.Errorf("%s should need a person and carry possible data risk", code)
 		}
+	}
+}
+
+// TestPlaybooks_LeftOnTheNewVersionNeverAdviseARestoreOrTheOldVersion: when
+// the new version may have moved money, restoring the backup or starting the
+// previous version could send a payout twice.
+func TestPlaybooks_LeftOnTheNewVersionNeverAdviseARestoreOrTheOldVersion(t *testing.T) {
+	for _, code := range []string{jobs.FailureUpgradeMoneyMoved, jobs.FailureUpgradeDatabaseUnchecked, jobs.FailureUpgradeRestoreFailed, jobs.FailureUpgradeRestoreDeclined} {
+		pb := RenderPlaybook(code, PlaybookContext{ContainerName: "payram"})
+		for _, step := range pb.SSHSteps {
+			if strings.Contains(step, "backup restore") || strings.Contains(step, "docker rename payram-previous") || strings.Contains(step, "docker start payram-previous") {
+				t.Errorf("%s step advises a restore or the previous version: %s", code, step)
+			}
+		}
+		if !strings.Contains(pb.UserMessage, "support") {
+			t.Errorf("%s does not send the merchant to support: %s", code, pb.UserMessage)
+		}
+	}
+}
+
+// TestRolledBack_NoLongerPromisesAnUncheckedDatabase: UPGRADE_ROLLED_BACK
+// now means the updater checked that the new version left the database fit.
+func TestRolledBack_NoLongerPromisesAnUncheckedDatabase(t *testing.T) {
+	if msg := GetPlaybook(jobs.FailureUpgradeRolledBack).UserMessage; !strings.Contains(msg, "after checking that the new version had not changed the database's structure") {
+		t.Errorf("UPGRADE_ROLLED_BACK message: %s", msg)
+	}
+	if msg := GetPlaybook(jobs.FailureUpgradeRolledBackRestored).UserMessage; !strings.Contains(msg, "restored the backup") || !strings.Contains(msg, "found again") {
+		t.Errorf("UPGRADE_ROLLED_BACK_RESTORED message: %s", msg)
 	}
 }
 

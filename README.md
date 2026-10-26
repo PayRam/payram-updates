@@ -148,10 +148,28 @@ You'll see a confirmation prompt before the upgrade starts:
 Proceed? (y/N):
 ```
 
+On a terminal, `payram-updater run` then follows the update until it ends
+(Ctrl+C stops following; the update goes on). If the new version fails after
+migrating the database and the backup can be restored safely, it asks before
+restoring:
+
+```
+PayRam 3.10.0 failed its checks (...) after it had changed the database (...).
+To switch back to 3.9.0, the updater restores the backup taken at 2026-10-26 10:15:00 UTC first. ...
+Restore the backup and switch back? [Y/n] (without an answer by 10:28:04 the backup is restored):
+```
+
+Enter (or no answer within 3 minutes) restores and switches back; `n` leaves
+both versions stopped and prints the recovery steps.
+
 ### Skip confirmation (for automation)
 ```bash
 sudo payram-updater run --to 1.7.8 --yes
 ```
+
+With `--yes`, or without a terminal, the command returns once the update has
+started, and nothing is asked: a failed update restores the backup when that
+is safe, as dashboard updates do.
 
 ### Upgrade to a specific version
 ```bash
@@ -179,11 +197,30 @@ sudo payram-updater run --to 1.7.8
 
 ## Recovery & Troubleshooting
 
-An update never deletes payment data, and whatever fails, the updater's aim is
-that PayRam ends up running. The new version is started next to the running
-one; if it fails its checks, the updater switches back to the previous version
-on its own. Before anything else after a failed update, check whether PayRam
-answers:
+Whatever fails, the updater's aim is that PayRam ends up running on a
+database its version understands, and that no payout can be sent twice. The
+new version is started next to the running one; if it fails its checks, the
+updater first looks at what the new version did to the database:
+
+- it did not change the database's structure (no migration), or never
+  started: PayRam is switched back to the previous version, and every payment
+  recorded during the update is kept;
+- it migrated the database and moved no money since the pre-update backup
+  (no payout requested, signed or sent, no sweep started, no gas sent, no
+  deposit wallet deployed, no payment address handed out): the backup is
+  restored, then PayRam is switched back. What PayRam recorded while the
+  failed version ran is removed; PayRam re-reads the blockchain from the
+  backup's point, so deposits made meanwhile are found again (their webhooks
+  are sent again). An update started with `payram-updater run` on a terminal
+  asks first (default yes; "no" leaves both versions stopped); dashboard and
+  automatic updates restore on their own, since no one can be asked while
+  PayRam is down;
+- it migrated the database and moved money, or the database could not be
+  read: nothing is restored and PayRam is not switched back (restoring could
+  send a payout twice, and the previous version cannot run on the migrated
+  database). PayRam stays on the new version; contact PayRam support.
+
+Before anything else after a failed update, check whether PayRam answers:
 
 ```bash
 curl -sk https://127.0.0.1/api/v1/health   # HTTPS installs
@@ -227,7 +264,12 @@ deposit and payout recorded after the backup was taken.
 
 | Code | Is PayRam running? | What to do |
 |------|--------------------|------------|
-| `UPGRADE_ROLLED_BACK` | Yes, on the version it had before. The new version failed (the cause is shown) and the updater switched back. The database was not restored, so payments recorded during the update are kept. | Nothing to recover. Send the updater logs to PayRam support, then retry later. |
+| `UPGRADE_ROLLED_BACK` | Yes, on the version it had before. The new version failed (the cause is shown) without changing the database's structure, and the updater switched back. The database was not restored, so payments recorded during the update are kept. | Nothing to recover. Send the updater logs to PayRam support, then retry later. |
+| `UPGRADE_ROLLED_BACK_RESTORED` | Yes, on the version it had before. The new version failed after migrating the database and had moved no money, so the updater restored the pre-update backup and switched back. | Nothing to restore. Check that recent deposits show up again over the next minutes; send the updater logs to PayRam support, then retry later. |
+| `UPGRADE_MONEY_MOVED_NOT_RESTORED` | On the new version, which failed its checks. It migrated the database and moved money, so the updater did not restore or switch back. | Do not restore the backup or start `<name>-previous`. Contact PayRam support. |
+| `UPGRADE_DATABASE_UNCHECKED` | On the new version (maybe stopped). The database could not be read to check it, so the updater did not restore or switch back. | Do not restore the backup or start `<name>-previous`. Contact PayRam support. |
+| `UPGRADE_RESTORE_FAILED` | Maybe not. The backup had to be restored before switching back, and the restore failed. | Contact PayRam support; the message says whether the database is unchanged. |
+| `UPGRADE_RESTORE_DECLINED` | No: you answered "no" to the restore, so both versions are stopped. | Follow the playbook and contact PayRam support. |
 | `ROLLBACK_FAILED` | Maybe not. The new version failed and switching back failed too. | Follow the playbook: it shows how to start `<name>-previous`, the version that ran before. Do not restore a backup unless support asks. |
 | `UPGRADE_INTERRUPTED` | Yes. The updater stopped mid-update (restart, crash, reboot) and put PayRam back when it came up. | Retry the update. |
 | `DOCKER_CREATE_FAILED`, `TARGET_NOT_ALLOWED`, `DOCKER_PULL_FAILED`, `BACKUP_FAILED`, `BACKUP_TIMEOUT`, `DISK_SPACE_LOW`, `POLICY_FETCH_FAILED`, `MANIFEST_FETCH_FAILED`, ... | Yes, unchanged: the update stopped before PayRam was touched. | Fix the cause shown in the playbook and retry. |
@@ -250,7 +292,10 @@ or any prune with `-a`: they delete what a switch-back needs.
 
 ### Database commands
 
-PayRam's bundled database is never published on the host. Run database
+An update never publishes PayRam's bundled database on the host (it drops a
+5432 mapping that installs from before 28 May 2026 had). When a failed update
+switches back, the previous container keeps its old settings, so the message
+then says if it still publishes 5432. Run database
 commands inside the container, for example:
 
 ```bash

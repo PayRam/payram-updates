@@ -657,6 +657,17 @@ type RestoreOptions struct {
 	// otherwise taken right before it is replaced (--no-safety-backup, or
 	// because the caller already took one with CreateSafetyBackup).
 	SkipSafetyBackup bool
+	// Database, when set, is the database to restore into, as
+	// ContainerBackupExecutor.ResolveDatabase found it: an update that
+	// switches back restores into exactly the database its backup came
+	// from. Otherwise it is found from ContainerName and the configuration.
+	Database *ResolvedDatabase
+}
+
+// ResolvedDatabase is a database and the executor that reaches it.
+type ResolvedDatabase struct {
+	Context  dbexec.DBContext
+	Executor dbexec.PGExecutor
 }
 
 // RestoreResult contains the result of a restore operation.
@@ -737,8 +748,11 @@ func (m *Manager) RestoreBackup(ctx context.Context, backupPath string, opts Res
 
 	m.Logger.Printf("Restoring database from: %s (format: %s)", backupPath, format)
 
-	dbCtx, pgExec, err := m.resolveDatabase(ctx, opts.ContainerName)
-	if err != nil {
+	var dbCtx dbexec.DBContext
+	var pgExec dbexec.PGExecutor
+	if opts.Database != nil {
+		dbCtx, pgExec = opts.Database.Context, opts.Database.Executor
+	} else if dbCtx, pgExec, err = m.resolveDatabase(ctx, opts.ContainerName); err != nil {
 		var dbErr *dbexec.DBError
 		if errors.As(err, &dbErr) && dbErr.Code == dbexec.ErrCodeContainerNotFound {
 			return nil, fmt.Errorf("CREDENTIALS_UNAVAILABLE: no running container and no persisted credentials found.\n\nRecovery options:\n1. Start the Payram container and retry\n2. Ensure data/state/db.env exists with valid credentials\n3. For remote databases, set POSTGRES_* environment variables\n\nError: %w", err)

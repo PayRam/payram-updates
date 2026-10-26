@@ -67,20 +67,25 @@ func printStatusWithPlaybook(body []byte, playbook *recovery.Playbook) {
 	}
 
 	// Then print formatted recovery instructions
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Printf("⚠️  RECOVERY: %s\n", playbook.Title)
-	fmt.Println(strings.Repeat("=", 60))
-	fmt.Printf("\nSeverity: %s\n", playbook.Severity)
-	fmt.Printf("Data Risk: %s\n", playbook.DataRisk)
-	fmt.Printf("\n%s\n", playbook.UserMessage)
-	fmt.Println("\n--- Recovery Steps (SSH) ---")
+	printPlaybook(os.Stdout, playbook)
+}
+
+// printPlaybook prints a recovery playbook for a person to follow.
+func printPlaybook(out io.Writer, playbook *recovery.Playbook) {
+	fmt.Fprintln(out, "\n"+strings.Repeat("=", 60))
+	fmt.Fprintf(out, "⚠️  RECOVERY: %s\n", playbook.Title)
+	fmt.Fprintln(out, strings.Repeat("=", 60))
+	fmt.Fprintf(out, "\nSeverity: %s\n", playbook.Severity)
+	fmt.Fprintf(out, "Data Risk: %s\n", playbook.DataRisk)
+	fmt.Fprintf(out, "\n%s\n", playbook.UserMessage)
+	fmt.Fprintln(out, "\n--- Recovery Steps (SSH) ---")
 	for _, step := range playbook.SSHSteps {
-		fmt.Printf("  %s\n", step)
+		fmt.Fprintf(out, "  %s\n", step)
 	}
 	if playbook.DocsURL != "" {
-		fmt.Printf("\nDocumentation: %s\n", playbook.DocsURL)
+		fmt.Fprintf(out, "\nDocumentation: %s\n", playbook.DocsURL)
 	}
-	fmt.Println(strings.Repeat("=", 60))
+	fmt.Fprintln(out, strings.Repeat("=", 60))
 }
 
 func runLogs() {

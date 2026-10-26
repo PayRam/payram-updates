@@ -994,3 +994,16 @@ func TestBuildContainerSpec_SecretsTravelInTheEnvironmentOnly(t *testing.T) {
 		t.Errorf("env = %v, want %v", spec.Env, want)
 	}
 }
+
+func TestPublishesDatabasePort(t *testing.T) {
+	published := &RuntimeState{Ports: []PortMapping{{HostPort: "443", ContainerPort: "443"}, {HostPort: "5432", ContainerPort: "5432", Protocol: "tcp"}}}
+	if !PublishesDatabasePort(published) {
+		t.Error("a container that maps 5432 publishes the database")
+	}
+	if PublishesDatabasePort(&RuntimeState{Ports: []PortMapping{{HostPort: "443", ContainerPort: "443"}}}) {
+		t.Error("443 only is not the database")
+	}
+	if PublishesDatabasePort(&RuntimeState{NetworkMode: "host", Ports: published.Ports}) || PublishesDatabasePort(nil) {
+		t.Error("a host-network container publishes nothing")
+	}
+}

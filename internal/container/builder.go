@@ -50,6 +50,21 @@ application code, not the runtime environment.
 // it on updates too.
 const databaseContainerPort = "5432"
 
+// PublishesDatabasePort reports whether a container publishes the bundled
+// database's port on the host, which an update drops (a switch back to the
+// container keeps it).
+func PublishesDatabasePort(state *RuntimeState) bool {
+	if state == nil || state.NetworkMode == "host" {
+		return false
+	}
+	for _, port := range state.Ports {
+		if port.ContainerPort == databaseContainerPort && port.HostPort != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // DockerRunBuilder constructs docker run arguments from runtime state and manifest.
 type DockerRunBuilder struct {
 	logger Logger

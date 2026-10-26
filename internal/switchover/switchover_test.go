@@ -190,7 +190,7 @@ func (d *fakeDocker) State(_ context.Context, name string) (dockerexec.Container
 	if !ok {
 		return dockerexec.ContainerState{}, nil
 	}
-	return dockerexec.ContainerState{Exists: true, Running: c.running, Status: c.status, RestartCount: c.restarts, Image: c.image}, nil
+	return dockerexec.ContainerState{Exists: true, Running: c.running, Status: c.status, RestartCount: c.restarts, Image: c.image, HasStarted: c.status != "created"}, nil
 }
 
 // fakeProbe answers like the PayRam that currently runs as "payram" would:
@@ -253,19 +253,61 @@ func (r *memoryRecorder) Log(line string) {
 	r.lines = append(r.lines, line)
 }
 
+// fakePrograms is supervisorctl in the fake containers: every container
+// runs the programs in running until they are stopped.
+type fakePrograms struct {
+	mu      sync.Mutex
+	running map[string][]string // container -> running programs
+	started []string            // "container:a,b" per Start
+	stopped []string            // "container:a,b" per Stop
+	noSup   bool
+	failOn  string // "stop" or "start" fails
+}
+
+func (p *fakePrograms) Running(_ context.Context, container string) ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.noSup {
+		return nil, ErrNoSupervisor
+	}
+	return append([]string(nil), p.running[container]...), nil
+}
+
+func (p *fakePrograms) Stop(_ context.Context, container string, programs []string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.failOn == "stop" {
+		return errors.New("injected supervisorctl stop failure")
+	}
+	p.stopped = append(p.stopped, container+":"+strings.Join(programs, ","))
+	delete(p.running, container)
+	return nil
+}
+
+func (p *fakePrograms) Start(_ context.Context, container string, programs []string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.failOn == "start" {
+		return errors.New("injected supervisorctl start failure")
+	}
+	p.started = append(p.started, container+":"+strings.Join(programs, ","))
+	if p.running == nil {
+		p.running = map[string][]string{}
+	}
+	p.running[container] = append([]string(nil), programs...)
+	return nil
+}
+
 func newSwitch(d *fakeDocker) (*Switch, *memoryRecorder, *[]string) {
 	rec := &memoryRecorder{}
-	var started []string
+	programs := &fakePrograms{}
 	w := &Switch{
-		Docker: d,
-		Record: rec,
-		Timing: Timing{HealthTimeout: 400 * time.Millisecond, StableFor: 60 * time.Millisecond, PollInterval: 10 * time.Millisecond, MaxRestarts: 3},
-		StartPrograms: func(_ context.Context, container string, programs []string) error {
-			started = append(started, container+":"+strings.Join(programs, ","))
-			return nil
-		},
+		Docker:   d,
+		Record:   rec,
+		Timing:   Timing{HealthTimeout: 400 * time.Millisecond, StableFor: 60 * time.Millisecond, PollInterval: 10 * time.Millisecond, MaxRestarts: 3},
+		Programs: programs,
 	}
-	return w, rec, &started
+	return w, rec, &programs.started
 }
 
 func newJob() *jobs.Job {

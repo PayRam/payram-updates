@@ -142,6 +142,19 @@ func (e *ContainerBackupExecutor) resolveDatabase(ctx context.Context, container
 	return db, host, dbConfig, nil
 }
 
+// ResolveDatabase returns the database containerName's PayRam uses and the
+// executor that reaches it, by the same rules as ExecuteBackup: a check or a
+// restore made with it works on the database the backup came from. It
+// changes nothing. The bundled database (Context.Mode in_container) can only
+// be reached while the container runs.
+func (e *ContainerBackupExecutor) ResolveDatabase(ctx context.Context, containerName string) (*ResolvedDatabase, error) {
+	db, pgExec, _, failure := e.resolveDatabase(ctx, containerName)
+	if failure != nil {
+		return nil, errors.New(failure.ErrorMessage)
+	}
+	return &ResolvedDatabase{Context: db, Executor: pgExec}, nil
+}
+
 // ExecuteBackup performs a database backup from the specified container.
 // It automatically detects whether the database is local or external and
 // uses the appropriate backup strategy.
